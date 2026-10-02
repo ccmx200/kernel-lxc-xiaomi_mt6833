@@ -138,46 +138,6 @@ TC_DIR=/opt/clang ./b.sh
 
 ---
 
-## 🐳 在设备上使用 LXC / Docker
-
-### Magisk / ReSukiSU 模块
-
-从 [tomxi1997/termux-packages releases](https://github.com/tomxi1997/termux-packages/releases) 下载：
-
-- `LXC-5.0-Pro_Magisk-android24-R5.1.zip`（主模块）
-
-在 ReSukiSU Manager 中刷入，重启。
-
-> ⚠️ ReSukiSU v3.0+ 需要先安装 `meta-overlayfs` 元模块，否则模块无法挂载。
-
-### 启动 LXC
-
-```bash
-su -c "lxc"
-```
-
-进入 lxc-manager 菜单，可在线下载 rootfs 或从 `/sdcard/Download/` 本地创建。
-
-### 在容器里跑 Docker
-
-```bash
-# 容器内
-apt update && apt install -y docker.io
-dockerd > /var/log/dockerd.log 2>&1 &
-docker run --rm hello-world
-```
-
-如果 `dockerd` 报 `iptables: No chain/target/match by that name`：
-
-```bash
-# 切到 iptables-legacy
-update-alternatives --set iptables /usr/sbin/iptables-legacy
-update-alternatives --set ip6tables /usr/sbin/ip6tables-legacy
-pkill dockerd && sleep 2 && dockerd > /var/log/dockerd.log 2>&1 &
-```
-
----
-
 ## 🛠 常见问题
 
 ### 编译相关
