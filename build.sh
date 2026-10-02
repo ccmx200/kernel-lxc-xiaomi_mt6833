@@ -21,6 +21,8 @@ readonly C_MAGENTA='\033[1;35m'
 readonly C_WHITE='\033[1;37m'
 readonly C_ORANGE='\033[38;5;208m'
 readonly C_SKY='\033[38;5;117m'
+readonly C_BG_ORANGE='\033[48;5;208m'
+readonly C_BG_TEAL='\033[48;5;30m'
 
 # -----------------------------------------------------------------------------
 #  CLI arguments
@@ -97,8 +99,8 @@ gh_url() {
 
 rewrite_gh_links_in() {
     local dir="$1"
-    [ -z "$GH_PROXY" ] && { printf '0'; return; }
-    [ -d "$dir" ] || { printf '0'; return; }
+    [ -z "$GH_PROXY" ] && { printf '0'; return 0; }
+    [ -d "$dir" ] || { printf '0'; return 0; }
 
     local count=0
     while IFS= read -r -d '' file; do
@@ -114,6 +116,7 @@ rewrite_gh_links_in() {
         fi
     done < <(find "$dir" -type f -name '*.sh' -print0 2>/dev/null || true)
     printf '%d' "$count"
+    return 0
 }
 
 # -----------------------------------------------------------------------------
@@ -198,10 +201,9 @@ roll_stop() {
 #  Logging helpers
 # -----------------------------------------------------------------------------
 log_section() {
+    local title="$1"
     echo
-    printf "${C_MAGENTA}${C_BOLD}  ┌───────────────────────────────────────────────────────┐${C_RESET}\n"
-    printf "${C_MAGENTA}${C_BOLD}  │${C_RESET}  ${C_WHITE}${C_BOLD}%-53s${C_RESET}${C_MAGENTA}${C_BOLD}│${C_RESET}\n" "$1"
-    printf "${C_MAGENTA}${C_BOLD}  └───────────────────────────────────────────────────────┘${C_RESET}\n"
+    printf "${C_BG_ORANGE}${C_WHITE}${C_BOLD}  %s  ${C_RESET}\n" "$title"
     echo
 }
 
@@ -223,26 +225,13 @@ hr() {
 banner() {
     clear 2>/dev/null || true
     echo
-    printf "${C_ORANGE}${C_BOLD}"
-    cat <<'EOF'
-     ╔═══════════════════════════════════════════════════════════╗
-     ║                                                           ║
-     ║     ██████╗ ███████╗███████╗██╗   ██╗██╗  ██╗██╗          ║
-     ║     ██╔══██╗██╔════╝██╔════╝██║   ██║██║ ██╔╝██║          ║
-     ║     ██████╔╝█████╗  ███████╗██║   ██║█████╔╝ ██║          ║
-     ║     ██╔══██╗██╔══╝  ╚════██║██║   ██║██╔═██╗ ██║          ║
-     ║     ██║  ██║███████╗███████║╚██████╔╝██║  ██╗██║          ║
-     ║     ╚═╝  ╚═╝╚══════╝╚══════╝ ╚═════╝ ╚═╝  ╚═╝╚═╝          ║
-     ║                                                           ║
-     ║            Kernel Build System · everpal / MT6833         ║
-     ║                                                           ║
-     ╚═══════════════════════════════════════════════════════════╝
-EOF
-    printf "${C_RESET}\n"
+    printf "${C_ORANGE}${C_BOLD}  ReSukiSU Kernel Builder${C_RESET}\n"
+    printf "${C_DIM}  everpal / MT6833${C_RESET}\n"
+    echo
     if [ -n "$GH_PROXY" ]; then
-        printf "  ${C_CYAN}GitHub proxy:${C_RESET}  ${C_BOLD}%s${C_RESET}\n" "$GH_PROXY"
+        printf "  ${C_CYAN}GitHub proxy${C_RESET}  ${C_BOLD}%s${C_RESET}\n" "$GH_PROXY"
     else
-        printf "  ${C_DIM}GitHub proxy:  disabled (use -cn to enable)${C_RESET}\n"
+        printf "  ${C_DIM}GitHub proxy: disabled (use -cn to enable)${C_RESET}\n"
     fi
     echo
 }
@@ -265,7 +254,6 @@ get_resukisu_info() {
     RSU_DATE="unknown"
     RSU_DIRTY="clean"
 
-    # git 信息
     if git -C "$dir" rev-parse --git-dir >/dev/null 2>&1; then
         RSU_COMMIT="$(git -C "$dir" rev-parse --short=12 HEAD 2>/dev/null || echo unknown)"
         RSU_BRANCH="$(git -C "$dir" rev-parse --abbrev-ref HEAD 2>/dev/null || echo unknown)"
@@ -281,7 +269,6 @@ get_resukisu_info() {
         [ -n "$described" ] && RSU_VERSION="$described"
     fi
 
-    # 源码版本宏
     local kver=""
     if [ -f "$dir/kernel/Makefile" ]; then
         kver="$(grep -E '^KSU_VERSION\s*[:?]?=' "$dir/kernel/Makefile" 2>/dev/null \
@@ -296,41 +283,23 @@ get_resukisu_info() {
         fi
     fi
     [ -n "$kver" ] && RSU_VERSION="$kver"
+
+    return 0
 }
 
 print_rsu_panel() {
-    local inner=58
-    local left_pad="  "
-
-    local row
-    row() {
-        local text="$1"
-        printf "${C_MAGENTA}${C_BOLD}${left_pad}│${C_RESET} ${C_DIM}%-12s${C_RESET} ${C_WHITE}%s${C_RESET}" "$2" "$3"
-        local visible_len=$(( 12 + 1 + ${#3} ))
-        local pad=$(( inner - visible_len - 1 ))
-        [ "$pad" -lt 0 ] && pad=0
-        printf "%${pad}s" ""
-        printf "${C_MAGENTA}${C_BOLD}│${C_RESET}\n"
-    }
-
-    printf "\n"
-    printf "${C_MAGENTA}${C_BOLD}${left_pad}┌─ ${C_WHITE}ReSukiSU Info${C_MAGENTA} %s┐${C_RESET}\n" \
-        "$(printf '─%.0s' $(seq 1 $((inner - 14))))"
-
-    row "" "Version"      "$RSU_VERSION"
-    row "" "Commit"       "$RSU_COMMIT"
-    row "" "Branch"       "$RSU_BRANCH"
-    row "" "Commit Date"  "$RSU_DATE"
-
+    echo
+    printf "${C_MAGENTA}${C_BOLD}  ReSukiSU Info${C_RESET}\n"
+    printf "${C_DIM}  Version       ${C_RESET} ${C_WHITE}%s${C_RESET}\n" "$RSU_VERSION"
+    printf "${C_DIM}  Commit        ${C_RESET} ${C_WHITE}%s${C_RESET}\n" "$RSU_COMMIT"
+    printf "${C_DIM}  Branch        ${C_RESET} ${C_WHITE}%s${C_RESET}\n" "$RSU_BRANCH"
+    printf "${C_DIM}  Commit Date   ${C_RESET} ${C_WHITE}%s${C_RESET}\n" "$RSU_DATE"
     if [ "$RSU_DIRTY" = "dirty" ]; then
-        row "" "Working Tree" "${C_YELLOW}dirty (local changes)${C_RESET}"
+        printf "${C_DIM}  Working Tree  ${C_RESET} ${C_YELLOW}dirty (local changes)${C_RESET}\n"
     else
-        row "" "Working Tree" "${C_GREEN}clean${C_RESET}"
+        printf "${C_DIM}  Working Tree  ${C_RESET} ${C_GREEN}clean${C_RESET}\n"
     fi
-
-    printf "${C_MAGENTA}${C_BOLD}${left_pad}└%s┘${C_RESET}\n" \
-        "$(printf '─%.0s' $(seq 1 $((inner + 2))))"
-    printf "\n"
+    echo
 }
 
 # -----------------------------------------------------------------------------
@@ -348,7 +317,6 @@ DEVICE="${DEVICE:-everpal}"
 DEFCONFIG="${DEVICE}_defconfig"
 ZIPNAME="ReSukiSU-AdrenalinKernel-${DATE}.zip"
 
-# 全局清理
 cleanup() {
     roll_stop 2>/dev/null || true
     if [ -n "$SPINNER_PID" ]; then
@@ -363,7 +331,7 @@ trap cleanup EXIT
 banner
 
 # =============================================================================
-log_section "1 / 6 · 清理旧构建产物"
+log_section "1 / 6  ·  清理旧构建产物"
 # =============================================================================
 spin_start "Removing stale artifacts..."
 
@@ -385,7 +353,7 @@ fi
 spin_stop ok "Cleanup complete"
 
 # =============================================================================
-log_section "2 / 6 · 工具链准备"
+log_section "2 / 6  ·  工具链准备"
 # =============================================================================
 TC_DIR="${TC_DIR:-$HOME/toolchains/neutron-clang}"
 
@@ -420,7 +388,7 @@ fi
 spin_stop ok "Toolchain: $TOOLCHAIN_SRC · ccache: $CCACHE_STATE"
 
 # =============================================================================
-log_section "3 / 6 · ReSukiSU 源码准备"
+log_section "3 / 6  ·  ReSukiSU 源码准备"
 # =============================================================================
 if [ ! -d "$CURRENT_DIR/ReSukiSU/kernel" ]; then
     spin_start "Cloning ReSukiSU..."
@@ -436,20 +404,17 @@ else
     log_ok "ReSukiSU source already present"
 fi
 
-# 重写 GitHub 链接
 if [ -n "$GH_PROXY" ]; then
     spin_start "Rewriting GitHub URLs in ReSukiSU scripts..."
     rewritten=$(rewrite_gh_links_in "$CURRENT_DIR/ReSukiSU")
     spin_stop ok "Rewrote $rewritten script(s)"
 fi
 
-# 版本信息
 spin_start "Reading ReSukiSU version info..."
 get_resukisu_info
 spin_stop ok "Version info collected"
 print_rsu_panel
 
-# 集成到内核树
 rm -f drivers/kernelsu
 ln -sfn ../ReSukiSU/kernel drivers/kernelsu
 
@@ -460,7 +425,7 @@ grep -q 'drivers/kernelsu/Kconfig' drivers/Kconfig || \
 log_ok "ReSukiSU integrated into kernel tree"
 
 # =============================================================================
-log_section "4 / 6 · 内核配置"
+log_section "4 / 6  ·  内核配置"
 # =============================================================================
 echo "  Using compiler:"
 "$CLANG" --version | head -n 2 | sed 's/^/    /'
@@ -489,7 +454,7 @@ else
 fi
 
 # =============================================================================
-log_section "5 / 6 · VDSO 符号生成"
+log_section "5 / 6  ·  VDSO 符号生成"
 # =============================================================================
 spin_start "Building vdso-offsets.h ..."
 if make "${MAKE_COMMON[@]}" arch/arm64/kernel/vdso/ >/dev/null 2>&1; then
@@ -505,7 +470,7 @@ else
 fi
 
 # =============================================================================
-log_section "6 / 6 · 编译内核"
+log_section "6 / 6  ·  编译内核"
 # =============================================================================
 echo
 log_info "Starting compilation (single-line rolling log below)..."
@@ -551,20 +516,11 @@ if make -j"$(nproc --all)" "${MAKE_COMMON[@]}" \
 
     echo
     hr
-    printf "${C_GREEN}${C_BOLD}"
-    cat <<'EOF'
-     ██████╗  ██████╗ ███╗   ██╗███████╗
-     ██╔══██╗██╔═══██╗████╗  ██║██╔════╝
-     ██║  ██║██║   ██║██╔██╗ ██║█████╗
-     ██║  ██║██║   ██║██║╚██╗██║██╔══╝
-     ██████╔╝╚██████╔╝██║ ╚████║███████╗
-     ╚═════╝  ╚═════╝ ╚═╝  ╚═══╝╚══════╝
-EOF
-    printf "${C_RESET}\n"
+    printf "${C_GREEN}${C_BOLD}  DONE${C_RESET}\n"
     printf "  ${C_DIM}Total time:${C_RESET} ${C_BOLD}%d minute(s) %d second(s)${C_RESET}\n" \
         $((SECONDS / 60)) $((SECONDS % 60))
-    echo
     hr
+    echo
 
     rm -f "$BUILD_LOG"
 else
