@@ -65,6 +65,7 @@ CONFIG_IPC_NS=y
 ### 前置依赖
 
 ```bash
+## archlinux
 sudo pacman -S --needed base-devel clang llvm lld ccache \
     bc libelf openssl flex bison pahole xmlto kmod inetutils \
     aarch64-linux-gnu-gcc openbsd-netcat git zip
@@ -148,15 +149,6 @@ TC_DIR=/opt/clang ./b.sh
 | `unknown type name 'syscall_fn_t'` | 4.14 内核无此类型定义 | 手动在报错文件头部加 `typedef long (*syscall_fn_t)(const struct pt_regs *);` |
 | `timespec` / `timespec64` 不匹配 | btrfs 源码版本混乱 | 在 defconfig 中 `# CONFIG_BTRFS_FS is not set` |
 | `too many errors` 后 hugetlbpage.c 崩 | 源码拼写错误 | 关 `CONFIG_HUGETLBFS`，或改 `ptep` 为 `pte` |
-
-### 运行相关
-
-| 问题 | 原因 | 解决 |
-|------|------|------|
-| 容器内 `ping` 报 `Permission denied` | `CONFIG_ANDROID_PARANOID_NETWORK` 未关 | 重新编译内核 |
-| 容器名解析失败 | 默认 bridge 不支持 | 用 `docker network create` 建自定义网络 |
-| `dockerd` 报 iptables 错误 | nft/legacy 后端不匹配 | 切 `iptables-legacy` |
-| cgroup 限制不可用 | LXC 未透传 cgroup | 宿主 LXC 配置加 `lxc.mount.auto = cgroup:mixed` |
 
 ---
 
