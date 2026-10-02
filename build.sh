@@ -27,9 +27,10 @@ readonly C_BG_RED='\033[48;5;160m'
 # -----------------------------------------------------------------------------
 #  CLI arguments
 # -----------------------------------------------------------------------------
-GH_PROXY=""
+GH_PROXY="https://git.yylx.win/"
 NO_CCACHE=""
 NO_UPDATE=""
+CHECK_ONLY=""
 
 usage() {
     cat <<EOF
@@ -42,6 +43,7 @@ Options:
   --proxy URL     Same as -cn URL
   --no-ccache     Disable ccache (ccache is ON by default)
   -nu, --no-update  Skip ReSukiSU auto-update
+  --check, --test  Only run syntax/toolchain/defconfig sanity check
   -h, --help      Show this help
 
 Environment variables:
@@ -74,6 +76,9 @@ while [ $# -gt 0 ]; do
             ;;
         -nu|--no-update)
             NO_UPDATE=1
+            ;;
+        --check|--test)
+            CHECK_ONLY=1
             ;;
         -h|--help)
             usage
@@ -318,6 +323,15 @@ get_resukisu_info() {
     RSU_DATE="unknown"
     RSU_DIRTY="clean"
 
+    if [ ! -d "$dir/.git" ] && [ -d "$dir/kernel" ]; then
+        RSU_VERSION="vendored"
+        RSU_COMMIT="vendored"
+        RSU_BRANCH="main"
+        RSU_DATE="unknown"
+        RSU_DIRTY="clean"
+        return 0
+    fi
+
     if git -C "$dir" rev-parse --git-dir >/dev/null 2>&1; then
         RSU_COMMIT="$(git -C "$dir" rev-parse --short=12 HEAD 2>/dev/null || echo unknown)"
         RSU_BRANCH="$(git -C "$dir" rev-parse --abbrev-ref HEAD 2>/dev/null || echo unknown)"
@@ -514,7 +528,9 @@ if [ ! -d "$CURRENT_DIR/ReSukiSU/kernel" ]; then
 else
     log_ok "ReSukiSU source already present"
 
-    if [ -n "$NO_UPDATE" ]; then
+    if [ ! -d "$CURRENT_DIR/ReSukiSU/.git" ]; then
+        spin_stop ok "Vendored ReSukiSU (no git metadata)"
+    elif [ -n "$NO_UPDATE" ]; then
         spin_stop warn "Auto-update disabled (--no-update)"
     else
         spin_start "Checking ReSukiSU updates..."
@@ -578,6 +594,17 @@ if make "${MAKE_COMMON[@]}" "$DEFCONFIG" >/dev/null 2>&1; then
 else
     spin_stop fail "defconfig failed"
     exit 1
+fi
+
+if [ -n "$CHECK_ONLY" ]; then
+    spin_start "Running prepare sanity check..."
+    if make -j"$(nproc --all)" "${MAKE_COMMON[@]}" prepare >/dev/null 2>&1; then
+        spin_stop ok "Sanity check passed"
+        exit 0
+    else
+        spin_stop fail "Sanity check failed"
+        exit 1
+    fi
 fi
 
 # =============================================================================
