@@ -1,3 +1,20 @@
+## build.sh说明
+# 默认：直连 GitHub，自动启用 ccache
+./b.sh
+
+# 走加速代理（默认 https://git.yylx.win/）
+./b.sh -cn
+
+# 自定义加速代理
+./b.sh -cn https://your-proxy.example/
+
+# 关闭 ccache
+./b.sh --no-ccache
+
+# 完整清理 + 加速
+CLEAN_BUILD=true ./b.sh -cn
+
+
 Linux kernel
 ============
 
