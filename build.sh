@@ -2,7 +2,7 @@
 # =============================================================================
 #  ReSukiSU Kernel Build Script
 #  Target : kernel-lxc_xiaomi_mtk810_mt6833 (everpal / MT6833)
-#  Usage  : ./b.sh [-cn [URL]] [--no-ccache] [--proxy URL]
+#  Usage  : ./b.sh [-cn [URL]] [--no-ccache] [--no-update] [--proxy URL]
 # =============================================================================
 
 set -euo pipefail
@@ -22,13 +22,14 @@ readonly C_WHITE='\033[1;37m'
 readonly C_ORANGE='\033[38;5;208m'
 readonly C_SKY='\033[38;5;117m'
 readonly C_BG_ORANGE='\033[48;5;208m'
-readonly C_BG_TEAL='\033[48;5;30m'
+readonly C_BG_RED='\033[48;5;160m'
 
 # -----------------------------------------------------------------------------
 #  CLI arguments
 # -----------------------------------------------------------------------------
 GH_PROXY=""
 NO_CCACHE=""
+NO_UPDATE=""
 
 usage() {
     cat <<EOF
@@ -40,6 +41,7 @@ Options:
   -cn [URL]       Enable GitHub acceleration (default: https://git.yylx.win/)
   --proxy URL     Same as -cn URL
   --no-ccache     Disable ccache (ccache is ON by default)
+  -nu, --no-update  Skip ReSukiSU auto-update
   -h, --help      Show this help
 
 Environment variables:
@@ -47,6 +49,7 @@ Environment variables:
   ZIP_ANY_KERNEL=false   Skip AnyKernel3 packaging
   DEVICE=everpal         Target device codename
   TC_DIR=/path/to/clang  Custom toolchain directory
+  ERROR_CTX=200          Lines of context around first error
 EOF
 }
 
@@ -68,6 +71,9 @@ while [ $# -gt 0 ]; do
             ;;
         --no-ccache)
             NO_CCACHE=1
+            ;;
+        -nu|--no-update)
+            NO_UPDATE=1
             ;;
         -h|--help)
             usage
@@ -198,6 +204,61 @@ roll_stop() {
 }
 
 # -----------------------------------------------------------------------------
+#  Error extraction with N lines of context
+# -----------------------------------------------------------------------------
+ERROR_CTX="${ERROR_CTX:-200}"
+
+print_error_context() {
+    local log_file="$1"
+    local ctx="$ERROR_CTX"
+
+    [ -f "$log_file" ] || return 0
+
+    # 找到第一个包含 "error:" 或 "Error " 或 "ERROR" 的行号
+    local first_err
+    first_err="$(grep -n -m1 -E '([[:space:]]error:|^error:|Error [0-9]+|ERROR:|fatal error:)' "$log_file" 2>/dev/null | cut -d: -f1 || true)"
+
+    if [ -z "$first_err" ]; then
+        # 找不到 error 行，就直接输出最后 40 行
+        echo
+        printf "${C_BG_RED}${C_WHITE}${C_BOLD}  Build failed · no 'error:' marker found · showing last 40 lines  ${C_RESET}\n"
+        echo
+        tail -n 40 "$log_file" | sed 's/^/    /'
+        return 0
+    fi
+
+    local total
+    total="$(wc -l < "$log_file")"
+    local start=$(( first_err - ctx ))
+    local end=$(( first_err + ctx ))
+    [ "$start" -lt 1 ] && start=1
+    [ "$end" -gt "$total" ] && end="$total"
+
+    echo
+    printf "${C_BG_RED}${C_WHITE}${C_BOLD}  Build failed  ·  first error at line %d of %d  ·  context ±%d lines  ${C_RESET}\n" \
+        "$first_err" "$total" "$ctx"
+    echo
+    printf "${C_DIM}  ── lines %d..%d ──────────────────────────────────────────${C_RESET}\n\n" \
+        "$start" "$end"
+
+    # 打印上下文，error 行高亮
+    awk -v s="$start" -v e="$end" -v fe="$first_err" '
+        NR >= s && NR <= e {
+            line = $0
+            if (NR == fe) {
+                printf "\033[1;31m  ▶ %s\033[0m\n", line
+            } else {
+                printf "    %s\n", line
+            }
+        }
+    ' "$log_file"
+
+    echo
+    printf "${C_DIM}  ──────────────────────────────────────────────────────────${C_RESET}\n"
+    printf "  ${C_DIM}Full log:${C_RESET} ${C_BOLD}%s${C_RESET}\n" "$log_file"
+}
+
+# -----------------------------------------------------------------------------
 #  Logging helpers
 # -----------------------------------------------------------------------------
 log_section() {
@@ -232,6 +293,9 @@ banner() {
         printf "  ${C_CYAN}GitHub proxy${C_RESET}  ${C_BOLD}%s${C_RESET}\n" "$GH_PROXY"
     else
         printf "  ${C_DIM}GitHub proxy: disabled (use -cn to enable)${C_RESET}\n"
+    fi
+    if [ -n "$NO_UPDATE" ]; then
+        printf "  ${C_DIM}ReSukiSU auto-update: disabled${C_RESET}\n"
     fi
     echo
 }
@@ -287,6 +351,49 @@ get_resukisu_info() {
     return 0
 }
 
+# -----------------------------------------------------------------------------
+#  ReSukiSU auto-update
+# -----------------------------------------------------------------------------
+RSU_UPDATED="no"
+
+update_resukisu() {
+    local dir="$CURRENT_DIR/ReSukiSU"
+
+    RSU_UPDATED="no"
+
+    [ -d "$dir/.git" ] || return 0
+    [ -n "$NO_UPDATE" ] && return 0
+
+    # 有本地修改时不动它，避免冲突
+    if ! git -C "$dir" diff --quiet 2>/dev/null || \
+       ! git -C "$dir" diff --cached --quiet 2>/dev/null; then
+        return 2
+    fi
+
+    local old_rev new_rev
+    old_rev="$(git -C "$dir" rev-parse HEAD 2>/dev/null || echo '')"
+
+    # 浅克隆需要先拉回深度
+    git -C "$dir" fetch --depth=1 origin HEAD >/dev/null 2>&1 || \
+        git -C "$dir" fetch origin >/dev/null 2>&1 || return 1
+
+    local upstream
+    upstream="$(git -C "$dir" rev-parse --abbrev-ref --symbolic-full-name '@{u}' 2>/dev/null || echo '')"
+
+    if [ -n "$upstream" ]; then
+        new_rev="$(git -C "$dir" rev-parse "$upstream" 2>/dev/null || echo '')"
+    else
+        new_rev="$(git -C "$dir" rev-parse FETCH_HEAD 2>/dev/null || echo '')"
+    fi
+
+    [ -z "$new_rev" ] && return 1
+    [ "$old_rev" = "$new_rev" ] && return 3
+
+    git -C "$dir" reset --hard "$new_rev" >/dev/null 2>&1 || return 1
+    RSU_UPDATED="yes"
+    return 0
+}
+
 print_rsu_panel() {
     echo
     printf "${C_MAGENTA}${C_BOLD}  ReSukiSU Info${C_RESET}\n"
@@ -298,6 +405,9 @@ print_rsu_panel() {
         printf "${C_DIM}  Working Tree  ${C_RESET} ${C_YELLOW}dirty (local changes)${C_RESET}\n"
     else
         printf "${C_DIM}  Working Tree  ${C_RESET} ${C_GREEN}clean${C_RESET}\n"
+    fi
+    if [ "$RSU_UPDATED" = "yes" ]; then
+        printf "${C_DIM}  Updated       ${C_RESET} ${C_GREEN}yes${C_RESET}\n"
     fi
     echo
 }
@@ -396,12 +506,29 @@ if [ ! -d "$CURRENT_DIR/ReSukiSU/kernel" ]; then
     if GIT_SSL_NO_VERIFY=true git clone --depth=1 --branch main \
         "$CLONE_URL" "$CURRENT_DIR/ReSukiSU" >/dev/null 2>&1; then
         spin_stop ok "ReSukiSU cloned"
+        RSU_UPDATED="yes"
     else
         spin_stop fail "Failed to clone ReSukiSU"
         exit 1
     fi
 else
     log_ok "ReSukiSU source already present"
+
+    if [ -n "$NO_UPDATE" ]; then
+        spin_stop warn "Auto-update disabled (--no-update)"
+    else
+        spin_start "Checking ReSukiSU updates..."
+        set +e
+        update_resukisu
+        rc=$?
+        set -e
+        case "$rc" in
+            0) spin_stop ok "ReSukiSU updated to latest" ;;
+            2) spin_stop warn "Local changes present · skipped update" ;;
+            3) spin_stop ok "ReSukiSU already up to date" ;;
+            *) spin_stop warn "Update failed · using local version" ;;
+        esac
+    fi
 fi
 
 if [ -n "$GH_PROXY" ]; then
@@ -525,15 +652,6 @@ if make -j"$(nproc --all)" "${MAKE_COMMON[@]}" \
     rm -f "$BUILD_LOG"
 else
     roll_stop
-    echo
-    hr
-    log_error "Compilation failed"
-    hr
-    echo
-    log_info "Last 40 lines of build log:"
-    echo
-    tail -n 40 "$BUILD_LOG" | sed 's/^/    /'
-    echo
-    log_dim "Full log: $BUILD_LOG"
+    print_error_context "$BUILD_LOG"
     exit 1
 fi
