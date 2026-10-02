@@ -1,0 +1,11 @@
+hugepage-mmap
+hugepage-shm
+map_hugetlb
+thuge-gen
+compaction_test
+mlock2-tests
+mremap_dontunmap
+on-fault-limit
+transhuge-stress
+userfaultfd
+mlock-intersect-test
