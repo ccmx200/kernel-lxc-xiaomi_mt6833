@@ -2,7 +2,7 @@
 # =============================================================================
 #  ReSukiSU Kernel Build Script
 #  Target : kernel-lxc_xiaomi_mtk810_mt6833 (everpal / MT6833)
-#  Usage  : ./b.sh [-cn [URL]] [--no-ccache]
+#  Usage  : ./b.sh [-cn [URL]] [--no-ccache] [--proxy URL]
 # =============================================================================
 
 set -euo pipefail
@@ -19,6 +19,8 @@ readonly C_YELLOW='\033[1;33m'
 readonly C_CYAN='\033[1;36m'
 readonly C_MAGENTA='\033[1;35m'
 readonly C_WHITE='\033[1;37m'
+readonly C_ORANGE='\033[38;5;208m'
+readonly C_SKY='\033[38;5;117m'
 
 # -----------------------------------------------------------------------------
 #  CLI arguments
@@ -33,15 +35,16 @@ ReSukiSU Kernel Build Script
 Usage: $0 [options]
 
 Options:
-  -cn [URL]       Enable GitHub acceleration (proxy URL, default: https://git.yylx.win/)
+  -cn [URL]       Enable GitHub acceleration (default: https://git.yylx.win/)
   --proxy URL     Same as -cn URL
   --no-ccache     Disable ccache (ccache is ON by default)
   -h, --help      Show this help
 
 Environment variables:
-  CLEAN_BUILD=true      Perform a full clean build
-  ZIP_ANY_KERNEL=false  Skip AnyKernel3 packaging
-  DEVICE=everpal        Target device codename
+  CLEAN_BUILD=true       Perform a full clean build
+  ZIP_ANY_KERNEL=false   Skip AnyKernel3 packaging
+  DEVICE=everpal         Target device codename
+  TC_DIR=/path/to/clang  Custom toolchain directory
 EOF
 }
 
@@ -92,7 +95,6 @@ gh_url() {
         -e "s|https://objects.githubusercontent.com/|${GH_PROXY}objects.githubusercontent.com/|g"
 }
 
-# 重写某个目录下所有 .sh 文件中的 GitHub 链接
 rewrite_gh_links_in() {
     local dir="$1"
     [ -z "$GH_PROXY" ] && { printf '0'; return; }
@@ -115,7 +117,7 @@ rewrite_gh_links_in() {
 }
 
 # -----------------------------------------------------------------------------
-#  Animations
+#  Spinner animation
 # -----------------------------------------------------------------------------
 SPINNER_PID=""
 
@@ -152,25 +154,66 @@ spin_stop() {
 }
 
 # -----------------------------------------------------------------------------
-#  Logging
+#  Single-line rolling build log
+# -----------------------------------------------------------------------------
+ROLL_PID=""
+ROLL_STOP_FILE=""
+
+roll_start() {
+    local log_file="$1"
+    ROLL_STOP_FILE="$(mktemp /tmp/kernel-roll-stop-XXXXXX)"
+    : > "$ROLL_STOP_FILE"
+    (
+        local last_line=""
+        while [ ! -s "$ROLL_STOP_FILE" ]; do
+            if [ -s "$log_file" ]; then
+                last_line="$(tail -n 1 "$log_file" 2>/dev/null || true)"
+                if [ -n "$last_line" ]; then
+                    [ "${#last_line}" -gt 100 ] && last_line="${last_line:0:97}..."
+                    printf "\r\033[K${C_SKY}  ▸${C_RESET} ${C_DIM}%s${C_RESET}" "$last_line"
+                fi
+            fi
+            sleep 0.12
+        done
+        printf "\r\033[K"
+    ) &
+    ROLL_PID=$!
+    disown "$ROLL_PID" 2>/dev/null || true
+}
+
+roll_stop() {
+    if [ -n "$ROLL_PID" ]; then
+        : > "$ROLL_STOP_FILE"
+        sleep 0.15
+        kill "$ROLL_PID" 2>/dev/null || true
+        wait "$ROLL_PID" 2>/dev/null || true
+        ROLL_PID=""
+    fi
+    [ -n "$ROLL_STOP_FILE" ] && rm -f "$ROLL_STOP_FILE"
+    ROLL_STOP_FILE=""
+    printf "\r\033[K"
+}
+
+# -----------------------------------------------------------------------------
+#  Logging helpers
 # -----------------------------------------------------------------------------
 log_section() {
     echo
-    printf "${C_MAGENTA}${C_BOLD}  ┌──────────────────────────────────────────────────┐${C_RESET}\n"
-    printf "${C_MAGENTA}${C_BOLD}  │${C_RESET}  ${C_WHITE}${C_BOLD}%s${C_RESET}\n" "$1"
-    printf "${C_MAGENTA}${C_BOLD}  └──────────────────────────────────────────────────┘${C_RESET}\n"
+    printf "${C_MAGENTA}${C_BOLD}  ┌───────────────────────────────────────────────────────┐${C_RESET}\n"
+    printf "${C_MAGENTA}${C_BOLD}  │${C_RESET}  ${C_WHITE}${C_BOLD}%-53s${C_RESET}${C_MAGENTA}${C_BOLD}│${C_RESET}\n" "$1"
+    printf "${C_MAGENTA}${C_BOLD}  └───────────────────────────────────────────────────────┘${C_RESET}\n"
     echo
 }
 
-log_info() { printf "${C_CYAN}  ▸${C_RESET}  %s\n" "$1"; }
-log_ok()   { printf "${C_GREEN}  ✓${C_RESET}  %s\n" "$1"; }
-log_warn() { printf "${C_YELLOW}  !${C_RESET}  %s\n" "$1"; }
-log_error(){ printf "${C_RED}  ✗${C_RESET}  %s\n" "$1" >&2; }
-log_dim()  { printf "${C_DIM}     %s${C_RESET}\n" "$1"; }
+log_info()  { printf "${C_CYAN}  ▸${C_RESET}  %s\n" "$1"; }
+log_ok()    { printf "${C_GREEN}  ✓${C_RESET}  %s\n" "$1"; }
+log_warn()  { printf "${C_YELLOW}  !${C_RESET}  %s\n" "$1"; }
+log_error() { printf "${C_RED}  ✗${C_RESET}  %s\n" "$1" >&2; }
+log_dim()   { printf "${C_DIM}     %s${C_RESET}\n" "$1"; }
 
 hr() {
     printf "${C_DIM}"
-    printf '─%.0s' $(seq 1 70)
+    printf '─%.0s' $(seq 1 72)
     printf "${C_RESET}\n"
 }
 
@@ -180,7 +223,7 @@ hr() {
 banner() {
     clear 2>/dev/null || true
     echo
-    printf "${C_MAGENTA}${C_BOLD}"
+    printf "${C_ORANGE}${C_BOLD}"
     cat <<'EOF'
      ╔═══════════════════════════════════════════════════════════╗
      ║                                                           ║
@@ -197,11 +240,97 @@ banner() {
 EOF
     printf "${C_RESET}\n"
     if [ -n "$GH_PROXY" ]; then
-        printf "  ${C_CYAN}GitHub proxy:${C_RESET} ${C_BOLD}%s${C_RESET}\n" "$GH_PROXY"
+        printf "  ${C_CYAN}GitHub proxy:${C_RESET}  ${C_BOLD}%s${C_RESET}\n" "$GH_PROXY"
     else
-        printf "  ${C_DIM}GitHub proxy: disabled (use -cn to enable)${C_RESET}\n"
+        printf "  ${C_DIM}GitHub proxy:  disabled (use -cn to enable)${C_RESET}\n"
     fi
     echo
+}
+
+# -----------------------------------------------------------------------------
+#  ReSukiSU version info
+# -----------------------------------------------------------------------------
+RSU_VERSION="unknown"
+RSU_COMMIT="unknown"
+RSU_BRANCH="unknown"
+RSU_DATE="unknown"
+RSU_DIRTY="clean"
+
+get_resukisu_info() {
+    local dir="$CURRENT_DIR/ReSukiSU"
+
+    RSU_VERSION="unknown"
+    RSU_COMMIT="unknown"
+    RSU_BRANCH="unknown"
+    RSU_DATE="unknown"
+    RSU_DIRTY="clean"
+
+    # git 信息
+    if git -C "$dir" rev-parse --git-dir >/dev/null 2>&1; then
+        RSU_COMMIT="$(git -C "$dir" rev-parse --short=12 HEAD 2>/dev/null || echo unknown)"
+        RSU_BRANCH="$(git -C "$dir" rev-parse --abbrev-ref HEAD 2>/dev/null || echo unknown)"
+        RSU_DATE="$(git -C "$dir" log -1 --format='%cd' --date=format:'%Y-%m-%d %H:%M' 2>/dev/null || echo unknown)"
+
+        if ! git -C "$dir" diff --quiet 2>/dev/null || \
+           ! git -C "$dir" diff --cached --quiet 2>/dev/null; then
+            RSU_DIRTY="dirty"
+        fi
+
+        local described
+        described="$(git -C "$dir" describe --tags --always 2>/dev/null || echo '')"
+        [ -n "$described" ] && RSU_VERSION="$described"
+    fi
+
+    # 源码版本宏
+    local kver=""
+    if [ -f "$dir/kernel/Makefile" ]; then
+        kver="$(grep -E '^KSU_VERSION\s*[:?]?=' "$dir/kernel/Makefile" 2>/dev/null \
+            | head -n1 | sed 's/.*=\s*//' || true)"
+    fi
+    if [ -z "$kver" ]; then
+        local vfile
+        vfile="$(find "$dir" -maxdepth 4 -type f -name 'version.h' 2>/dev/null | head -n1 || true)"
+        if [ -n "$vfile" ]; then
+            kver="$(grep -E '#define\s+(KSU|RESUKISU|SUKISU)_VERSION' "$vfile" 2>/dev/null \
+                | awk '{print $3}' || true)"
+        fi
+    fi
+    [ -n "$kver" ] && RSU_VERSION="$kver"
+}
+
+print_rsu_panel() {
+    local inner=58
+    local left_pad="  "
+
+    local row
+    row() {
+        local text="$1"
+        printf "${C_MAGENTA}${C_BOLD}${left_pad}│${C_RESET} ${C_DIM}%-12s${C_RESET} ${C_WHITE}%s${C_RESET}" "$2" "$3"
+        local visible_len=$(( 12 + 1 + ${#3} ))
+        local pad=$(( inner - visible_len - 1 ))
+        [ "$pad" -lt 0 ] && pad=0
+        printf "%${pad}s" ""
+        printf "${C_MAGENTA}${C_BOLD}│${C_RESET}\n"
+    }
+
+    printf "\n"
+    printf "${C_MAGENTA}${C_BOLD}${left_pad}┌─ ${C_WHITE}ReSukiSU Info${C_MAGENTA} %s┐${C_RESET}\n" \
+        "$(printf '─%.0s' $(seq 1 $((inner - 14))))"
+
+    row "" "Version"      "$RSU_VERSION"
+    row "" "Commit"       "$RSU_COMMIT"
+    row "" "Branch"       "$RSU_BRANCH"
+    row "" "Commit Date"  "$RSU_DATE"
+
+    if [ "$RSU_DIRTY" = "dirty" ]; then
+        row "" "Working Tree" "${C_YELLOW}dirty (local changes)${C_RESET}"
+    else
+        row "" "Working Tree" "${C_GREEN}clean${C_RESET}"
+    fi
+
+    printf "${C_MAGENTA}${C_BOLD}${left_pad}└%s┘${C_RESET}\n" \
+        "$(printf '─%.0s' $(seq 1 $((inner + 2))))"
+    printf "\n"
 }
 
 # -----------------------------------------------------------------------------
@@ -218,6 +347,15 @@ DATE="$(date '+%Y%m%d-%H%M')"
 DEVICE="${DEVICE:-everpal}"
 DEFCONFIG="${DEVICE}_defconfig"
 ZIPNAME="ReSukiSU-AdrenalinKernel-${DATE}.zip"
+
+# 全局清理
+cleanup() {
+    roll_stop 2>/dev/null || true
+    if [ -n "$SPINNER_PID" ]; then
+        kill "$SPINNER_PID" 2>/dev/null || true
+    fi
+}
+trap cleanup EXIT
 
 # -----------------------------------------------------------------------------
 #  Main
@@ -236,7 +374,6 @@ rm -rf arch/arm64/include/generated
 rm -rf vmlinux* System.map modules.builtin*
 rm -f Module.symvers modules.order
 rm -rf scripts/kconfig/.tmp*
-
 rm -rf out/include/generated out/include/config
 rm -rf out/arch/arm64/kernel/vdso
 rm -f out/include/generated/vdso-offsets.h
@@ -263,14 +400,13 @@ else
 fi
 
 if [ -z "${CLANG:-}" ]; then
-    spin_stop fail "clang not found"
+    spin_stop fail "clang not found. Set TC_DIR or install clang."
     exit 1
 fi
 
 export CC="${CC:-$CLANG}"
 export LD="${LD:-ld.lld}"
 
-# ccache: 默认开启
 if [ -z "$NO_CCACHE" ] && command -v ccache >/dev/null 2>&1; then
     CC="ccache $CC"
     CCACHE_STATE="enabled"
@@ -300,13 +436,20 @@ else
     log_ok "ReSukiSU source already present"
 fi
 
-# 自动重写 ReSukiSU 中所有 .sh 的 GitHub 链接（含 resukisu.sh）
+# 重写 GitHub 链接
 if [ -n "$GH_PROXY" ]; then
     spin_start "Rewriting GitHub URLs in ReSukiSU scripts..."
     rewritten=$(rewrite_gh_links_in "$CURRENT_DIR/ReSukiSU")
     spin_stop ok "Rewrote $rewritten script(s)"
 fi
 
+# 版本信息
+spin_start "Reading ReSukiSU version info..."
+get_resukisu_info
+spin_stop ok "Version info collected"
+print_rsu_panel
+
+# 集成到内核树
 rm -f drivers/kernelsu
 ln -sfn ../ReSukiSU/kernel drivers/kernelsu
 
@@ -365,18 +508,19 @@ fi
 log_section "6 / 6 · 编译内核"
 # =============================================================================
 echo
-log_info "Starting compilation (this may take a while)..."
+log_info "Starting compilation (single-line rolling log below)..."
 echo
 
 BUILD_LOG="$(mktemp /tmp/kernel-build-XXXXXX.log)"
-trap 'rm -f "$BUILD_LOG"' EXIT
-
 START_TS=$(date +%s)
+
+roll_start "$BUILD_LOG"
 
 if make -j"$(nproc --all)" "${MAKE_COMMON[@]}" \
     KCFLAGS="-Wno-error=default-const-init-var-unsafe -Wno-default-const-init-var-unsafe" \
     Image.gz >"$BUILD_LOG" 2>&1; then
 
+    roll_stop
     END_TS=$(date +%s)
     BUILD_TIME=$(( END_TS - START_TS ))
 
@@ -421,7 +565,10 @@ EOF
         $((SECONDS / 60)) $((SECONDS % 60))
     echo
     hr
+
+    rm -f "$BUILD_LOG"
 else
+    roll_stop
     echo
     hr
     log_error "Compilation failed"
