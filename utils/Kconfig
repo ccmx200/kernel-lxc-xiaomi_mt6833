@@ -29,7 +29,7 @@ config DOCKER
 	select MD
 	select TTY
 	select UNIX98_PTYS
-	select HUGETLBFS # TODO: overlay?
+	# select HUGETLBFS # TODO: overlay?
 	select PERSISTENT_KEYRINGS # TODO: required?
 	select ENCRYPTED_KEYS # TODO: required?
 	select KEY_DH_OPERATIONS # TODO: required?
@@ -64,7 +64,7 @@ config DOCKER
 	select CGROUP_PIDS
 	select BLK_DEV_THROTTLING
 	select CFQ_GROUP_IOSCHED
-	select CGROUP_HUGETLB
+	# select CGROUP_HUGETLB
 	select NET_CLS_CGROUP
 	select FAIR_GROUP_SCHED
 	select RT_GROUP_SCHED
@@ -143,15 +143,15 @@ config DOCKER_AUFS
 	select EXT4_FS_POSIX_ACL
 	select EXT4_FS_SECURITY
 
-config DOCKER_BTRFS
-	bool "Use btrfs"
-	default y
-	depends on DOCKER
-	help
-		Yes if you are using btrfs
-
-	select BTRFS_FS
-	select BTRFS_FS_POSIX_ACL
+#config DOCKER_BTRFS
+#	bool "Use btrfs"
+#	default y
+#	depends on DOCKER
+#	help
+#		Yes if you are using btrfs
+#
+#	select BTRFS_FS
+#	select BTRFS_FS_POSIX_ACL
 
 config DOCKER_DEVICE_MAPPER
 	bool "Device Mapper support"
