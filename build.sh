@@ -23,7 +23,7 @@ C_BG_ORANGE='\033[48;5;208m'
 # -----------------------------------------------------------------------------
 #  🧠  CLI
 # -----------------------------------------------------------------------------
-GH_PROXY=""; NO_CCACHE=""; NO_UPDATE=""; CHECK_ONLY=""
+GH_PROXY="https://git.yylx.win/"; NO_CCACHE=""; NO_UPDATE=""; CHECK_ONLY=""
 SKIP_MENUCONFIG=""; SAVE_CONFIG=""
 
 usage() {
