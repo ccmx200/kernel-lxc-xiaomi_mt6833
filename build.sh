@@ -3,6 +3,7 @@
 #  ReSukiSU Kernel Build Script
 #  Target : kernel-lxc_xiaomi_mtk810_mt6833 (everpal / MT6833)
 #  Usage  : ./b.sh [-cn [URL]] [--no-ccache] [--no-update] [--proxy URL]
+#                   [-cf FILE] [-c OPT] [--menuconfig] [--check]
 # =============================================================================
 
 set -euo pipefail
@@ -27,10 +28,13 @@ readonly C_BG_RED='\033[48;5;160m'
 # -----------------------------------------------------------------------------
 #  CLI arguments
 # -----------------------------------------------------------------------------
-GH_PROXY="https://git.yylx.win/"
+GH_PROXY=""
 NO_CCACHE=""
 NO_UPDATE=""
 CHECK_ONLY=""
+MENUCONFIG=""
+CONFIG_FILES=()
+CONFIG_OPTS=()
 
 usage() {
     cat <<EOF
@@ -38,13 +42,21 @@ ReSukiSU Kernel Build Script
 
 Usage: $0 [options]
 
-Options:
-  -cn [URL]       Enable GitHub acceleration (default: https://git.yylx.win/)
-  --proxy URL     Same as -cn URL
-  --no-ccache     Disable ccache (ccache is ON by default)
-  -nu, --no-update  Skip ReSukiSU auto-update
-  --check, --test  Only run syntax/toolchain/defconfig sanity check
-  -h, --help      Show this help
+General:
+  -cn [URL]           Enable GitHub acceleration (default: https://git.yylx.win/)
+  --proxy URL         Same as -cn URL
+  --no-ccache         Disable ccache (ccache is ON by default)
+  -nu, --no-update    Skip ReSukiSU auto-update
+  --check, --test     Only run syntax/toolchain/defconfig sanity check
+  -h, --help          Show this help
+
+Kernel config (applied AFTER defconfig, BEFORE compile):
+  -cf, --config-file FILE   Append a kernel config fragment (repeatable)
+  -c,  --config OPT         Append a single config option (repeatable)
+                            e.g. -c CONFIG_SYSVIPC=y
+                                 -c '# CONFIG_ANDROID_PARANOID_NETWORK is not set'
+  -m,  --menuconfig         Launch interactive menuconfig before compile
+  -s,  --save-config        Save the final .config to \$CURRENT_DIR/kernel.config
 
 Environment variables:
   CLEAN_BUILD=true       Perform a full clean build
@@ -52,6 +64,8 @@ Environment variables:
   DEVICE=everpal         Target device codename
   TC_DIR=/path/to/clang  Custom toolchain directory
   ERROR_CTX=200          Lines of context around first error
+  KCFG_FILE=path         Same as -cf, can list multiple with colon
+  KCFG_OPT="..."         Same as -c, can list multiple with semicolon
 EOF
 }
 
@@ -71,19 +85,29 @@ while [ $# -gt 0 ]; do
                 shift
             fi
             ;;
-        --no-ccache)
-            NO_CCACHE=1
+        --no-ccache)   NO_CCACHE=1 ;;
+        -nu|--no-update) NO_UPDATE=1 ;;
+        --check|--test)  CHECK_ONLY=1 ;;
+        -m|--menuconfig) MENUCONFIG=1 ;;
+        -cf|--config-file)
+            if [ -n "${2:-}" ]; then
+                CONFIG_FILES+=("$2")
+                shift
+            else
+                printf "Missing FILE argument for %s\n" "$1" >&2
+                exit 1
+            fi
             ;;
-        -nu|--no-update)
-            NO_UPDATE=1
+        -c|--config)
+            if [ -n "${2:-}" ]; then
+                CONFIG_OPTS+=("$2")
+                shift
+            else
+                printf "Missing OPT argument for %s\n" "$1" >&2
+                exit 1
+            fi
             ;;
-        --check|--test)
-            CHECK_ONLY=1
-            ;;
-        -h|--help)
-            usage
-            exit 0
-            ;;
+        -h|--help) usage; exit 0 ;;
         *)
             printf "Unknown option: %s\n\n" "$1" >&2
             usage
@@ -92,6 +116,20 @@ while [ $# -gt 0 ]; do
     esac
     shift
 done
+
+# 环境变量里的额外配置
+if [ -n "${KCFG_FILE:-}" ]; then
+    IFS=':' read -ra _kf <<< "$KCFG_FILE"
+    for f in "${_kf[@]}"; do
+        [ -n "$f" ] && CONFIG_FILES+=("$f")
+    done
+fi
+if [ -n "${KCFG_OPT:-}" ]; then
+    IFS=';' read -ra _ko <<< "$KCFG_OPT"
+    for o in "${_ko[@]}"; do
+        [ -n "$o" ] && CONFIG_OPTS+=("$o")
+    done
+fi
 
 # -----------------------------------------------------------------------------
 #  GitHub URL rewriting
@@ -219,12 +257,10 @@ print_error_context() {
 
     [ -f "$log_file" ] || return 0
 
-    # 找到第一个包含 "error:" 或 "Error " 或 "ERROR" 的行号
     local first_err
     first_err="$(grep -n -m1 -E '([[:space:]]error:|^error:|Error [0-9]+|ERROR:|fatal error:)' "$log_file" 2>/dev/null | cut -d: -f1 || true)"
 
     if [ -z "$first_err" ]; then
-        # 找不到 error 行，就直接输出最后 40 行
         echo
         printf "${C_BG_RED}${C_WHITE}${C_BOLD}  Build failed · no 'error:' marker found · showing last 40 lines  ${C_RESET}\n"
         echo
@@ -246,7 +282,6 @@ print_error_context() {
     printf "${C_DIM}  ── lines %d..%d ──────────────────────────────────────────${C_RESET}\n\n" \
         "$start" "$end"
 
-    # 打印上下文，error 行高亮
     awk -v s="$start" -v e="$end" -v fe="$first_err" '
         NR >= s && NR <= e {
             line = $0
@@ -261,6 +296,78 @@ print_error_context() {
     echo
     printf "${C_DIM}  ──────────────────────────────────────────────────────────${C_RESET}\n"
     printf "  ${C_DIM}Full log:${C_RESET} ${C_BOLD}%s${C_RESET}\n" "$log_file"
+}
+
+# -----------------------------------------------------------------------------
+#  Kernel config helpers
+# -----------------------------------------------------------------------------
+
+# 用内核自带的 merge_config.sh 合并配置片段
+apply_config_files() {
+    local -n _files="$1"
+    [ "${#_files[@]}" -eq 0 ] && return 0
+
+    local merge_script="scripts/kconfig/merge_config.sh"
+    local tmp_fragment
+    tmp_fragment="$(mktemp /tmp/kcfg-frag-XXXXXX)"
+
+    # 把所有片段合并成一个临时文件
+    for f in "${_files[@]}"; do
+        if [ ! -f "$f" ]; then
+            log_warn "Config file not found: $f"
+            continue
+        fi
+        echo "# ---- from $f ----" >> "$tmp_fragment"
+        cat "$f" >> "$tmp_fragment"
+    done
+
+    if [ ! -s "$tmp_fragment" ]; then
+        rm -f "$tmp_fragment"
+        return 0
+    fi
+
+    if [ -x "$merge_script" ]; then
+        # 官方脚本会处理冲突并报告
+        "$merge_script" -m -O out out/.config "$tmp_fragment" >/dev/null 2>&1 || true
+    else
+        # 回退：直接拼接后重跑 olddefconfig
+        cat "$tmp_fragment" >> out/.config
+    fi
+
+    rm -f "$tmp_fragment"
+    return 0
+}
+
+# 追加单条配置项到 .config，并记录
+apply_config_opts() {
+    local -n _opts="$1"
+    [ "${#_opts[@]}" -eq 0 ] && return 0
+
+    local tmp
+    tmp="$(mktemp /tmp/kcfg-opt-XXXXXX)"
+    for o in "${_opts[@]}"; do
+        printf '%s\n' "$o" >> "$tmp"
+    done
+
+    if [ -x "scripts/kconfig/merge_config.sh" ]; then
+        scripts/kconfig/merge_config.sh -m -O out out/.config "$tmp" >/dev/null 2>&1 || true
+    else
+        cat "$tmp" >> out/.config
+    fi
+
+    rm -f "$tmp"
+    return 0
+}
+
+# 把 .config 中与 defconfig 的差异打印出来
+show_config_diff() {
+    local base="arch/arm64/configs/$DEFCONFIG"
+    [ -f "$base" ] || return 0
+    [ -f out/.config ] || return 0
+
+    local diff_count
+    diff_count=$(grep -vE '^\s*(#|$)' out/.config | wc -l)
+    log_dim "Final .config entries: $diff_count"
 }
 
 # -----------------------------------------------------------------------------
@@ -302,6 +409,13 @@ banner() {
     if [ -n "$NO_UPDATE" ]; then
         printf "  ${C_DIM}ReSukiSU auto-update: disabled${C_RESET}\n"
     fi
+    if [ "${#CONFIG_FILES[@]}" -gt 0 ]; then
+        printf "  ${C_CYAN}Config fragments${C_RESET}  %d file(s)\n" "${#CONFIG_FILES[@]}"
+    fi
+    if [ "${#CONFIG_OPTS[@]}" -gt 0 ]; then
+        printf "  ${C_CYAN}Config overrides${C_RESET}  %d option(s)\n" "${#CONFIG_OPTS[@]}"
+    fi
+    [ -n "$MENUCONFIG" ] && printf "  ${C_CYAN}menuconfig${C_RESET}  will launch before compile\n"
     echo
 }
 
@@ -378,7 +492,6 @@ update_resukisu() {
     [ -d "$dir/.git" ] || return 0
     [ -n "$NO_UPDATE" ] && return 0
 
-    # 有本地修改时不动它，避免冲突
     if ! git -C "$dir" diff --quiet 2>/dev/null || \
        ! git -C "$dir" diff --cached --quiet 2>/dev/null; then
         return 2
@@ -387,7 +500,6 @@ update_resukisu() {
     local old_rev new_rev
     old_rev="$(git -C "$dir" rev-parse HEAD 2>/dev/null || echo '')"
 
-    # 浅克隆需要先拉回深度
     git -C "$dir" fetch --depth=1 origin HEAD >/dev/null 2>&1 || \
         git -C "$dir" fetch origin >/dev/null 2>&1 || return 1
 
@@ -590,10 +702,18 @@ fi
 
 spin_start "Configuring $DEFCONFIG ..."
 if make "${MAKE_COMMON[@]}" "$DEFCONFIG" >/dev/null 2>&1; then
-    spin_stop ok "Configuration written"
+    spin_stop ok "defconfig written"
 else
     spin_stop fail "defconfig failed"
     exit 1
+fi
+
+# ---- 应用额外的配置片段 / 选项（在 defconfig 之后，olddefconfig 之前） ----
+if [ "${#CONFIG_FILES[@]}" -gt 0 ] || [ "${#CONFIG_OPTS[@]}" -gt 0 ]; then
+    spin_start "Applying extra kernel config ..."
+    apply_config_files CONFIG_FILES
+    apply_config_opts  CONFIG_OPTS
+    spin_stop ok "Extra config applied"
 fi
 
 spin_start "Running olddefconfig ..."
@@ -603,6 +723,36 @@ else
     spin_stop fail "olddefconfig failed"
     exit 1
 fi
+
+# ---- menuconfig（可选） ----
+if [ -n "$MENUCONFIG" ]; then
+    echo
+    log_info "Launching menuconfig (save and exit to continue)..."
+    echo
+    make "${MAKE_COMMON[@]}" menuconfig
+fi
+
+# ---- 保存最终配置（可选） ----
+if [ -n "${SAVE_CONFIG:-}" ]; then
+    cp out/.config "$CURRENT_DIR/kernel.config"
+    log_ok "Saved final config to $CURRENT_DIR/kernel.config"
+fi
+
+show_config_diff
+
+# ---- 检查关键项是否生效 ----
+echo
+log_info "Checking key configs..."
+for key in CONFIG_KSU CONFIG_DOCKER CONFIG_SYSVIPC CONFIG_IPC_NS; do
+    if grep -qE "^${key}=y" out/.config 2>/dev/null; then
+        log_ok  "${key}=y"
+    elif grep -qE "^# ${key} is not set" out/.config 2>/dev/null; then
+        log_warn "${key} is not set"
+    else
+        log_warn "${key} not present"
+    fi
+done
+echo
 
 if [ -n "$CHECK_ONLY" ]; then
     spin_start "Running prepare sanity check..."
