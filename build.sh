@@ -1,41 +1,26 @@
 #!/bin/bash
 # =============================================================================
-#  🚀  ReSukiSU Kernel Builder  ·  Dual-Panel Edition v2
+#  🚀  ReSukiSU Kernel Builder  ·  Dual-Panel v3 (low-flicker)
 # =============================================================================
 
 set -euo pipefail
 
 # -----------------------------------------------------------------------------
-#  🎨  Colors
+#  🎨 Colors
 # -----------------------------------------------------------------------------
-readonly C_RESET='\033[0m'
-readonly C_BOLD='\033[1m'
-readonly C_DIM='\033[2m'
-readonly C_RED='\033[1;31m'
-readonly C_GREEN='\033[1;32m'
-readonly C_YELLOW='\033[1;33m'
-readonly C_CYAN='\033[1;36m'
-readonly C_WHITE='\033[1;37m'
-readonly C_ORANGE='\033[38;5;208m'
-readonly C_PINK='\033[38;5;213m'
-readonly C_LAVENDER='\033[38;5;183m'
-readonly C_SKY='\033[38;5;117m'
-readonly C_GREY='\033[38;5;245m'
-readonly C_BG_RED='\033[48;5;160m'
-readonly C_BG_GREEN='\033[48;5;28m'
-readonly C_BG_BLUE='\033[48;5;24m'
-readonly C_BG_PURPLE='\033[48;5;90m'
-readonly C_BG_TEAL='\033[48;5;30m'
+C_RESET='\033[0m'; C_BOLD='\033[1m'; C_DIM='\033[2m'
+C_RED='\033[1;31m'; C_GREEN='\033[1;32m'; C_YELLOW='\033[1;33m'
+C_CYAN='\033[1;36m'; C_WHITE='\033[1;37m'; C_ORANGE='\033[38;5;208m'
+C_PINK='\033[38;5;213m'; C_LAVENDER='\033[38;5;183m'; C_SKY='\033[38;5;117m'
+C_GREY='\033[38;5;245m'
+C_BG_RED='\033[48;5;160m'; C_BG_GREEN='\033[48;5;28m'
+C_BG_BLUE='\033[48;5;24m'; C_BG_PURPLE='\033[48;5;90m'
 
 # -----------------------------------------------------------------------------
-#  🧠  CLI
+#  🧠 CLI
 # -----------------------------------------------------------------------------
-GH_PROXY=""
-NO_CCACHE=""
-NO_UPDATE=""
-CHECK_ONLY=""
-SKIP_MENUCONFIG=""
-SAVE_CONFIG=""
+GH_PROXY=""; NO_CCACHE=""; NO_UPDATE=""; CHECK_ONLY=""
+SKIP_MENUCONFIG=""; SAVE_CONFIG=""
 
 usage() {
     printf "${C_ORANGE}${C_BOLD}🚀 ReSukiSU Kernel Builder${C_RESET}\n\n"
@@ -43,10 +28,12 @@ usage() {
     printf "  ${C_CYAN}--no-ccache${C_RESET}        Disable ccache\n"
     printf "  ${C_CYAN}-nu${C_RESET}                Skip ReSukiSU update\n"
     printf "  ${C_CYAN}--no-menuconfig${C_RESET}    Skip menuconfig\n"
+    printf "  ${C_CYAN}--no-panel${C_RESET}         Disable dual panel\n"
     printf "  ${C_CYAN}-s${C_RESET}                 Save final config\n"
     printf "  ${C_CYAN}--check${C_RESET}            Sanity check only\n"
 }
 
+NO_PANEL=""
 while [ $# -gt 0 ]; do
     case "$1" in
         -cn|--cn)
@@ -60,6 +47,7 @@ while [ $# -gt 0 ]; do
         --no-ccache)     NO_CCACHE=1 ;;
         -nu|--no-update) NO_UPDATE=1 ;;
         --no-menuconfig) SKIP_MENUCONFIG=1 ;;
+        --no-panel)      NO_PANEL=1 ;;
         -s|--save-config) SAVE_CONFIG=1 ;;
         --check|--test)  CHECK_ONLY=1 ;;
         -h|--help)       usage; exit 0 ;;
@@ -68,9 +56,6 @@ while [ $# -gt 0 ]; do
     shift
 done
 
-# -----------------------------------------------------------------------------
-#  🌐  GitHub URL
-# -----------------------------------------------------------------------------
 gh_url() {
     [ -z "$GH_PROXY" ] && { printf '%s' "$1"; return; }
     printf '%s' "$1" | sed \
@@ -79,7 +64,7 @@ gh_url() {
 }
 
 # =============================================================================
-#  🖼️  全局双栏面板
+#  🖼️  Panel
 # =============================================================================
 PANEL_LOG_FILE=""
 PANEL_STATE_FILE=""
@@ -87,150 +72,197 @@ PANEL_STOP_FILE=""
 PANEL_REFRESH_PID=""
 PANEL_ACTIVE=0
 PANEL_SUSPEND=0
+PANEL_TERM_W=80
+PANEL_TERM_H=24
+PANEL_USE=1                 # 1=启用双栏, 0=降级普通模式
+PANEL_LEFT_W=22
+PANEL_TOP_ROWS=8            # 标题1 + 6步 + 分隔线1
+PANEL_ROLL_ROW=$((PANEL_TOP_ROWS + 1))
 
-# 步骤定义
-readonly STEP_NAMES=("1/6 Cleanup  " "2/6 Toolchain" "3/6 ReSukiSU " "4/6 Config   " "5/6 VDSO     " "6/6 Compile  ")
+readonly STEP_NAMES=("1/6 Cleanup" "2/6 Toolchain" "3/6 ReSukiSU" "4/6 Config" "5/6 VDSO" "6/6 Compile")
 readonly STEP_COUNT=6
-readonly PANEL_ROWS=$((STEP_COUNT + 2))       # 标题 + 6 步 + 分隔线 = 8 行
-readonly ROLL_START_ROW=$((PANEL_ROWS + 1))   # 滚动区从第 9 行开始
 
-# 更新面板状态（写文件，供后台线程读取）
+# 缓存上一帧（增量重绘）
+declare -a _LAST_LINES=()
+declare -a _LAST_ICONS=()
+
+# 状态文件读写
 panel_set_mark() {
     local idx=$1 state=$2
+    [ "$PANEL_USE" = "0" ] && return
     [ -z "$PANEL_STATE_FILE" ] && return
-    local -a states
-    mapfile -t states < "$PANEL_STATE_FILE"
-    states[$idx]="$state"
-    printf '%s\n' "${states[@]}" > "$PANEL_STATE_FILE"
+    local -a s
+    mapfile -t s < "$PANEL_STATE_FILE" 2>/dev/null || s=()
+    while [ "${#s[@]}" -lt "$STEP_COUNT" ]; do s+=("WAIT"); done
+    s[$idx]="$state"
+    printf '%s\n' "${s[@]}" > "$PANEL_STATE_FILE"
 }
 
-# 记录日志（写入文件，供面板右侧显示）
 panel_log() {
     [ -z "$PANEL_LOG_FILE" ] && return
     printf '%s\n' "$1" >> "$PANEL_LOG_FILE"
-    # 截断，最多保留 200 行
     local n
     n=$(wc -l < "$PANEL_LOG_FILE" 2>/dev/null || echo 0)
-    if [ "$n" -gt 200 ]; then
-        tail -n 200 "$PANEL_LOG_FILE" > "${PANEL_LOG_FILE}.tmp" && \
+    if [ "$n" -gt 300 ]; then
+        tail -n 300 "$PANEL_LOG_FILE" > "${PANEL_LOG_FILE}.tmp" && \
             mv "${PANEL_LOG_FILE}.tmp" "$PANEL_LOG_FILE"
     fi
 }
 
-# 内部：绘制整个面板
-_panel_draw() {
+# 图标
+_step_icon() {
+    case "$1" in
+        DONE) printf '✅' ;;
+        RUN)  printf '🔄' ;;
+        FAIL) printf '❌' ;;
+        *)    printf '⏸ ' ;;
+    esac
+}
+_step_color() {
+    case "$1" in
+        DONE) printf '%s' "$C_GREEN" ;;
+        RUN)  printf '%s' "$C_YELLOW" ;;
+        FAIL) printf '%s' "$C_RED" ;;
+        *)    printf '%s' "$C_DIM" ;;
+    esac
+}
+
+# 增量重绘
+_panel_render() {
     [ "$PANEL_SUSPEND" = "1" ] && return 0
     [ "$PANEL_ACTIVE" = "0" ] && return 0
 
-    local term_w
-    term_w=$(tput cols 2>/dev/null || echo 100)
-    [ "$term_w" -lt 60 ] && term_w=80
+    local -a states logs
+    mapfile -t states < "$PANEL_STATE_FILE" 2>/dev/null || states=()
+    while [ "${#states[@]}" -lt "$STEP_COUNT" ]; do states+=("WAIT"); done
 
-    local -a states
-    mapfile -t states < "$PANEL_STATE_FILE" 2>/dev/null || true
-
-    local -a logs
     mapfile -t logs < <(tail -n "$STEP_COUNT" "$PANEL_LOG_FILE" 2>/dev/null || true)
 
-    printf '\033[s'
+    local rw=$((PANEL_TERM_W - PANEL_LEFT_W - 6))
+    [ "$rw" -lt 15 ] && rw=15
 
-    # 标题栏（第 1 行）
-    printf '\033[1;1H\033[K'
-    printf "${C_BG_PURPLE}${C_WHITE}${C_BOLD}  Build Progress  ${C_RESET} ${C_GREY}│${C_RESET} ${C_BG_BLUE}${C_WHITE}${C_BOLD}  Live Log  ${C_RESET}"
+    printf '\033[?2026h'
 
-    # 6 步
     local i=0
     while [ "$i" -lt "$STEP_COUNT" ]; do
-        local row=$((i + 2))
-        local state="${states[$i]:-WAIT}"
+        local state="${states[$i]}"
         local log="${logs[$i]:-}"
-
         local icon color
-        case "$state" in
-            DONE) icon="✅"; color="$C_GREEN" ;;
-            RUN)  icon="🔄"; color="$C_YELLOW" ;;
-            FAIL) icon="❌"; color="$C_RED" ;;
-            *)    icon="⏸ "; color="$C_DIM" ;;
-        esac
+        icon="$(_step_icon "$state")"
+        color="$(_step_color "$state")"
 
-        printf '\033[%d;1H\033[K' "$row"
-        printf "  ${C_WHITE}%s${C_RESET} ${color}%s${C_RESET} ${C_GREY}│${C_RESET} " \
-            "${STEP_NAMES[$i]}" "$icon"
+        # 截断日志
+        [ "${#log}" -gt "$rw" ] && log="${log:0:$((rw-3))}..."
 
-        if [ -n "$log" ]; then
-            local rw=$((term_w - 32))
-            [ "$rw" -lt 20 ] && rw=20
-            [ "${#log}" -gt "$rw" ] && log="${log:0:$((rw-3))}..."
-            printf "${C_DIM}%s${C_RESET}" "$log"
+        # 只有状态或日志变化才重绘
+        if [ "${_LAST_ICONS[$i]:-}" != "$state" ] || [ "${_LAST_LINES[$i]:-}" != "$log" ]; then
+            local row=$((i + 2))
+            printf '\033[%d;1H\033[K' "$row"
+            printf "  ${C_WHITE}%-$((PANEL_LEFT_W - 4))s${C_RESET} ${color}%s${C_RESET} ${C_GREY}│${C_RESET} ${C_DIM}%s${C_RESET}" \
+                "${STEP_NAMES[$i]}" "$icon" "$log"
+            _LAST_ICONS[$i]="$state"
+            _LAST_LINES[$i]="$log"
         fi
         i=$((i + 1))
     done
 
-    # 分隔线
-    printf '\033[%d;1H\033[K' "$PANEL_ROWS"
-    printf "${C_GREY}"
-    printf '─%.0s' $(seq 1 $((term_w - 2)))
-    printf "${C_RESET}"
-
-    printf '\033[u'
+    printf '\033[?2026l'
 }
 
-# 启动面板
+# 首帧全绘制（标题 + 分隔线 + 全部步骤）
+_panel_first_draw() {
+    printf '\033[?2026h'
+
+    # 标题栏
+    printf '\033[1;1H\033[K'
+    printf "${C_BG_PURPLE}${C_WHITE}${C_BOLD}  Build Progress  ${C_RESET} ${C_GREY}│${C_RESET} ${C_BG_BLUE}${C_WHITE}${C_BOLD}  Live Log  ${C_RESET}"
+
+    # 步骤行（初始 WAIT）
+    local i=0
+    while [ "$i" -lt "$STEP_COUNT" ]; do
+        local row=$((i + 2))
+        printf '\033[%d;1H\033[K' "$row"
+        printf "  ${C_WHITE}%-$((PANEL_LEFT_W - 4))s${C_RESET} ${C_DIM}⏸ ${C_RESET} ${C_GREY}│${C_RESET} " \
+            "${STEP_NAMES[$i]}"
+        i=$((i + 1))
+    done
+
+    # 分隔线
+    printf '\033[%d;1H\033[K' "$PANEL_TOP_ROWS"
+    printf "${C_GREY}"
+    printf '─%.0s' $(seq 1 "$PANEL_TERM_W")
+    printf "${C_RESET}"
+
+    printf '\033[?2026l'
+}
+
 panel_start() {
     [ "$PANEL_ACTIVE" = "1" ] && return 0
-    PANEL_ACTIVE=1
+    [ "$NO_PANEL" = "1" ] && { PANEL_USE=0; return 0; }
 
+    # 读终端尺寸（只读一次）
+    local size
+    size=$(stty size 2>/dev/null || echo "24 80")
+    PANEL_TERM_H=${size% *}
+    PANEL_TERM_W=${size#* }
+    [ "$PANEL_TERM_W" -lt 1 ] && PANEL_TERM_W=80
+    [ "$PANEL_TERM_H" -lt 1 ] && PANEL_TERM_H=24
+
+    # 太小就降级
+    if [ "$PANEL_TERM_W" -lt 60 ] || [ "$PANEL_TERM_H" -lt 20 ]; then
+        PANEL_USE=0
+        printf "${C_YELLOW}⚠️  终端太小 (%dx%d)，禁用双栏面板${C_RESET}\n" \
+            "$PANEL_TERM_W" "$PANEL_TERM_H"
+        return 0
+    fi
+
+    # 左栏宽度自适应
+    if   [ "$PANEL_TERM_W" -ge 100 ]; then PANEL_LEFT_W=24
+    elif [ "$PANEL_TERM_W" -ge 80  ]; then PANEL_LEFT_W=22
+    else                                    PANEL_LEFT_W=20
+    fi
+
+    PANEL_ACTIVE=1
     PANEL_LOG_FILE="$(mktemp /tmp/panel-log-XXXXXX)"
     PANEL_STATE_FILE="$(mktemp /tmp/panel-state-XXXXXX)"
     PANEL_STOP_FILE="$(mktemp /tmp/panel-stop-XXXXXX)"
-
     printf 'WAIT\nWAIT\nWAIT\nWAIT\nWAIT\nWAIT\n' > "$PANEL_STATE_FILE"
 
-    local term_lines
-    term_lines=$(tput lines 2>/dev/null || echo 24)
-
     clear 2>/dev/null || true
-
-    # 设置滚动区域：第 9 行到末行（面板区不参与滚动）
-    if [ "$term_lines" -gt "$PANEL_ROWS" ]; then
-        printf "\033[%d;%dr" "$ROLL_START_ROW" "$term_lines"
-    fi
-    printf "\033[%d;1H" "$ROLL_START_ROW"
-
     printf '\033[?25l'
 
-    _panel_draw
+    # 滚动区从第 9 行开始
+    printf '\033[%d;%dr' "$PANEL_ROLL_ROW" "$PANEL_TERM_H"
 
-    printf "\033[%d;1H" "$ROLL_START_ROW"
-    printf '\033[?25h'
+    _panel_first_draw
 
-    # 后台刷新线程
+    # 光标放到滚动区顶部
+    printf '\033[%d;1H' "$PANEL_ROLL_ROW"
+
+    # 后台增量刷新（0.3s 间隔）
     (
         while [ ! -s "$PANEL_STOP_FILE" ]; do
-            _panel_draw 2>/dev/null || true
-            sleep 0.12
+            _panel_render 2>/dev/null || true
+            sleep 0.3
         done
     ) &
     PANEL_REFRESH_PID=$!
     disown "$PANEL_REFRESH_PID" 2>/dev/null || true
 }
 
-# 停止面板
 panel_stop() {
     [ "$PANEL_ACTIVE" = "0" ] && return 0
     PANEL_ACTIVE=0
 
     if [ -n "$PANEL_REFRESH_PID" ]; then
         : > "$PANEL_STOP_FILE" 2>/dev/null || true
-        sleep 0.2
+        sleep 0.4
         kill "$PANEL_REFRESH_PID" 2>/dev/null || true
         wait "$PANEL_REFRESH_PID" 2>/dev/null || true
         PANEL_REFRESH_PID=""
     fi
 
-    # 恢复滚动区域
-    printf '\033[r'
-    printf '\033[?25h'
+    printf '\033[r\033[?25h'
 
     [ -n "$PANEL_STOP_FILE" ] && rm -f "$PANEL_STOP_FILE"
     [ -n "$PANEL_LOG_FILE" ] && rm -f "$PANEL_LOG_FILE"
@@ -238,30 +270,20 @@ panel_stop() {
     PANEL_STOP_FILE=""; PANEL_LOG_FILE=""; PANEL_STATE_FILE=""
 }
 
-# 挂起面板（menuconfig 用）
 panel_suspend() {
     PANEL_SUSPEND=1
-    printf '\033[r'          # 恢复滚动区域
-    printf '\033[?25h'       # 显示光标
-    printf "\033[%d;1H\n\n" "$ROLL_START_ROW"
+    printf '\033[r\033[?25h'
+    printf "\033[%d;1H\n\n" "$PANEL_ROLL_ROW"
 }
 
-# 恢复面板
 panel_resume() {
     PANEL_SUSPEND=0
-    local term_lines
-    term_lines=$(tput lines 2>/dev/null || echo 24)
-    if [ "$term_lines" -gt "$PANEL_ROWS" ]; then
-        printf "\033[%d;%dr" "$ROLL_START_ROW" "$term_lines"
-    fi
-    printf '\033[?25l'
-    printf "\033[%d;1H" "$ROLL_START_ROW"
-    _panel_draw
-    printf '\033[?25h'
+    printf '\033[%d;%dr\033[?25l\033[%d;1H' \
+        "$PANEL_ROLL_ROW" "$PANEL_TERM_H" "$PANEL_ROLL_ROW"
 }
 
 # -----------------------------------------------------------------------------
-#  📝  Logging
+#  📝 Logging
 # -----------------------------------------------------------------------------
 log_info()  { panel_log "💡 $1"; }
 log_ok()    { panel_log "✅ $1"; }
@@ -269,23 +291,22 @@ log_warn()  { panel_log "⚠️  $1"; }
 log_error() { panel_log "❌ $1"; }
 log_dim()   { panel_log "   $1"; }
 
-# 输出到滚动区（会正常向下滚动，不冲掉面板）
-print_scroll() {
-    printf "%s\n" "$1"
-}
+# 直接输出到滚动区（不受面板影响）
+print_scroll() { printf "%s\n" "$1"; }
 
-# spinner（显示在滚动区顶部，由后台线程更新）
+# Spinner（滚动区顶行）
 SPINNER_PID=""
 spin_start() {
     local msg="$1"
+    [ "$PANEL_ACTIVE" = "0" ] && { printf "  %s..." "$msg"; return; }
     local frames=('⠋' '⠙' '⠹' '⠸' '⠼' '⠴' '⠦' '⠧' '⠇' '⠏')
     (
         local i=0
         while :; do
-            printf "\033[%d;1H\033[K${C_CYAN}  ${frames[$i]}${C_RESET}  ${C_DIM}%s${C_RESET}" \
-                "$ROLL_START_ROW" "$msg"
+            printf '\033[%d;1H\033[K%s  %s  %s%s%s' \
+                "$PANEL_ROLL_ROW" "$C_CYAN" "${frames[$i]}" "$C_RESET" "$C_DIM" "$msg$C_RESET"
             i=$(( (i + 1) % ${#frames[@]} ))
-            sleep 0.08
+            sleep 0.1
         done
     ) &
     SPINNER_PID=$!
@@ -300,17 +321,21 @@ spin_stop() {
         wait "$SPINNER_PID" 2>/dev/null || true
         SPINNER_PID=""
     fi
-    printf "\033[%d;1H\033[K" "$ROLL_START_ROW"
+    if [ "$PANEL_ACTIVE" = "1" ]; then
+        printf '\033[%d;1H\033[K' "$PANEL_ROLL_ROW"
+    else
+        printf "\n"
+    fi
     case "$status" in
-        ok)   log_ok "$msg" ;;
-        fail) log_error "$msg" ;;
-        warn) log_warn "$msg" ;;
-        *)    log_info "$msg" ;;
+        ok)   log_ok "$msg";   [ "$PANEL_ACTIVE" = "0" ] && printf "${C_GREEN}  ✅${C_RESET}  %s\n" "$msg" ;;
+        fail) log_error "$msg"; [ "$PANEL_ACTIVE" = "0" ] && printf "${C_RED}  ❌${C_RESET}  %s\n" "$msg" >&2 ;;
+        warn) log_warn "$msg"; [ "$PANEL_ACTIVE" = "0" ] && printf "${C_YELLOW}  ⚠️${C_RESET}   %s\n" "$msg" ;;
+        *)    log_info "$msg"; [ "$PANEL_ACTIVE" = "0" ] && printf "${C_SKY}  💡${C_RESET}  %s\n" "$msg" ;;
     esac
 }
 
 # -----------------------------------------------------------------------------
-#  🚨  Error context
+#  🚨 Error context
 # -----------------------------------------------------------------------------
 ERROR_CTX="${ERROR_CTX:-200}"
 
@@ -323,35 +348,30 @@ print_error_context() {
     first_err="$(grep -n -m1 -E '([[:space:]]error:|^error:|Error [0-9]+|ERROR:|fatal error:)' "$log_file" 2>/dev/null | cut -d: -f1 || true)"
 
     if [ -z "$first_err" ]; then
-        printf "\n${C_BG_RED}${C_WHITE}${C_BOLD}  ❌ Build failed  ·  no 'error:' marker  ${C_RESET}\n\n"
+        printf "\n${C_BG_RED}${C_WHITE}${C_BOLD}  ❌ Build failed  ·  no error marker  ${C_RESET}\n\n"
         tail -n 40 "$log_file" | sed 's/^/    /'
         return 0
     fi
 
-    local total
-    total="$(wc -l < "$log_file")"
-    local start=$(( first_err - ctx ))
-    local end=$(( first_err + ctx ))
+    local total start end
+    total=$(wc -l < "$log_file")
+    start=$(( first_err - ctx )); end=$(( first_err + ctx ))
     [ "$start" -lt 1 ] && start=1
     [ "$end" -gt "$total" ] && end="$total"
 
-    printf "\n${C_BG_RED}${C_WHITE}${C_BOLD}  ❌ Build failed  ·  line %d / %d  ·  context ±%d  ${C_RESET}\n" \
+    printf "\n${C_BG_RED}${C_WHITE}${C_BOLD}  ❌ Build failed  ·  line %d/%d  ·  ±%d  ${C_RESET}\n" \
         "$first_err" "$total" "$ctx"
-    printf "\n${C_DIM}  ── lines %d..%d ──────────────────────────────${C_RESET}\n\n" "$start" "$end"
+    printf "${C_DIM}  ─── lines %d..%d ───${C_RESET}\n\n" "$start" "$end"
 
     awk -v s="$start" -v e="$end" -v fe="$first_err" '
-        NR >= s && NR <= e {
-            if (NR == fe) printf "\033[1;31m  ▶ %s\033[0m\n", $0
-            else          printf "    %s\n", $0
-        }
+        NR>=s && NR<=e { if (NR==fe) printf "\033[1;31m  ▶ %s\033[0m\n",$0; else printf "    %s\n",$0 }
     ' "$log_file"
 
-    printf "\n${C_DIM}  ──────────────────────────────────────────────${C_RESET}\n"
-    printf "  ${C_DIM}Full log:${C_RESET} ${C_BOLD}%s${C_RESET}\n" "$log_file"
+    printf "\n  ${C_DIM}Full log:${C_RESET} ${C_BOLD}%s${C_RESET}\n" "$log_file"
 }
 
 # -----------------------------------------------------------------------------
-#  🔧  Config diff
+#  🔧 Config diff
 # -----------------------------------------------------------------------------
 CFG_BEFORE=""; CFG_AFTER=""
 
@@ -363,13 +383,8 @@ norm_config() {
 print_config_block() {
     local title="$1" file="$2" fg="$3" bg="$4" count="$5"
     [ ! -s "$file" ] && return 0
-    local term_w
-    term_w=$(tput cols 2>/dev/null || echo 100)
-    [ "$term_w" -lt 40 ] && term_w=80
-    local lw=$((term_w - 6))
-
     printf "\n  ${bg}${C_WHITE}${C_BOLD}  %s  ·  %d items  ${C_RESET}\n" "$title" "$count"
-    printf "  ${fg}"; printf '─%.0s' $(seq 1 "$lw"); printf "${C_RESET}\n"
+    printf "  ${fg}"; printf '─%.0s' $(seq 1 $((PANEL_TERM_W - 6))); printf "${C_RESET}\n"
     while IFS= read -r line; do
         [ -z "$line" ] && continue
         printf "  ${fg}  %s${C_RESET}\n" "$line"
@@ -382,10 +397,9 @@ show_menuconfig_diff() {
     b="$(mktemp)"; a="$(mktemp)"
     norm_config "$CFG_BEFORE" > "$b"
     norm_config "$CFG_AFTER"  > "$a"
-    local added removed
+    local added removed an=0 rn=0
     added="$(comm -13 "$b" "$a" || true)"
     removed="$(comm -23 "$b" "$a" || true)"
-    local an=0 rn=0
     [ -n "$added" ] && an=$(printf '%s\n' "$added" | grep -c . || true)
     [ -n "$removed" ] && rn=$(printf '%s\n' "$removed" | grep -c . || true)
 
@@ -400,8 +414,8 @@ show_menuconfig_diff() {
     lf="$(mktemp)"; rf="$(mktemp)"
     [ -n "$added" ]   && printf '%s\n' "$added"   > "$lf"
     [ -n "$removed" ] && printf '%s\n' "$removed" > "$rf"
-    print_config_block "➕ 新增 (Added)"   "$lf" "$C_GREEN" "$C_BG_GREEN" "$an"
-    print_config_block "➖ 移除 (Removed)" "$rf" "$C_RED"   "$C_BG_RED"   "$rn"
+    print_config_block "➕ Added"   "$lf" "$C_GREEN" "$C_BG_GREEN" "$an"
+    print_config_block "➖ Removed" "$rf" "$C_RED"   "$C_BG_RED"   "$rn"
     rm -f "$b" "$a" "$lf" "$rf"
 }
 
@@ -419,34 +433,28 @@ check_key_configs() {
 }
 
 # -----------------------------------------------------------------------------
-#  📦  ReSukiSU info
+#  📦 ReSukiSU info
 # -----------------------------------------------------------------------------
 RSU_VERSION="unknown"; RSU_COMMIT="unknown"
-RSU_BRANCH="unknown";  RSU_DATE="unknown"
-RSU_DIRTY="clean";     RSU_UPDATED="no"
+RSU_BRANCH="unknown";  RSU_DIRTY="clean"; RSU_UPDATED="no"
 
 get_resukisu_info() {
     local dir="$CURRENT_DIR/ReSukiSU"
-    RSU_VERSION="unknown"; RSU_COMMIT="unknown"
-    RSU_BRANCH="unknown";  RSU_DATE="unknown"
-    RSU_DIRTY="clean"
-
+    RSU_VERSION="unknown"; RSU_COMMIT="unknown"; RSU_BRANCH="unknown"; RSU_DIRTY="clean"
     if [ ! -d "$dir/.git" ] && [ -d "$dir/kernel" ]; then
         RSU_VERSION="vendored"; RSU_COMMIT="vendored"; RSU_BRANCH="main"
         return 0
     fi
-
     if git -C "$dir" rev-parse --git-dir >/dev/null 2>&1; then
         RSU_COMMIT="$(git -C "$dir" rev-parse --short=12 HEAD 2>/dev/null || echo unknown)"
         RSU_BRANCH="$(git -C "$dir" rev-parse --abbrev-ref HEAD 2>/dev/null || echo unknown)"
-        RSU_DATE="$(git -C "$dir" log -1 --format='%cd' --date=format:'%Y-%m-%d %H:%M' 2>/dev/null || echo unknown)"
         if ! git -C "$dir" diff --quiet 2>/dev/null || \
            ! git -C "$dir" diff --cached --quiet 2>/dev/null; then
             RSU_DIRTY="dirty"
         fi
-        local described
-        described="$(git -C "$dir" describe --tags --always 2>/dev/null || echo '')"
-        [ -n "$described" ] && RSU_VERSION="$described"
+        local d
+        d="$(git -C "$dir" describe --tags --always 2>/dev/null || echo '')"
+        [ -n "$d" ] && RSU_VERSION="$d"
     fi
     return 0
 }
@@ -464,13 +472,7 @@ update_resukisu() {
     old="$(git -C "$dir" rev-parse HEAD 2>/dev/null || echo '')"
     git -C "$dir" fetch --depth=1 origin HEAD >/dev/null 2>&1 || \
         git -C "$dir" fetch origin >/dev/null 2>&1 || return 1
-    local upstream
-    upstream="$(git -C "$dir" rev-parse --abbrev-ref --symbolic-full-name '@{u}' 2>/dev/null || echo '')"
-    if [ -n "$upstream" ]; then
-        new="$(git -C "$dir" rev-parse "$upstream" 2>/dev/null || echo '')"
-    else
-        new="$(git -C "$dir" rev-parse FETCH_HEAD 2>/dev/null || echo '')"
-    fi
+    new="$(git -C "$dir" rev-parse FETCH_HEAD 2>/dev/null || echo '')"
     [ -z "$new" ] && return 1
     [ "$old" = "$new" ] && return 3
     git -C "$dir" reset --hard "$new" >/dev/null 2>&1 || return 1
@@ -486,7 +488,6 @@ cd "$CURRENT_DIR"
 
 CLEAN_BUILD="${CLEAN_BUILD:-false}"
 ZIP_ANY_KERNEL="${ZIP_ANY_KERNEL:-true}"
-
 SECONDS=0
 DATE="$(date '+%Y%m%d-%H%M')"
 DEVICE="${DEVICE:-everpal}"
@@ -503,7 +504,6 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# 启动面板
 panel_start
 
 # ---- 1/6 Cleanup ----
@@ -551,7 +551,7 @@ if [ ! -d "$CURRENT_DIR/ReSukiSU/kernel" ]; then
         "$CLONE_URL" "$CURRENT_DIR/ReSukiSU" >/dev/null 2>&1; then
         spin_stop ok "ReSukiSU cloned"; RSU_UPDATED="yes"
     else
-        spin_stop fail "Failed to clone"; panel_set_mark 2 FAIL; exit 1
+        spin_stop fail "Clone failed"; panel_set_mark 2 FAIL; exit 1
     fi
 else
     log_ok "ReSukiSU source present"
@@ -570,8 +570,7 @@ else
         esac
     fi
 fi
-
-spin_start "Reading version info..."
+spin_start "Reading version..."
 get_resukisu_info
 spin_stop ok "Version: $RSU_VERSION ($RSU_COMMIT)"
 
@@ -585,7 +584,6 @@ panel_set_mark 2 DONE
 
 # ---- 4/6 Config ----
 panel_set_mark 3 RUN
-
 MAKE_COMMON=(
     O=out ARCH=arm64 CC="$CC" LD="$LD"
     LLVM=1 LLVM_IAS=1 NM=llvm-nm
@@ -613,7 +611,7 @@ if [ -z "$SKIP_MENUCONFIG" ]; then
     cp out/.config "$CFG_BEFORE"
 
     panel_suspend
-    printf "\n${C_BG_TEAL}${C_WHITE}${C_BOLD}  🎛️  menuconfig  ${C_RESET}\n\n"
+    printf "\n${C_BG_TEAL:-}${C_WHITE}${C_BOLD}  🎛️  menuconfig  ${C_RESET}\n\n"
     printf "  ${C_SKY}↑↓ 移动  空格 切换  / 搜索  Enter 进入  ESC ESC 返回${C_RESET}\n"
     printf "  ${C_YELLOW}⚠️  退出前记得 <Save>${C_RESET}\n\n"
 
@@ -633,7 +631,6 @@ if [ -z "$SKIP_MENUCONFIG" ]; then
     cp out/.config "$CFG_AFTER"
 
     panel_resume
-    # diff 输出到滚动区
     show_menuconfig_diff
 
     rm -f "$CFG_BEFORE" "$CFG_AFTER"
@@ -651,20 +648,14 @@ check_key_configs
 panel_set_mark 3 DONE
 
 if [ -n "$CHECK_ONLY" ]; then
-    panel_set_mark 4 DONE
-    panel_set_mark 5 DONE
+    panel_set_mark 4 DONE; panel_set_mark 5 DONE
     spin_start "Sanity check..."
     if make -j"$(nproc --all)" "${MAKE_COMMON[@]}" prepare >/dev/null 2>&1; then
         spin_stop ok "Sanity check passed"
-        sleep 0.5
-        panel_stop
-        exit 0
+        sleep 0.5; panel_stop; exit 0
     else
         spin_stop fail "Sanity check failed"
-        panel_set_mark 5 FAIL
-        sleep 0.3
-        panel_stop
-        exit 1
+        panel_set_mark 5 FAIL; sleep 0.3; panel_stop; exit 1
     fi
 fi
 
@@ -689,7 +680,6 @@ log_info "Starting compilation..."
 BUILD_LOG="$(mktemp /tmp/kernel-build-XXXXXX.log)"
 START_TS=$(date +%s)
 
-# 编译（日志写文件）
 (
     make -j"$(nproc --all)" "${MAKE_COMMON[@]}" \
         KCFLAGS="-Wno-error=default-const-init-var-unsafe -Wno-default-const-init-var-unsafe" \
@@ -698,7 +688,7 @@ START_TS=$(date +%s)
 ) &
 BUILD_PID=$!
 
-# 后台喂日志给面板
+# 后台喂日志
 (
     prev=0
     while kill -0 "$BUILD_PID" 2>/dev/null; do
@@ -711,9 +701,8 @@ BUILD_PID=$!
                 prev=$total
             fi
         fi
-        sleep 0.2
+        sleep 0.4
     done
-    # 补最后几行
     if [ -f "$BUILD_LOG" ]; then
         total=$(wc -l < "$BUILD_LOG" 2>/dev/null || echo 0)
         if [ "$total" -gt "$prev" ]; then
@@ -731,8 +720,7 @@ make_rc=0
 wait "$LOG_FEED_PID" 2>/dev/null || true
 
 if [ "$make_rc" -eq 0 ]; then
-    END_TS=$(date +%s)
-    BUILD_TIME=$(( END_TS - START_TS ))
+    END_TS=$(date +%s); BUILD_TIME=$(( END_TS - START_TS ))
     panel_set_mark 5 DONE
     sleep 0.5
     panel_stop
