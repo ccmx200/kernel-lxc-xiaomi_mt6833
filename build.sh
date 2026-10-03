@@ -15,11 +15,9 @@ set -euo pipefail
 readonly C_RESET='\033[0m'
 readonly C_BOLD='\033[1m'
 readonly C_DIM='\033[2m'
-
 readonly C_RED='\033[1;31m'
 readonly C_GREEN='\033[1;32m'
 readonly C_YELLOW='\033[1;33m'
-readonly C_BLUE='\033[1;34m'
 readonly C_MAGENTA='\033[1;35m'
 readonly C_CYAN='\033[1;36m'
 readonly C_WHITE='\033[1;37m'
@@ -28,8 +26,6 @@ readonly C_PINK='\033[38;5;213m'
 readonly C_LAVENDER='\033[38;5;183m'
 readonly C_MINT='\033[38;5;121m'
 readonly C_SKY='\033[38;5;117m'
-
-readonly C_BG_ORANGE='\033[48;5;208m'
 readonly C_BG_RED='\033[48;5;160m'
 readonly C_BG_GREEN='\033[48;5;28m'
 readonly C_BG_BLUE='\033[48;5;24m'
@@ -43,7 +39,6 @@ GH_PROXY=""
 NO_CCACHE=""
 NO_UPDATE=""
 CHECK_ONLY=""
-FORCE_MENUCONFIG=""
 SKIP_MENUCONFIG=""
 SAVE_CONFIG=""
 
@@ -77,13 +72,11 @@ while [ $# -gt 0 ]; do
                 GH_PROXY="https://git.yylx.win/"
             fi
             ;;
-        --proxy)
-            [ -n "${2:-}" ] && { GH_PROXY="$2"; shift; }
-            ;;
+        --proxy)         [ -n "${2:-}" ] && { GH_PROXY="$2"; shift; } ;;
         --no-ccache)     NO_CCACHE=1 ;;
         -nu|--no-update) NO_UPDATE=1 ;;
-        -m|--menuconfig) FORCE_MENUCONFIG=1; SKIP_MENUCONFIG="" ;;
-        --no-menuconfig) SKIP_MENUCONFIG=1; FORCE_MENUCONFIG="" ;;
+        -m|--menuconfig) SKIP_MENUCONFIG="" ;;
+        --no-menuconfig) SKIP_MENUCONFIG=1 ;;
         -s|--save-config) SAVE_CONFIG=1 ;;
         --check|--test)  CHECK_ONLY=1 ;;
         -h|--help)       usage; exit 0 ;;
@@ -113,7 +106,6 @@ rewrite_gh_links_in() {
     local dir="$1"
     [ -z "$GH_PROXY" ] && { printf '0'; return 0; }
     [ -d "$dir" ] || { printf '0'; return 0; }
-
     local count=0
     while IFS= read -r -d '' file; do
         if grep -q 'github\.com\|githubusercontent\.com' "$file" 2>/dev/null; then
@@ -132,7 +124,7 @@ rewrite_gh_links_in() {
 }
 
 # -----------------------------------------------------------------------------
-#  🎡  Spinner animation
+#  🎡  Spinner
 # -----------------------------------------------------------------------------
 SPINNER_PID=""
 
@@ -168,8 +160,123 @@ spin_stop() {
     esac
 }
 
+# =============================================================================
+#  🖼️  双栏面板：左流程 + 右滚动日志
+# =============================================================================
+
+# 面板状态（全局，后台子 shell 也要访问）
+declare -a PANEL_STEPS=(
+    " 1/6  Cleanup   "
+    " 2/6  Toolchain "
+    " 3/6  ReSukiSU  "
+    " 4/6  Config    "
+    " 5/6  VDSO      "
+    " 6/6  Compile   "
+)
+declare -a PANEL_MARKS=(
+    "DONE" "DONE" "DONE" "DONE" "DONE" "RUN"
+)
+PANEL_LEFT_W=18
+PANEL_ROWS=6
+PANEL_TERM_W=100
+PANEL_RIGHT_W=60
+
+# 隐藏/显示光标
+cursor_hide() { printf "\033[?25l"; }
+cursor_show() { printf "\033[?25h"; }
+
+# 定位光标到第 N 行第 1 列
+cursor_to() { printf "\033[%d;1H" "$1"; }
+
+# 清到行尾
+clear_to_eol() { printf "\033[K"; }
+
+# 绘制单行（左侧流程 + 右侧日志）
+_panel_draw_row() {
+    local row="$1"       # 1..6
+    local logline="$2"
+
+    local idx=$((row - 1))
+    local step="${PANEL_STEPS[$idx]}"
+    local mark_state="${PANEL_MARKS[$idx]}"
+
+    local mark_color mark_icon
+    case "$mark_state" in
+        DONE) mark_color="$C_GREEN";  mark_icon="✅" ;;
+        RUN)  mark_color="$C_YELLOW"; mark_icon="🔄" ;;
+        WAIT) mark_color="$C_DIM";    mark_icon="⏸ " ;;
+        *)    mark_color="$C_DIM";    mark_icon="  " ;;
+    esac
+
+    # 定位到指定行
+    cursor_to "$row"
+
+    # 左栏
+    printf "  ${C_WHITE}%s${C_RESET} ${mark_color}%s${C_RESET}  ${C_DIM}│${C_RESET}  " \
+        "$step" "$mark_icon"
+
+    # 右栏：日志行（截断超长）
+    if [ -n "$logline" ]; then
+        [ "${#logline}" -gt "$PANEL_RIGHT_W" ] && logline="${logline:0:$((PANEL_RIGHT_W-3))}..."
+        printf "${C_DIM}%s${C_RESET}" "$logline"
+    fi
+
+    # 清到行尾
+    clear_to_eol
+}
+
+# 初始化面板：打印标题栏 + 6 行空面板
+dual_panel_init() {
+    PANEL_TERM_W=$(tput cols 2>/dev/null || echo 100)
+    [ "$PANEL_TERM_W" -lt 60 ] && PANEL_TERM_W=100
+    PANEL_RIGHT_W=$((PANEL_TERM_W - PANEL_LEFT_W - 10))
+    [ "$PANEL_RIGHT_W" -lt 20 ] && PANEL_RIGHT_W=20
+
+    cursor_hide
+
+    # 标题栏
+    printf "${C_BG_PURPLE}${C_WHITE}${C_BOLD}  %-${PANEL_LEFT_W}s  ${C_RESET}${C_DIM}│${C_RESET}  ${C_BG_BLUE}${C_WHITE}${C_BOLD}  Live Build Log  ${C_RESET}\n" \
+        "  Build Progress"
+
+    # 6 行面板（初次绘制）
+    local i=1
+    while [ "$i" -le "$PANEL_ROWS" ]; do
+        _panel_draw_row "$i" ""
+        printf "\n"
+        i=$((i + 1))
+    done
+
+    # 光标移到面板下方
+    cursor_to $((PANEL_ROWS + 2))
+    clear_to_eol
+}
+
+# 刷新面板（只刷新内容，不动光标位置）
+dual_panel_refresh() {
+    local log_file="$1"
+
+    # 读取日志最新 N 行
+    local -a tail_arr=()
+    while IFS= read -r line; do
+        tail_arr+=("$line")
+    done < <(tail -n "$PANEL_ROWS" "$log_file" 2>/dev/null || true)
+
+    # 逐行重绘（注意：从第 2 行开始，第 1 行是标题）
+    local i=1
+    while [ "$i" -le "$PANEL_ROWS" ]; do
+        local line="${tail_arr[$((i-1))]:-}"
+        # row 位置 = i + 1（标题占第 1 行）
+        _panel_draw_row $((i + 1)) "$line"
+        i=$((i + 1))
+    done
+
+    # 光标放到面板下方，不影响其他输出
+    cursor_to $((PANEL_ROWS + 2))
+    clear_to_eol
+}
+
 # -----------------------------------------------------------------------------
-#  📜  Single-line rolling build log
+#  📜  滚动日志（双栏面板版）
 # -----------------------------------------------------------------------------
 ROLL_PID=""
 ROLL_STOP_FILE=""
@@ -178,19 +285,12 @@ roll_start() {
     local log_file="$1"
     ROLL_STOP_FILE="$(mktemp /tmp/kernel-roll-stop-XXXXXX)"
     : > "$ROLL_STOP_FILE"
+
     (
-        local last_line=""
         while [ ! -s "$ROLL_STOP_FILE" ]; do
-            if [ -s "$log_file" ]; then
-                last_line="$(tail -n 1 "$log_file" 2>/dev/null || true)"
-                if [ -n "$last_line" ]; then
-                    [ "${#last_line}" -gt 100 ] && last_line="${last_line:0:97}..."
-                    printf "\r\033[K${C_SKY}  🔨${C_RESET} ${C_DIM}%s${C_RESET}" "$last_line"
-                fi
-            fi
+            dual_panel_refresh "$log_file"
             sleep 0.12
         done
-        printf "\r\033[K"
     ) &
     ROLL_PID=$!
     disown "$ROLL_PID" 2>/dev/null || true
@@ -199,14 +299,19 @@ roll_start() {
 roll_stop() {
     if [ -n "$ROLL_PID" ]; then
         : > "$ROLL_STOP_FILE"
-        sleep 0.15
+        sleep 0.2
         kill "$ROLL_PID" 2>/dev/null || true
         wait "$ROLL_PID" 2>/dev/null || true
         ROLL_PID=""
     fi
     [ -n "$ROLL_STOP_FILE" ] && rm -f "$ROLL_STOP_FILE"
     ROLL_STOP_FILE=""
-    printf "\r\033[K"
+
+    cursor_show
+
+    # 光标移出面板区域，供后续输出使用
+    cursor_to $((PANEL_ROWS + 3))
+    clear_to_eol
 }
 
 # -----------------------------------------------------------------------------
@@ -217,7 +322,6 @@ ERROR_CTX="${ERROR_CTX:-200}"
 print_error_context() {
     local log_file="$1"
     local ctx="$ERROR_CTX"
-
     [ -f "$log_file" ] || return 0
 
     local first_err
@@ -225,7 +329,7 @@ print_error_context() {
 
     if [ -z "$first_err" ]; then
         echo
-        printf "${C_BG_RED}${C_WHITE}${C_BOLD}  ❌ Build failed  ·  no 'error:' marker found  ${C_RESET}\n"
+        printf "${C_BG_RED}${C_WHITE}${C_BOLD}  ❌ Build failed  ·  no 'error:' marker  ${C_RESET}\n"
         echo
         tail -n 40 "$log_file" | sed 's/^/    /'
         return 0
@@ -242,21 +346,17 @@ print_error_context() {
     printf "${C_BG_RED}${C_WHITE}${C_BOLD}  ❌ Build failed  ·  line %d / %d  ·  context ±%d  ${C_RESET}\n" \
         "$first_err" "$total" "$ctx"
     echo
-    printf "${C_DIM}  ── lines %d..%d ──────────────────────────────────${C_RESET}\n\n" \
-        "$start" "$end"
+    printf "${C_DIM}  ── lines %d..%d ──────────────────────────────${C_RESET}\n\n" "$start" "$end"
 
     awk -v s="$start" -v e="$end" -v fe="$first_err" '
         NR >= s && NR <= e {
-            if (NR == fe) {
-                printf "\033[1;31m  ▶ %s\033[0m\n", $0
-            } else {
-                printf "    %s\n", $0
-            }
+            if (NR == fe) printf "\033[1;31m  ▶ %s\033[0m\n", $0
+            else          printf "    %s\n", $0
         }
     ' "$log_file"
 
     echo
-    printf "${C_DIM}  ──────────────────────────────────────────────────${C_RESET}\n"
+    printf "${C_DIM}  ──────────────────────────────────────────────${C_RESET}\n"
     printf "  ${C_DIM}Full log:${C_RESET} ${C_BOLD}%s${C_RESET}\n" "$log_file"
 }
 
@@ -264,9 +364,7 @@ print_error_context() {
 #  🎨  Logging helpers
 # -----------------------------------------------------------------------------
 log_section() {
-    local num="$1"
-    local icon="$2"
-    local title="$3"
+    local num="$1" icon="$2" title="$3"
     echo
     printf "${C_BG_PURPLE}${C_WHITE}${C_BOLD}  %s  %s  ·  %s  ${C_RESET}\n" "$num" "$icon" "$title"
     echo
@@ -285,50 +383,28 @@ hr() {
 }
 
 # -----------------------------------------------------------------------------
-#  🎨  Config diff printer (single-column, full width, no truncation)
+#  🎨  配置 diff 单栏打印
 # -----------------------------------------------------------------------------
-# 打印一个分类块，完整显示配置名，不截断
 print_config_block() {
-    local title="$1"
-    local file="$2"
-    local fg="$3"
-    local bg="$4"
-    local count="$5"
-
+    local title="$1" file="$2" fg="$3" bg="$4" count="$5"
     [ ! -s "$file" ] && return 0
 
-    # 计算分隔线宽度：终端宽度 - 6
     local term_width
     term_width=$(tput cols 2>/dev/null || echo 100)
     [ "$term_width" -lt 40 ] && term_width=100
-    local line_width=$((term_width - 6))
-    [ "$line_width" -gt 120 ] && line_width=120
+    local lw=$((term_width - 6))
+    [ "$lw" -gt 120 ] && lw=120
 
     echo
     printf "  ${bg}${C_WHITE}${C_BOLD}  %s  ·  %d items  ${C_RESET}\n" "$title" "$count"
-
     printf "  ${fg}"
-    printf '─%.0s' $(seq 1 "$line_width")
+    printf '─%.0s' $(seq 1 "$lw")
     printf "${C_RESET}\n"
 
-    # 用 while read 保留原始内容，完整输出不截断
     while IFS= read -r line; do
         [ -z "$line" ] && continue
         printf "  ${fg}  %s${C_RESET}\n" "$line"
     done < "$file"
-}
-
-# 兼容接口：内部拆成两个单栏块
-dual_print() {
-    local ltitle="$1" lfile="$2"
-    local rtitle="$3" rfile="$4"
-
-    local lc rc
-    lc=$(grep -c . "$lfile" 2>/dev/null || echo 0)
-    rc=$(grep -c . "$rfile" 2>/dev/null || echo 0)
-
-    print_config_block "$ltitle" "$lfile" "$C_GREEN" "$C_BG_GREEN" "$lc"
-    print_config_block "$rtitle" "$rfile" "$C_RED"   "$C_BG_RED"   "$rc"
 }
 
 # -----------------------------------------------------------------------------
@@ -347,48 +423,28 @@ EOF
     printf "${C_RESET}\n"
 
     printf "  ${C_LAVENDER}🌐 GitHub proxy${C_RESET}   "
-    if [ -n "$GH_PROXY" ]; then
-        printf "${C_BOLD}%s${C_RESET}\n" "$GH_PROXY"
-    else
-        printf "${C_DIM}disabled${C_RESET}\n"
-    fi
+    [ -n "$GH_PROXY" ] && printf "${C_BOLD}%s${C_RESET}\n" "$GH_PROXY" || printf "${C_DIM}disabled${C_RESET}\n"
 
     printf "  ${C_LAVENDER}🔄 Auto-update${C_RESET}    "
-    if [ -n "$NO_UPDATE" ]; then
-        printf "${C_DIM}disabled${C_RESET}\n"
-    else
-        printf "${C_GREEN}enabled${C_RESET}\n"
-    fi
+    [ -n "$NO_UPDATE" ] && printf "${C_DIM}disabled${C_RESET}\n" || printf "${C_GREEN}enabled${C_RESET}\n"
 
     printf "  ${C_LAVENDER}⚙️  Menuconfig${C_RESET}     "
-    if [ -n "$SKIP_MENUCONFIG" ]; then
-        printf "${C_DIM}skipped${C_RESET}\n"
-    else
-        printf "${C_GREEN}interactive${C_RESET}\n"
-    fi
+    [ -n "$SKIP_MENUCONFIG" ] && printf "${C_DIM}skipped${C_RESET}\n" || printf "${C_GREEN}interactive${C_RESET}\n"
 
-    [ -n "$SAVE_CONFIG" ] && \
-        printf "  ${C_LAVENDER}💾 Save config${C_RESET}    ${C_GREEN}yes${C_RESET}\n"
-
-    [ -n "$CHECK_ONLY" ] && \
-        printf "  ${C_LAVENDER}🔍 Check only${C_RESET}     ${C_YELLOW}yes${C_RESET}\n"
-
+    [ -n "$SAVE_CONFIG" ] && printf "  ${C_LAVENDER}💾 Save config${C_RESET}    ${C_GREEN}yes${C_RESET}\n"
+    [ -n "$CHECK_ONLY" ]  && printf "  ${C_LAVENDER}🔍 Check only${C_RESET}     ${C_YELLOW}yes${C_RESET}\n"
     echo
 }
 
 # -----------------------------------------------------------------------------
 #  📦  ReSukiSU version info
 # -----------------------------------------------------------------------------
-RSU_VERSION="unknown"
-RSU_COMMIT="unknown"
-RSU_BRANCH="unknown"
-RSU_DATE="unknown"
-RSU_DIRTY="clean"
-RSU_UPDATED="no"
+RSU_VERSION="unknown"; RSU_COMMIT="unknown"
+RSU_BRANCH="unknown";  RSU_DATE="unknown"
+RSU_DIRTY="clean";     RSU_UPDATED="no"
 
 get_resukisu_info() {
     local dir="$CURRENT_DIR/ReSukiSU"
-
     RSU_VERSION="unknown"; RSU_COMMIT="unknown"
     RSU_BRANCH="unknown";  RSU_DATE="unknown"
     RSU_DIRTY="clean"
@@ -396,7 +452,6 @@ get_resukisu_info() {
     if [ ! -d "$dir/.git" ] && [ -d "$dir/kernel" ]; then
         RSU_VERSION="vendored"; RSU_COMMIT="vendored"
         RSU_BRANCH="main";     RSU_DATE="unknown"
-        RSU_DIRTY="clean"
         return 0
     fi
 
@@ -404,12 +459,10 @@ get_resukisu_info() {
         RSU_COMMIT="$(git -C "$dir" rev-parse --short=12 HEAD 2>/dev/null || echo unknown)"
         RSU_BRANCH="$(git -C "$dir" rev-parse --abbrev-ref HEAD 2>/dev/null || echo unknown)"
         RSU_DATE="$(git -C "$dir" log -1 --format='%cd' --date=format:'%Y-%m-%d %H:%M' 2>/dev/null || echo unknown)"
-
         if ! git -C "$dir" diff --quiet 2>/dev/null || \
            ! git -C "$dir" diff --cached --quiet 2>/dev/null; then
             RSU_DIRTY="dirty"
         fi
-
         local described
         described="$(git -C "$dir" describe --tags --always 2>/dev/null || echo '')"
         [ -n "$described" ] && RSU_VERSION="$described"
@@ -420,23 +473,13 @@ get_resukisu_info() {
         kver="$(grep -E '^KSU_VERSION\s*[:?]?=' "$dir/kernel/Makefile" 2>/dev/null \
             | head -n1 | sed 's/.*=\s*//' || true)"
     fi
-    if [ -z "$kver" ]; then
-        local vfile
-        vfile="$(find "$dir" -maxdepth 4 -type f -name 'version.h' 2>/dev/null | head -n1 || true)"
-        if [ -n "$vfile" ]; then
-            kver="$(grep -E '#define\s+(KSU|RESUKISU|SUKISU)_VERSION' "$vfile" 2>/dev/null \
-                | awk '{print $3}' || true)"
-        fi
-    fi
     [ -n "$kver" ] && RSU_VERSION="$kver"
-
     return 0
 }
 
 update_resukisu() {
     local dir="$CURRENT_DIR/ReSukiSU"
     RSU_UPDATED="no"
-
     [ -d "$dir/.git" ] || return 0
     [ -n "$NO_UPDATE" ] && return 0
 
@@ -447,19 +490,16 @@ update_resukisu() {
 
     local old_rev new_rev
     old_rev="$(git -C "$dir" rev-parse HEAD 2>/dev/null || echo '')"
-
     git -C "$dir" fetch --depth=1 origin HEAD >/dev/null 2>&1 || \
         git -C "$dir" fetch origin >/dev/null 2>&1 || return 1
 
     local upstream
     upstream="$(git -C "$dir" rev-parse --abbrev-ref --symbolic-full-name '@{u}' 2>/dev/null || echo '')"
-
     if [ -n "$upstream" ]; then
         new_rev="$(git -C "$dir" rev-parse "$upstream" 2>/dev/null || echo '')"
     else
         new_rev="$(git -C "$dir" rev-parse FETCH_HEAD 2>/dev/null || echo '')"
     fi
-
     [ -z "$new_rev" ] && return 1
     [ "$old_rev" = "$new_rev" ] && return 3
 
@@ -480,30 +520,22 @@ print_rsu_panel() {
     else
         printf "  ${C_DIM}├─${C_RESET} ${C_DIM}Tree${C_RESET}          ${C_GREEN}🌿 clean${C_RESET}\n"
     fi
-    if [ "$RSU_UPDATED" = "yes" ]; then
-        printf "  ${C_DIM}└─${C_RESET} ${C_DIM}Updated${C_RESET}       ${C_GREEN}✅ yes${C_RESET}\n"
-    else
-        printf "  ${C_DIM}└─${C_RESET}\n"
-    fi
+    printf "  ${C_DIM}└─${C_RESET}\n"
     echo
 }
 
 # -----------------------------------------------------------------------------
-#  🔧  Config helpers
+#  🔧  Config diff
 # -----------------------------------------------------------------------------
-CFG_BEFORE=""
-CFG_AFTER=""
+CFG_BEFORE=""; CFG_AFTER=""
 
 norm_config() {
     grep -E '^(CONFIG_[A-Z0-9_]+=.*|# CONFIG_[A-Z0-9_]+ is not set)' "$1" 2>/dev/null \
-        | sed -E 's/^# (CONFIG_[A-Z0-9_]+) is not set$/\1=n/' \
-        | sort -u
+        | sed -E 's/^# (CONFIG_[A-Z0-9_]+) is not set$/\1=n/' | sort -u
 }
 
 show_menuconfig_diff() {
-    if [ ! -f "$CFG_BEFORE" ] || [ ! -f "$CFG_AFTER" ]; then
-        return 0
-    fi
+    [ -f "$CFG_BEFORE" ] && [ -f "$CFG_AFTER" ] || return 0
 
     local b_norm a_norm
     b_norm="$(mktemp)"; a_norm="$(mktemp)"
@@ -519,7 +551,7 @@ show_menuconfig_diff() {
     [ -n "$removed" ] && removed_n=$(printf '%s\n' "$removed" | grep -c . || true)
 
     echo
-    printf "${C_BG_BLUE}${C_WHITE}${C_BOLD}  🎨 Menuconfig Changes  ·  compared with defconfig state  ${C_RESET}\n"
+    printf "${C_BG_BLUE}${C_WHITE}${C_BOLD}  🎨 Menuconfig Changes  ·  compared with defconfig  ${C_RESET}\n"
 
     if [ "$added_n" -eq 0 ] && [ "$removed_n" -eq 0 ]; then
         echo
@@ -537,7 +569,8 @@ show_menuconfig_diff() {
     [ -n "$added" ]   && printf '%s\n' "$added"   > "$lf"
     [ -n "$removed" ] && printf '%s\n' "$removed" > "$rf"
 
-    dual_print "➕ 新增 (Added)" "$lf" "➖ 移除 (Removed)" "$rf"
+    print_config_block "➕ 新增 (Added)"   "$lf" "$C_GREEN" "$C_BG_GREEN" "$added_n"
+    print_config_block "➖ 移除 (Removed)" "$rf" "$C_RED"   "$C_BG_RED"   "$removed_n"
 
     rm -f "$b_norm" "$a_norm" "$lf" "$rf"
     echo
@@ -579,6 +612,7 @@ cleanup() {
     for f in "${CFG_BEFORE:-}" "${CFG_AFTER:-}"; do
         [ -n "$f" ] && [ -f "$f" ] && rm -f "$f"
     done
+    cursor_show 2>/dev/null || true
 }
 trap cleanup EXIT
 
@@ -591,7 +625,6 @@ banner
 log_section "1 / 6" "🧹" "清理旧构建产物"
 # =============================================================================
 spin_start "Removing stale artifacts..."
-
 rm -rf out/arch/arm64/boot
 rm -rf .config .config.old .tmp_versions
 rm -rf include/generated include/config
@@ -602,16 +635,13 @@ rm -rf scripts/kconfig/.tmp*
 rm -rf out/include/generated out/include/config
 rm -rf out/arch/arm64/kernel/vdso
 rm -f out/include/generated/vdso-offsets.h
-
 [ "$CLEAN_BUILD" = true ] && rm -rf out
-
 spin_stop ok "Cleanup complete"
 
 # =============================================================================
 log_section "2 / 6" "🔧" "工具链准备"
 # =============================================================================
 TC_DIR="${TC_DIR:-$HOME/toolchains/neutron-clang}"
-
 spin_start "Detecting toolchain..."
 if [ -x "$TC_DIR/bin/clang" ]; then
     export PATH="$TC_DIR/bin:$PATH"
@@ -621,24 +651,15 @@ else
     CLANG="$(command -v clang || true)"
     TOOLCHAIN_SRC="system clang"
 fi
-
-if [ -z "${CLANG:-}" ]; then
-    spin_stop fail "clang not found"
-    exit 1
-fi
+[ -z "${CLANG:-}" ] && { spin_stop fail "clang not found"; exit 1; }
 
 export CC="${CC:-$CLANG}"
 export LD="${LD:-ld.lld}"
 
 if [ -z "$NO_CCACHE" ] && command -v ccache >/dev/null 2>&1; then
-    CC="ccache $CC"
-    CCACHE_STATE="enabled ⚡"
+    CC="ccache $CC"; CCACHE_STATE="enabled ⚡"
 else
-    if [ -z "$NO_CCACHE" ]; then
-        CCACHE_STATE="not installed"
-    else
-        CCACHE_STATE="disabled"
-    fi
+    [ -z "$NO_CCACHE" ] && CCACHE_STATE="not installed" || CCACHE_STATE="disabled"
 fi
 spin_stop ok "Toolchain: $TOOLCHAIN_SRC · ccache: $CCACHE_STATE"
 
@@ -650,30 +671,24 @@ if [ ! -d "$CURRENT_DIR/ReSukiSU/kernel" ]; then
     CLONE_URL="$(gh_url 'https://github.com/ReSukiSU/ReSukiSU.git')"
     if GIT_SSL_NO_VERIFY=true git clone --depth=1 --branch main \
         "$CLONE_URL" "$CURRENT_DIR/ReSukiSU" >/dev/null 2>&1; then
-        spin_stop ok "ReSukiSU cloned"
-        RSU_UPDATED="yes"
+        spin_stop ok "ReSukiSU cloned"; RSU_UPDATED="yes"
     else
-        spin_stop fail "Failed to clone ReSukiSU"
-        exit 1
+        spin_stop fail "Failed to clone ReSukiSU"; exit 1
     fi
 else
     log_ok "ReSukiSU source already present"
-
     if [ ! -d "$CURRENT_DIR/ReSukiSU/.git" ]; then
-        spin_stop ok "Vendored ReSukiSU (no git metadata)"
+        spin_stop ok "Vendored ReSukiSU"
     elif [ -n "$NO_UPDATE" ]; then
-        spin_stop warn "Auto-update disabled (--no-update)"
+        spin_stop warn "Auto-update disabled"
     else
         spin_start "Checking ReSukiSU updates..."
-        set +e
-        update_resukisu
-        rc=$?
-        set -e
+        set +e; update_resukisu; rc=$?; set -e
         case "$rc" in
-            0) spin_stop ok "ReSukiSU updated to latest" ;;
-            2) spin_stop warn "Local changes present · skipped update" ;;
-            3) spin_stop ok "ReSukiSU already up to date" ;;
-            *) spin_stop warn "Update failed · using local version" ;;
+            0) spin_stop ok "Updated to latest" ;;
+            2) spin_stop warn "Local changes present · skipped" ;;
+            3) spin_stop ok "Already up to date" ;;
+            *) spin_stop warn "Update failed · using local" ;;
         esac
     fi
 fi
@@ -684,19 +699,17 @@ if [ -n "$GH_PROXY" ]; then
     spin_stop ok "Rewrote $rewritten script(s)"
 fi
 
-spin_start "Reading ReSukiSU version info..."
+spin_start "Reading version info..."
 get_resukisu_info
 spin_stop ok "Version info collected"
 print_rsu_panel
 
 rm -f drivers/kernelsu
 ln -sfn ../ReSukiSU/kernel drivers/kernelsu
-
 grep -q 'kernelsu' drivers/Makefile || echo 'obj-$(CONFIG_KSU) += kernelsu/' >> drivers/Makefile
 grep -q 'drivers/kernelsu/Kconfig' drivers/Kconfig || \
     sed -i '/endmenu/i source "drivers/kernelsu/Kconfig"' drivers/Kconfig
-
-log_ok "ReSukiSU integrated into kernel tree"
+log_ok "ReSukiSU integrated"
 
 # =============================================================================
 log_section "4 / 6" "⚙️" "内核配置"
@@ -706,36 +719,28 @@ printf "  ${C_DIM}Using compiler:${C_RESET}\n"
 echo
 
 MAKE_COMMON=(
-    O=out
-    ARCH=arm64
-    CC="$CC"
-    LD="$LD"
-    LLVM=1
-    LLVM_IAS=1
-    NM=llvm-nm
+    O=out ARCH=arm64 CC="$CC" LD="$LD"
+    LLVM=1 LLVM_IAS=1 NM=llvm-nm
     CROSS_COMPILE=aarch64-linux-gnu-
 )
-if command -v arm-linux-gnueabi-gcc >/dev/null 2>&1; then
+command -v arm-linux-gnueabi-gcc >/dev/null 2>&1 && \
     MAKE_COMMON+=(CROSS_COMPILE_ARM32=arm-linux-gnueabi-)
-fi
 
 spin_start "Configuring $DEFCONFIG ..."
 if make "${MAKE_COMMON[@]}" "$DEFCONFIG" >/dev/null 2>&1; then
     spin_stop ok "defconfig written"
 else
-    spin_stop fail "defconfig failed"
-    exit 1
+    spin_stop fail "defconfig failed"; exit 1
 fi
 
 spin_start "Running olddefconfig ..."
 if make "${MAKE_COMMON[@]}" olddefconfig >/dev/null 2>&1; then
     spin_stop ok "olddefconfig done"
 else
-    spin_stop fail "olddefconfig failed"
-    exit 1
+    spin_stop fail "olddefconfig failed"; exit 1
 fi
 
-# ---- menuconfig 快照 & 交互 ----
+# menuconfig
 if [ -z "$SKIP_MENUCONFIG" ]; then
     CFG_BEFORE="$(mktemp /tmp/kcfg-before-XXXXXX)"
     cp out/.config "$CFG_BEFORE"
@@ -746,58 +751,49 @@ if [ -z "$SKIP_MENUCONFIG" ]; then
     printf "  ${C_SKY}💡 操作指南${C_RESET}\n"
     printf "     ${C_WHITE}↑ ↓${C_RESET}       ${C_DIM}移动光标${C_RESET}\n"
     printf "     ${C_WHITE}空格${C_RESET}      ${C_DIM}切换 y / n / m${C_RESET}\n"
-    printf "     ${C_WHITE}/${C_RESET}         ${C_DIM}搜索配置（例如 DOCKER、SYSVIPC）${C_RESET}\n"
+    printf "     ${C_WHITE}/${C_RESET}         ${C_DIM}搜索配置${C_RESET}\n"
     printf "     ${C_WHITE}Enter${C_RESET}     ${C_DIM}进入子菜单${C_RESET}\n"
     printf "     ${C_WHITE}ESC ESC${C_RESET}   ${C_DIM}返回上级${C_RESET}\n"
     printf "     ${C_WHITE}Save${C_RESET}      ${C_DIM}保存（务必保存！）${C_RESET}\n"
     printf "     ${C_WHITE}Exit${C_RESET}      ${C_DIM}退出${C_RESET}\n"
     echo
-    printf "  ${C_YELLOW}⚠️  离开前记得 <Save>，否则改动会丢失${C_RESET}\n"
+    printf "  ${C_YELLOW}⚠️  离开前记得 <Save>${C_RESET}\n"
     echo
 
     set +e
     (
-        unset CC
-        unset LD
+        unset CC; unset LD
         export CURSES_LOC='ncurses.h'
         make O=out ARCH=arm64 HOSTCC=gcc HOSTLD=ld HOSTCXX=g++ menuconfig
     )
     menu_rc=$?
     set -e
+    [ "$menu_rc" -ne 0 ] && log_warn "menuconfig 退出码 $menu_rc"
 
-    [ "$menu_rc" -ne 0 ] && log_warn "menuconfig 退出码 $menu_rc (usually normal)"
-
-    if [ ! -f out/.config ]; then
-        spin_stop fail "menuconfig 后 out/.config 消失了"
-        exit 1
-    fi
+    [ ! -f out/.config ] && { spin_stop fail "out/.config gone"; exit 1; }
 
     CFG_AFTER="$(mktemp /tmp/kcfg-after-XXXXXX)"
     cp out/.config "$CFG_AFTER"
-
     show_menuconfig_diff
-
     rm -f "$CFG_BEFORE" "$CFG_AFTER"
     CFG_BEFORE=""; CFG_AFTER=""
 else
-    log_info "Skipping menuconfig (--no-menuconfig)"
+    log_info "Skipping menuconfig"
 fi
 
 if [ -n "$SAVE_CONFIG" ]; then
     cp out/.config "$CURRENT_DIR/kernel.config"
-    log_ok "Saved final config to $CURRENT_DIR/kernel.config"
+    log_ok "Saved final config"
 fi
 
 check_key_configs
 
 if [ -n "$CHECK_ONLY" ]; then
-    spin_start "Running prepare sanity check..."
+    spin_start "Running sanity check..."
     if make -j"$(nproc --all)" "${MAKE_COMMON[@]}" prepare >/dev/null 2>&1; then
-        spin_stop ok "Sanity check passed"
-        exit 0
+        spin_stop ok "Sanity check passed"; exit 0
     else
-        spin_stop fail "Sanity check failed"
-        exit 1
+        spin_stop fail "Sanity check failed"; exit 1
     fi
 fi
 
@@ -809,31 +805,39 @@ if make "${MAKE_COMMON[@]}" arch/arm64/kernel/vdso/ >/dev/null 2>&1; then
     if [ -f out/include/generated/vdso-offsets.h ]; then
         spin_stop ok "vdso-offsets.h generated"
     else
-        spin_stop fail "vdso-offsets.h not found"
-        exit 1
+        spin_stop fail "vdso-offsets.h not found"; exit 1
     fi
 else
-    spin_stop fail "vdso build failed"
-    exit 1
+    spin_stop fail "vdso build failed"; exit 1
 fi
 
 # =============================================================================
 log_section "6 / 6" "🔨" "编译内核"
 # =============================================================================
-echo
-log_info "Starting compilation (single-line rolling log below)..."
-echo
+
+# 更新面板状态：前 5 步 DONE，第 6 步 RUN
+PANEL_MARKS=("DONE" "DONE" "DONE" "DONE" "DONE" "RUN")
+
+# 打印标题 + 初始化双栏面板（在当前位置绘制，不清屏）
+printf "\n"
+dual_panel_init
 
 BUILD_LOG="$(mktemp /tmp/kernel-build-XXXXXX.log)"
 START_TS=$(date +%s)
 
 roll_start "$BUILD_LOG"
 
-if make -j"$(nproc --all)" "${MAKE_COMMON[@]}" \
+# 编译
+set +e
+make -j"$(nproc --all)" "${MAKE_COMMON[@]}" \
     KCFLAGS="-Wno-error=default-const-init-var-unsafe -Wno-default-const-init-var-unsafe" \
-    Image.gz >"$BUILD_LOG" 2>&1; then
+    Image.gz >"$BUILD_LOG" 2>&1
+make_rc=$?
+set -e
 
-    roll_stop
+roll_stop
+
+if [ "$make_rc" -eq 0 ]; then
     END_TS=$(date +%s)
     BUILD_TIME=$(( END_TS - START_TS ))
 
@@ -847,7 +851,6 @@ if make -j"$(nproc --all)" "${MAKE_COMMON[@]}" \
         echo
         spin_start "Packaging AnyKernel3 zip..."
         rm -rf AnyKernel3
-
         AK_URL="$(gh_url 'https://github.com/weaponmasterjax/AnyKernel3')"
         if GIT_SSL_NO_VERIFY=true git clone -q --depth=1 \
             "$AK_URL" AnyKernel3 >/dev/null 2>&1; then
@@ -875,10 +878,9 @@ EOF
         $((SECONDS / 60)) $((SECONDS % 60))
     hr
     echo
-
     rm -f "$BUILD_LOG"
 else
-    roll_stop
+    echo
     print_error_context "$BUILD_LOG"
     exit 1
 fi
