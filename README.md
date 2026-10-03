@@ -12,7 +12,7 @@
 | 内核构建入口 | `drivers/kernelsu -> ../ReSukiSU/kernel`（软链接） |
 | 设备 defconfig | `arch/arm64/configs/everpal_defconfig` |
 | LXC/Docker 支持 | `utils/`（Kconfig + 补丁） |
-| 构建脚本 | `b.sh` |
+| 构建脚本 | `build.sh` |
 | 输出目录 | `out/` |
 
 ---
@@ -75,7 +75,7 @@ sudo pacman -S --needed base-devel clang llvm lld ccache \
 
 ```bash
 cd /root/kernel-lxc_xiaomi_mtk810_mt6833-resukisu
-./b.sh
+./build.sh
 ```
 
 脚本会依次执行：
@@ -83,7 +83,7 @@ cd /root/kernel-lxc_xiaomi_mtk810_mt6833-resukisu
 1. **清理旧构建产物**（含 `out/` 下的残留）
 2. **检测工具链**（优先 neutron-clang，否则系统 clang），自动启用 ccache
 3. **准备 ReSukiSU 源码**：不存在则克隆，已存在则自动检查更新
-4. **配置内核**：加载 `everpal_defconfig`
+4. **配置内核**：加载 `everpal_defconfig` 并执行 `olddefconfig`
 5. **生成 vdso-offsets.h**：解决 4.14 并行编译依赖问题
 6. **编译 `Image.gz`**：单行滚动日志显示最新编译命令
 7. **打包 AnyKernel3**：生成可刷入 zip
@@ -91,29 +91,32 @@ cd /root/kernel-lxc_xiaomi_mtk810_mt6833-resukisu
 ### 命令行选项
 
 ```bash
-# 默认：直连 GitHub，自动更新 ReSukiSU，启用 ccache
-./b.sh
+# 默认：走 https://git.yylx.win/ 加速，自动更新 ReSukiSU，启用 ccache
+./build.sh
 
-# 走加速代理（默认 https://git.yylx.win/）
-./b.sh -cn
+# 只做环境/配置检查，不完整编译
+./build.sh --check --no-ccache --no-update
 
-# 自定义加速代理
-./b.sh -cn https://your-proxy.example/
+# 自定义 GitHub 加速代理
+./build.sh --proxy https://your-proxy.example/
+
+# 使用 -cn 也可启用/覆盖加速
+./build.sh -cn https://your-proxy.example/
 
 # 跳过 ReSukiSU 自动更新
-./b.sh -nu
+./build.sh -nu
 
 # 关闭 ccache
-./b.sh --no-ccache
+./build.sh --no-ccache
 
 # 完全清理后编译 + 加速
-CLEAN_BUILD=true ./b.sh -cn
+CLEAN_BUILD=true ./build.sh -cn
 
 # 调整错误上下文行数（默认前后各 200 行）
-ERROR_CTX=300 ./b.sh -cn
+ERROR_CTX=300 ./build.sh -cn
 
 # 自定义工具链目录
-TC_DIR=/opt/clang ./b.sh
+TC_DIR=/opt/clang ./build.sh
 ```
 
 ### 输出文件
@@ -122,6 +125,16 @@ TC_DIR=/opt/clang ./b.sh
 |------|------|
 | `out/arch/arm64/boot/Image.gz` | 编译出的内核镜像 |
 | `ReSukiSU-AdrenalinKernel-YYYYMMDD-HHMM.zip` | AnyKernel3 打包后的可刷入 zip |
+
+---
+
+## 🧪 快速检查
+
+```sh
+./build.sh --check --no-ccache --no-update
+```
+
+该模式只检查工具链、defconfig、olddefconfig 和 `make prepare`，不会完整编译。
 
 ---
 
@@ -156,7 +169,7 @@ TC_DIR=/opt/clang ./b.sh
 
 ```
 kernel-lxc_xiaomi_mtk810_mt6833-resukisu/
-├── b.sh                      # 构建脚本
+├── build.sh                  # 构建脚本
 ├── ReSukiSU/                 # ReSukiSU 源码（独立 git）
 │   └── kernel/               # → 软链到 drivers/kernelsu
 ├── utils/                    # LXC/Docker 内核支持

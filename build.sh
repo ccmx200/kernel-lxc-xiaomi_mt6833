@@ -596,6 +596,14 @@ else
     exit 1
 fi
 
+spin_start "Running olddefconfig ..."
+if make "${MAKE_COMMON[@]}" olddefconfig >/dev/null 2>&1; then
+    spin_stop ok "olddefconfig done"
+else
+    spin_stop fail "olddefconfig failed"
+    exit 1
+fi
+
 if [ -n "$CHECK_ONLY" ]; then
     spin_start "Running prepare sanity check..."
     if make -j"$(nproc --all)" "${MAKE_COMMON[@]}" prepare >/dev/null 2>&1; then
