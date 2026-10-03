@@ -66,7 +66,6 @@ usage() {
     printf "  ${C_DIM}DEVICE=everpal${C_RESET}        Target device codename\n"
     printf "  ${C_DIM}TC_DIR=/path/clang${C_RESET}    Custom toolchain directory\n"
     printf "  ${C_DIM}ERROR_CTX=200${C_RESET}         Error context lines\n"
-    printf "  ${C_DIM}DIFF_LINES=100${C_RESET}        Max diff lines per category\n"
 }
 
 while [ $# -gt 0 ]; do
@@ -286,40 +285,50 @@ hr() {
 }
 
 # -----------------------------------------------------------------------------
-#  🎨  Dual-column printer
+#  🎨  Config diff printer (single-column, full width, no truncation)
 # -----------------------------------------------------------------------------
+# 打印一个分类块，完整显示配置名，不截断
+print_config_block() {
+    local title="$1"
+    local file="$2"
+    local fg="$3"
+    local bg="$4"
+    local count="$5"
+
+    [ ! -s "$file" ] && return 0
+
+    # 计算分隔线宽度：终端宽度 - 6
+    local term_width
+    term_width=$(tput cols 2>/dev/null || echo 100)
+    [ "$term_width" -lt 40 ] && term_width=100
+    local line_width=$((term_width - 6))
+    [ "$line_width" -gt 120 ] && line_width=120
+
+    echo
+    printf "  ${bg}${C_WHITE}${C_BOLD}  %s  ·  %d items  ${C_RESET}\n" "$title" "$count"
+
+    printf "  ${fg}"
+    printf '─%.0s' $(seq 1 "$line_width")
+    printf "${C_RESET}\n"
+
+    # 用 while read 保留原始内容，完整输出不截断
+    while IFS= read -r line; do
+        [ -z "$line" ] && continue
+        printf "  ${fg}  %s${C_RESET}\n" "$line"
+    done < "$file"
+}
+
+# 兼容接口：内部拆成两个单栏块
 dual_print() {
     local ltitle="$1" lfile="$2"
     local rtitle="$3" rfile="$4"
-    local lw=34
-    local cw=34
 
     local lc rc
-    lc=$(wc -l < "$lfile" 2>/dev/null || echo 0)
-    rc=$(wc -l < "$rfile" 2>/dev/null || echo 0)
-    local max=$(( lc > rc ? lc : rc ))
+    lc=$(grep -c . "$lfile" 2>/dev/null || echo 0)
+    rc=$(grep -c . "$rfile" 2>/dev/null || echo 0)
 
-    printf "  ${C_BG_GREEN}${C_WHITE}${C_BOLD} %-${lw}s ${C_RESET}" "$ltitle"
-    printf "  ${C_BG_RED}${C_WHITE}${C_BOLD} %-${lw}s ${C_RESET}\n" "$rtitle"
-
-    printf "  ${C_GREEN}"
-    printf '─%.0s' $(seq 1 $lw)
-    printf "${C_RESET}  ${C_RED}"
-    printf '─%.0s' $(seq 1 $lw)
-    printf "${C_RESET}\n"
-
-    local i=0
-    while [ "$i" -lt "$max" ]; do
-        i=$((i + 1))
-        local l r
-        l=$(sed -n "${i}p" "$lfile" 2>/dev/null || true)
-        r=$(sed -n "${i}p" "$rfile" 2>/dev/null || true)
-
-        [ "${#l}" -gt "$lw" ] && l="${l:0:$((lw-3))}..."
-        [ "${#r}" -gt "$lw" ] && r="${r:0:$((lw-3))}..."
-
-        printf "  ${C_MINT}%-${lw}s${C_RESET}  ${C_PINK}%-${lw}s${C_RESET}\n" "$l" "$r"
-    done
+    print_config_block "$ltitle" "$lfile" "$C_GREEN" "$C_BG_GREEN" "$lc"
+    print_config_block "$rtitle" "$rfile" "$C_RED"   "$C_BG_RED"   "$rc"
 }
 
 # -----------------------------------------------------------------------------
@@ -492,8 +501,6 @@ norm_config() {
 }
 
 show_menuconfig_diff() {
-    local diff_lines="${DIFF_LINES:-100}"
-
     if [ ! -f "$CFG_BEFORE" ] || [ ! -f "$CFG_AFTER" ]; then
         return 0
     fi
@@ -513,31 +520,24 @@ show_menuconfig_diff() {
 
     echo
     printf "${C_BG_BLUE}${C_WHITE}${C_BOLD}  🎨 Menuconfig Changes  ·  compared with defconfig state  ${C_RESET}\n"
-    echo
 
     if [ "$added_n" -eq 0 ] && [ "$removed_n" -eq 0 ]; then
+        echo
         log_info "没有检测到配置改动"
         rm -f "$b_norm" "$a_norm"
         return 0
     fi
 
-    printf "  ${C_GREEN}${C_BOLD}➕ Added${C_RESET}   ${C_GREEN}%d${C_RESET}\n" "$added_n"
-    printf "  ${C_RED}${C_BOLD}➖ Removed${C_RESET} ${C_RED}%d${C_RESET}\n" "$removed_n"
     echo
+    printf "  ${C_GREEN}${C_BOLD}➕ Added${C_RESET}   ${C_GREEN}%d${C_RESET}    " "$added_n"
+    printf "${C_RED}${C_BOLD}➖ Removed${C_RESET} ${C_RED}%d${C_RESET}\n" "$removed_n"
 
     local lf rf
     lf="$(mktemp)"; rf="$(mktemp)"
-    printf '%s\n' "$added"   | head -n "$diff_lines" > "$lf"
-    printf '%s\n' "$removed" | head -n "$diff_lines" > "$rf"
+    [ -n "$added" ]   && printf '%s\n' "$added"   > "$lf"
+    [ -n "$removed" ] && printf '%s\n' "$removed" > "$rf"
 
     dual_print "➕ 新增 (Added)" "$lf" "➖ 移除 (Removed)" "$rf"
-
-    if [ "$added_n" -gt "$diff_lines" ]; then
-        log_dim "... 还有 $((added_n - diff_lines)) 条 Added 未显示"
-    fi
-    if [ "$removed_n" -gt "$diff_lines" ]; then
-        log_dim "... 还有 $((removed_n - diff_lines)) 条 Removed 未显示"
-    fi
 
     rm -f "$b_norm" "$a_norm" "$lf" "$rf"
     echo
@@ -701,7 +701,7 @@ log_ok "ReSukiSU integrated into kernel tree"
 # =============================================================================
 log_section "4 / 6" "⚙️" "内核配置"
 # =============================================================================
-echo "  ${C_DIM}Using compiler:${C_RESET}"
+printf "  ${C_DIM}Using compiler:${C_RESET}\n"
 "$CLANG" --version | head -n 2 | sed 's/^/    /'
 echo
 
@@ -756,7 +756,12 @@ if [ -z "$SKIP_MENUCONFIG" ]; then
     echo
 
     set +e
-    make "${MAKE_COMMON[@]}" menuconfig
+    (
+        unset CC
+        unset LD
+        export CURSES_LOC='ncurses.h'
+        make O=out ARCH=arm64 HOSTCC=gcc HOSTLD=ld HOSTCXX=g++ menuconfig
+    )
     menu_rc=$?
     set -e
 
