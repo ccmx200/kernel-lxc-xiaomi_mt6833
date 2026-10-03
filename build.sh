@@ -24,6 +24,7 @@ readonly C_ORANGE='\033[38;5;208m'
 readonly C_SKY='\033[38;5;117m'
 readonly C_BG_ORANGE='\033[48;5;208m'
 readonly C_BG_RED='\033[48;5;160m'
+readonly C_BG_GREEN='\033[48;5;28m'
 
 # -----------------------------------------------------------------------------
 #  CLI arguments
@@ -33,6 +34,7 @@ NO_CCACHE=""
 NO_UPDATE=""
 CHECK_ONLY=""
 MENUCONFIG=""
+SAVE_CONFIG=""
 CONFIG_FILES=()
 CONFIG_OPTS=()
 
@@ -64,8 +66,9 @@ Environment variables:
   DEVICE=everpal         Target device codename
   TC_DIR=/path/to/clang  Custom toolchain directory
   ERROR_CTX=200          Lines of context around first error
-  KCFG_FILE=path         Same as -cf, can list multiple with colon
-  KCFG_OPT="..."         Same as -c, can list multiple with semicolon
+  DIFF_LINES=50          Max lines to show per diff category
+  KCFG_FILE=path         Same as -cf, colon-separated
+  KCFG_OPT="..."         Same as -c, semicolon-separated
 EOF
 }
 
@@ -89,6 +92,7 @@ while [ $# -gt 0 ]; do
         -nu|--no-update) NO_UPDATE=1 ;;
         --check|--test)  CHECK_ONLY=1 ;;
         -m|--menuconfig) MENUCONFIG=1 ;;
+        -s|--save-config) SAVE_CONFIG=1 ;;
         -cf|--config-file)
             if [ -n "${2:-}" ]; then
                 CONFIG_FILES+=("$2")
@@ -302,7 +306,14 @@ print_error_context() {
 #  Kernel config helpers
 # -----------------------------------------------------------------------------
 
-# 用内核自带的 merge_config.sh 合并配置片段
+# 归一化：把 "# CONFIG_X is not set" 转成 "CONFIG_X=n"
+normalize_config() {
+    local file="$1"
+    grep -E '^(CONFIG_[A-Z0-9_]+=.*|# CONFIG_[A-Z0-9_]+ is not set)' "$file" 2>/dev/null \
+        | sed -E 's/^# (CONFIG_[A-Z0-9_]+) is not set$/\1=n/' \
+        | sort -u
+}
+
 apply_config_files() {
     local -n _files="$1"
     [ "${#_files[@]}" -eq 0 ] && return 0
@@ -311,7 +322,6 @@ apply_config_files() {
     local tmp_fragment
     tmp_fragment="$(mktemp /tmp/kcfg-frag-XXXXXX)"
 
-    # 把所有片段合并成一个临时文件
     for f in "${_files[@]}"; do
         if [ ! -f "$f" ]; then
             log_warn "Config file not found: $f"
@@ -327,10 +337,8 @@ apply_config_files() {
     fi
 
     if [ -x "$merge_script" ]; then
-        # 官方脚本会处理冲突并报告
         "$merge_script" -m -O out out/.config "$tmp_fragment" >/dev/null 2>&1 || true
     else
-        # 回退：直接拼接后重跑 olddefconfig
         cat "$tmp_fragment" >> out/.config
     fi
 
@@ -338,7 +346,6 @@ apply_config_files() {
     return 0
 }
 
-# 追加单条配置项到 .config，并记录
 apply_config_opts() {
     local -n _opts="$1"
     [ "${#_opts[@]}" -eq 0 ] && return 0
@@ -359,15 +366,71 @@ apply_config_opts() {
     return 0
 }
 
-# 把 .config 中与 defconfig 的差异打印出来
-show_config_diff() {
-    local base="arch/arm64/configs/$DEFCONFIG"
-    [ -f "$base" ] || return 0
-    [ -f out/.config ] || return 0
+# ---- 核心：对比配置前后的差异 ----
+show_config_changes() {
+    local before="$1"
+    local after="$2"
 
-    local diff_count
-    diff_count=$(grep -vE '^\s*(#|$)' out/.config | wc -l)
-    log_dim "Final .config entries: $diff_count"
+    [ -f "$before" ] || return 0
+    [ -f "$after" ]  || return 0
+
+    local diff_lines="${DIFF_LINES:-50}"
+
+    local before_norm after_norm
+    before_norm="$(mktemp)"
+    after_norm="$(mktemp)"
+    normalize_config "$before" > "$before_norm"
+    normalize_config "$after"  > "$after_norm"
+
+    # 新增：after 里有、before 里没有（或值变了）
+    local added removed
+    added="$(comm -13 "$before_norm" "$after_norm" || true)"
+    removed="$(comm -23 "$before_norm" "$after_norm" || true)"
+
+    local added_count=0 removed_count=0
+    [ -n "$added" ]   && added_count="$(printf '%s\n' "$added"   | grep -c . || true)"
+    [ -n "$removed" ] && removed_count="$(printf '%s\n' "$removed" | grep -c . || true)"
+
+    echo
+    printf "${C_MAGENTA}${C_BOLD}  Config Changes  (after extra config + olddefconfig)${C_RESET}\n"
+    echo
+
+    if [ "$added_count" -eq 0 ] && [ "$removed_count" -eq 0 ]; then
+        log_ok "No changes (fragment had no effect or identical to defconfig)"
+        rm -f "$before_norm" "$after_norm"
+        return 0
+    fi
+
+    printf "  ${C_GREEN}${C_BOLD}[+] Added    %3d${C_RESET}\n" "$added_count"
+    printf "  ${C_RED}${C_BOLD}[-] Removed  %3d${C_RESET}\n" "$removed_count"
+    echo
+
+    if [ "$added_count" -gt 0 ]; then
+        printf "${C_BG_GREEN}${C_WHITE}${C_BOLD}  Added  ${C_RESET}\n"
+        printf '%s\n' "$added" | head -n "$diff_lines" | sed 's/^/      /'
+        if [ "$added_count" -gt "$diff_lines" ]; then
+            log_dim "... and $((added_count - diff_lines)) more"
+        fi
+        echo
+    fi
+
+    if [ "$removed_count" -gt 0 ]; then
+        printf "${C_BG_RED}${C_WHITE}${C_BOLD}  Removed  ${C_RESET}\n"
+        printf '%s\n' "$removed" | head -n "$diff_lines" | sed 's/^/      /'
+        if [ "$removed_count" -gt "$diff_lines" ]; then
+            log_dim "... and $((removed_count - diff_lines)) more"
+        fi
+        echo
+    fi
+
+    rm -f "$before_norm" "$after_norm"
+}
+
+show_config_diff_stat() {
+    [ -f out/.config ] || return 0
+    local total
+    total=$(grep -cE '^(CONFIG_[A-Z0-9_]+=|# CONFIG_[A-Z0-9_]+ is not set)' out/.config 2>/dev/null || echo 0)
+    log_dim "Final .config entries: $total"
 }
 
 # -----------------------------------------------------------------------------
@@ -416,6 +479,7 @@ banner() {
         printf "  ${C_CYAN}Config overrides${C_RESET}  %d option(s)\n" "${#CONFIG_OPTS[@]}"
     fi
     [ -n "$MENUCONFIG" ] && printf "  ${C_CYAN}menuconfig${C_RESET}  will launch before compile\n"
+    [ -n "$SAVE_CONFIG" ] && printf "  ${C_CYAN}save-config${C_RESET}  will save final .config\n"
     echo
 }
 
@@ -558,6 +622,8 @@ cleanup() {
     if [ -n "$SPINNER_PID" ]; then
         kill "$SPINNER_PID" 2>/dev/null || true
     fi
+    [ -n "${CFG_BEFORE:-}" ] && [ -f "${CFG_BEFORE:-}" ] && rm -f "$CFG_BEFORE"
+    [ -n "${CFG_AFTER:-}" ]  && [ -f "${CFG_AFTER:-}"  ] && rm -f "$CFG_AFTER"
 }
 trap cleanup EXIT
 
@@ -708,7 +774,13 @@ else
     exit 1
 fi
 
-# ---- 应用额外的配置片段 / 选项（在 defconfig 之后，olddefconfig 之前） ----
+# ---- 在追加配置前，保存 defconfig 状态快照 ----
+if [ "${#CONFIG_FILES[@]}" -gt 0 ] || [ "${#CONFIG_OPTS[@]}" -gt 0 ]; then
+    CFG_BEFORE="$(mktemp /tmp/kcfg-before-XXXXXX)"
+    cp out/.config "$CFG_BEFORE"
+fi
+
+# ---- 应用额外的配置片段 / 选项 ----
 if [ "${#CONFIG_FILES[@]}" -gt 0 ] || [ "${#CONFIG_OPTS[@]}" -gt 0 ]; then
     spin_start "Applying extra kernel config ..."
     apply_config_files CONFIG_FILES
@@ -733,17 +805,27 @@ if [ -n "$MENUCONFIG" ]; then
 fi
 
 # ---- 保存最终配置（可选） ----
-if [ -n "${SAVE_CONFIG:-}" ]; then
+if [ -n "$SAVE_CONFIG" ]; then
     cp out/.config "$CURRENT_DIR/kernel.config"
     log_ok "Saved final config to $CURRENT_DIR/kernel.config"
 fi
 
-show_config_diff
+# ---- 显示配置差异 ----
+if [ -n "${CFG_BEFORE:-}" ] && [ -f "$CFG_BEFORE" ]; then
+    CFG_AFTER="$(mktemp /tmp/kcfg-after-XXXXXX)"
+    cp out/.config "$CFG_AFTER"
+    show_config_changes "$CFG_BEFORE" "$CFG_AFTER"
+    rm -f "$CFG_BEFORE" "$CFG_AFTER"
+    CFG_BEFORE=""
+    CFG_AFTER=""
+fi
+
+show_config_diff_stat
 
 # ---- 检查关键项是否生效 ----
 echo
 log_info "Checking key configs..."
-for key in CONFIG_KSU CONFIG_DOCKER CONFIG_SYSVIPC CONFIG_IPC_NS; do
+for key in CONFIG_KSU CONFIG_DOCKER CONFIG_SYSVIPC CONFIG_IPC_NS CONFIG_ANDROID_PARANOID_NETWORK; do
     if grep -qE "^${key}=y" out/.config 2>/dev/null; then
         log_ok  "${key}=y"
     elif grep -qE "^# ${key} is not set" out/.config 2>/dev/null; then
