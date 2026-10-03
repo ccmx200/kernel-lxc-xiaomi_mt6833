@@ -3,7 +3,8 @@
 #  🚀  ReSukiSU Kernel Builder
 #  🎯  Target : kernel-lxc_xiaomi_mtk810_mt6833 (everpal / MT6833)
 #  📖  Usage  : ./build.sh [-cn [URL]] [--no-ccache] [--no-update]
-#                          [--no-menuconfig] [--save-config] [--check]
+#                          [-m|--menuconfig] [--no-menuconfig]
+#                          [--save-config] [--check]
 # =============================================================================
 
 set -euo pipefail
@@ -14,10 +15,7 @@ set -euo pipefail
 readonly C_RESET='\033[0m'
 readonly C_BOLD='\033[1m'
 readonly C_DIM='\033[2m'
-readonly C_ITALIC='\033[3m'
-readonly C_UNDERLINE='\033[4m'
 
-readonly C_BLACK='\033[1;30m'
 readonly C_RED='\033[1;31m'
 readonly C_GREEN='\033[1;32m'
 readonly C_YELLOW='\033[1;33m'
@@ -45,33 +43,30 @@ GH_PROXY=""
 NO_CCACHE=""
 NO_UPDATE=""
 CHECK_ONLY=""
+FORCE_MENUCONFIG=""
 SKIP_MENUCONFIG=""
 SAVE_CONFIG=""
 
 usage() {
-    cat <<EOF
-${C_ORANGE}🚀 ReSukiSU Kernel Builder${C_RESET}
-
-${C_BOLD}Usage:${C_RESET} $0 [options]
-
-${C_BOLD}General:${C_RESET}
-  ${C_CYAN}-cn [URL]${C_RESET}            Enable GitHub acceleration
-  ${C_CYAN}--proxy URL${C_RESET}          Same as -cn URL
-  ${C_CYAN}--no-ccache${C_RESET}          Disable ccache
-  ${C_CYAN}-nu, --no-update${C_RESET}     Skip ReSukiSU auto-update
-  ${C_CYAN}--no-menuconfig${C_RESET}      Skip interactive menuconfig
-  ${C_CYAN}-s, --save-config${C_RESET}    Save final .config to ./kernel.config
-  ${C_CYAN}--check, --test${C_RESET}      Only run sanity check (no compile)
-  ${C_CYAN}-h, --help${C_RESET}           Show this help
-
-${C_BOLD}Environment:${C_RESET}
-  ${C_DIM}CLEAN_BUILD=true${C_RESET}      Full clean build
-  ${C_DIM}ZIP_ANY_KERNEL=false${C_RESET}  Skip AnyKernel3 packaging
-  ${C_DIM}DEVICE=everpal${C_RESET}        Target device codename
-  ${C_DIM}TC_DIR=/path/clang${C_RESET}    Custom toolchain directory
-  ${C_DIM}ERROR_CTX=200${C_RESET}         Error context lines
-  ${C_DIM}DIFF_LINES=100${C_RESET}        Max diff lines per category
-EOF
+    printf "${C_ORANGE}${C_BOLD}🚀 ReSukiSU Kernel Builder${C_RESET}\n\n"
+    printf "${C_BOLD}Usage:${C_RESET} $0 [options]\n\n"
+    printf "${C_BOLD}General:${C_RESET}\n"
+    printf "  ${C_CYAN}-cn [URL]${C_RESET}            Enable GitHub acceleration\n"
+    printf "  ${C_CYAN}--proxy URL${C_RESET}          Same as -cn URL\n"
+    printf "  ${C_CYAN}--no-ccache${C_RESET}          Disable ccache\n"
+    printf "  ${C_CYAN}-nu, --no-update${C_RESET}     Skip ReSukiSU auto-update\n"
+    printf "  ${C_CYAN}-m,  --menuconfig${C_RESET}    Force interactive menuconfig\n"
+    printf "  ${C_CYAN}--no-menuconfig${C_RESET}      Skip interactive menuconfig\n"
+    printf "  ${C_CYAN}-s,  --save-config${C_RESET}   Save final .config to ./kernel.config\n"
+    printf "  ${C_CYAN}--check, --test${C_RESET}      Only run sanity check (no compile)\n"
+    printf "  ${C_CYAN}-h,  --help${C_RESET}          Show this help\n\n"
+    printf "${C_BOLD}Environment:${C_RESET}\n"
+    printf "  ${C_DIM}CLEAN_BUILD=true${C_RESET}      Full clean build\n"
+    printf "  ${C_DIM}ZIP_ANY_KERNEL=false${C_RESET}  Skip AnyKernel3 packaging\n"
+    printf "  ${C_DIM}DEVICE=everpal${C_RESET}        Target device codename\n"
+    printf "  ${C_DIM}TC_DIR=/path/clang${C_RESET}    Custom toolchain directory\n"
+    printf "  ${C_DIM}ERROR_CTX=200${C_RESET}         Error context lines\n"
+    printf "  ${C_DIM}DIFF_LINES=100${C_RESET}        Max diff lines per category\n"
 }
 
 while [ $# -gt 0 ]; do
@@ -88,12 +83,13 @@ while [ $# -gt 0 ]; do
             ;;
         --no-ccache)     NO_CCACHE=1 ;;
         -nu|--no-update) NO_UPDATE=1 ;;
-        --no-menuconfig) SKIP_MENUCONFIG=1 ;;
+        -m|--menuconfig) FORCE_MENUCONFIG=1; SKIP_MENUCONFIG="" ;;
+        --no-menuconfig) SKIP_MENUCONFIG=1; FORCE_MENUCONFIG="" ;;
         -s|--save-config) SAVE_CONFIG=1 ;;
         --check|--test)  CHECK_ONLY=1 ;;
         -h|--help)       usage; exit 0 ;;
         *)
-            printf "${C_RED}Unknown option:${C_RESET} %s\n\n" "$1" >&2
+            printf "${C_RED}❌ Unknown option:${C_RESET} %s\n\n" "$1" >&2
             usage; exit 1
             ;;
     esac
@@ -215,7 +211,7 @@ roll_stop() {
 }
 
 # -----------------------------------------------------------------------------
-#  🚨  Error extraction with context
+#  🚨  Error extraction
 # -----------------------------------------------------------------------------
 ERROR_CTX="${ERROR_CTX:-200}"
 
@@ -292,7 +288,6 @@ hr() {
 # -----------------------------------------------------------------------------
 #  🎨  Dual-column printer
 # -----------------------------------------------------------------------------
-# 用法: dual_print "left_title" "left_lines_file" "right_title" "right_lines_file"
 dual_print() {
     local ltitle="$1" lfile="$2"
     local rtitle="$3" rfile="$4"
@@ -304,18 +299,15 @@ dual_print() {
     rc=$(wc -l < "$rfile" 2>/dev/null || echo 0)
     local max=$(( lc > rc ? lc : rc ))
 
-    # 表头
     printf "  ${C_BG_GREEN}${C_WHITE}${C_BOLD} %-${lw}s ${C_RESET}" "$ltitle"
     printf "  ${C_BG_RED}${C_WHITE}${C_BOLD} %-${lw}s ${C_RESET}\n" "$rtitle"
 
-    # 分隔线
     printf "  ${C_GREEN}"
     printf '─%.0s' $(seq 1 $lw)
     printf "${C_RESET}  ${C_RED}"
     printf '─%.0s' $(seq 1 $lw)
     printf "${C_RESET}\n"
 
-    # 内容
     local i=0
     while [ "$i" -lt "$max" ]; do
         i=$((i + 1))
@@ -533,7 +525,6 @@ show_menuconfig_diff() {
     printf "  ${C_RED}${C_BOLD}➖ Removed${C_RESET} ${C_RED}%d${C_RESET}\n" "$removed_n"
     echo
 
-    # 准备双栏数据文件
     local lf rf
     lf="$(mktemp)"; rf="$(mktemp)"
     printf '%s\n' "$added"   | head -n "$diff_lines" > "$lf"
