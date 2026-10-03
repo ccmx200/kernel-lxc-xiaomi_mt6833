@@ -1,74 +1,76 @@
 #!/bin/bash
 # =============================================================================
-#  ReSukiSU Kernel Build Script
-#  Target : kernel-lxc_xiaomi_mtk810_mt6833 (everpal / MT6833)
-#  Usage  : ./b.sh [-cn [URL]] [--no-ccache] [--no-update] [--proxy URL]
-#                   [-cf FILE] [-c OPT] [--menuconfig] [--check]
+#  🚀  ReSukiSU Kernel Builder
+#  🎯  Target : kernel-lxc_xiaomi_mtk810_mt6833 (everpal / MT6833)
+#  📖  Usage  : ./build.sh [-cn [URL]] [--no-ccache] [--no-update]
+#                          [--no-menuconfig] [--save-config] [--check]
 # =============================================================================
 
 set -euo pipefail
 
 # -----------------------------------------------------------------------------
-#  Colors
+#  🎨  Colors
 # -----------------------------------------------------------------------------
 readonly C_RESET='\033[0m'
 readonly C_BOLD='\033[1m'
 readonly C_DIM='\033[2m'
+readonly C_ITALIC='\033[3m'
+readonly C_UNDERLINE='\033[4m'
+
+readonly C_BLACK='\033[1;30m'
 readonly C_RED='\033[1;31m'
 readonly C_GREEN='\033[1;32m'
 readonly C_YELLOW='\033[1;33m'
-readonly C_CYAN='\033[1;36m'
+readonly C_BLUE='\033[1;34m'
 readonly C_MAGENTA='\033[1;35m'
+readonly C_CYAN='\033[1;36m'
 readonly C_WHITE='\033[1;37m'
 readonly C_ORANGE='\033[38;5;208m'
+readonly C_PINK='\033[38;5;213m'
+readonly C_LAVENDER='\033[38;5;183m'
+readonly C_MINT='\033[38;5;121m'
 readonly C_SKY='\033[38;5;117m'
+
 readonly C_BG_ORANGE='\033[48;5;208m'
 readonly C_BG_RED='\033[48;5;160m'
 readonly C_BG_GREEN='\033[48;5;28m'
+readonly C_BG_BLUE='\033[48;5;24m'
+readonly C_BG_PURPLE='\033[48;5;90m'
+readonly C_BG_TEAL='\033[48;5;30m'
 
 # -----------------------------------------------------------------------------
-#  CLI arguments
+#  🧠  CLI arguments
 # -----------------------------------------------------------------------------
 GH_PROXY=""
 NO_CCACHE=""
 NO_UPDATE=""
 CHECK_ONLY=""
-MENUCONFIG=""
+SKIP_MENUCONFIG=""
 SAVE_CONFIG=""
-CONFIG_FILES=()
-CONFIG_OPTS=()
 
 usage() {
     cat <<EOF
-ReSukiSU Kernel Build Script
+${C_ORANGE}🚀 ReSukiSU Kernel Builder${C_RESET}
 
-Usage: $0 [options]
+${C_BOLD}Usage:${C_RESET} $0 [options]
 
-General:
-  -cn [URL]           Enable GitHub acceleration (default: https://git.yylx.win/)
-  --proxy URL         Same as -cn URL
-  --no-ccache         Disable ccache (ccache is ON by default)
-  -nu, --no-update    Skip ReSukiSU auto-update
-  --check, --test     Only run syntax/toolchain/defconfig sanity check
-  -h, --help          Show this help
+${C_BOLD}General:${C_RESET}
+  ${C_CYAN}-cn [URL]${C_RESET}            Enable GitHub acceleration
+  ${C_CYAN}--proxy URL${C_RESET}          Same as -cn URL
+  ${C_CYAN}--no-ccache${C_RESET}          Disable ccache
+  ${C_CYAN}-nu, --no-update${C_RESET}     Skip ReSukiSU auto-update
+  ${C_CYAN}--no-menuconfig${C_RESET}      Skip interactive menuconfig
+  ${C_CYAN}-s, --save-config${C_RESET}    Save final .config to ./kernel.config
+  ${C_CYAN}--check, --test${C_RESET}      Only run sanity check (no compile)
+  ${C_CYAN}-h, --help${C_RESET}           Show this help
 
-Kernel config (applied AFTER defconfig, BEFORE compile):
-  -cf, --config-file FILE   Append a kernel config fragment (repeatable)
-  -c,  --config OPT         Append a single config option (repeatable)
-                            e.g. -c CONFIG_SYSVIPC=y
-                                 -c '# CONFIG_ANDROID_PARANOID_NETWORK is not set'
-  -m,  --menuconfig         Launch interactive menuconfig before compile
-  -s,  --save-config        Save the final .config to \$CURRENT_DIR/kernel.config
-
-Environment variables:
-  CLEAN_BUILD=true       Perform a full clean build
-  ZIP_ANY_KERNEL=false   Skip AnyKernel3 packaging
-  DEVICE=everpal         Target device codename
-  TC_DIR=/path/to/clang  Custom toolchain directory
-  ERROR_CTX=200          Lines of context around first error
-  DIFF_LINES=50          Max lines to show per diff category
-  KCFG_FILE=path         Same as -cf, colon-separated
-  KCFG_OPT="..."         Same as -c, semicolon-separated
+${C_BOLD}Environment:${C_RESET}
+  ${C_DIM}CLEAN_BUILD=true${C_RESET}      Full clean build
+  ${C_DIM}ZIP_ANY_KERNEL=false${C_RESET}  Skip AnyKernel3 packaging
+  ${C_DIM}DEVICE=everpal${C_RESET}        Target device codename
+  ${C_DIM}TC_DIR=/path/clang${C_RESET}    Custom toolchain directory
+  ${C_DIM}ERROR_CTX=200${C_RESET}         Error context lines
+  ${C_DIM}DIFF_LINES=100${C_RESET}        Max diff lines per category
 EOF
 }
 
@@ -76,73 +78,35 @@ while [ $# -gt 0 ]; do
     case "$1" in
         -cn|--cn)
             if [ -n "${2:-}" ] && [[ "${2:-}" =~ ^https?:// ]]; then
-                GH_PROXY="$2"
-                shift
+                GH_PROXY="$2"; shift
             else
                 GH_PROXY="https://git.yylx.win/"
             fi
             ;;
         --proxy)
-            if [ -n "${2:-}" ]; then
-                GH_PROXY="$2"
-                shift
-            fi
+            [ -n "${2:-}" ] && { GH_PROXY="$2"; shift; }
             ;;
-        --no-ccache)   NO_CCACHE=1 ;;
+        --no-ccache)     NO_CCACHE=1 ;;
         -nu|--no-update) NO_UPDATE=1 ;;
-        --check|--test)  CHECK_ONLY=1 ;;
-        -m|--menuconfig) MENUCONFIG=1 ;;
+        --no-menuconfig) SKIP_MENUCONFIG=1 ;;
         -s|--save-config) SAVE_CONFIG=1 ;;
-        -cf|--config-file)
-            if [ -n "${2:-}" ]; then
-                CONFIG_FILES+=("$2")
-                shift
-            else
-                printf "Missing FILE argument for %s\n" "$1" >&2
-                exit 1
-            fi
-            ;;
-        -c|--config)
-            if [ -n "${2:-}" ]; then
-                CONFIG_OPTS+=("$2")
-                shift
-            else
-                printf "Missing OPT argument for %s\n" "$1" >&2
-                exit 1
-            fi
-            ;;
-        -h|--help) usage; exit 0 ;;
+        --check|--test)  CHECK_ONLY=1 ;;
+        -h|--help)       usage; exit 0 ;;
         *)
-            printf "Unknown option: %s\n\n" "$1" >&2
-            usage
-            exit 1
+            printf "${C_RED}Unknown option:${C_RESET} %s\n\n" "$1" >&2
+            usage; exit 1
             ;;
     esac
     shift
 done
 
-# 环境变量里的额外配置
-if [ -n "${KCFG_FILE:-}" ]; then
-    IFS=':' read -ra _kf <<< "$KCFG_FILE"
-    for f in "${_kf[@]}"; do
-        [ -n "$f" ] && CONFIG_FILES+=("$f")
-    done
-fi
-if [ -n "${KCFG_OPT:-}" ]; then
-    IFS=';' read -ra _ko <<< "$KCFG_OPT"
-    for o in "${_ko[@]}"; do
-        [ -n "$o" ] && CONFIG_OPTS+=("$o")
-    done
-fi
-
 # -----------------------------------------------------------------------------
-#  GitHub URL rewriting
+#  🌐  GitHub URL rewriting
 # -----------------------------------------------------------------------------
 gh_url() {
     local url="$1"
     if [ -z "$GH_PROXY" ]; then
-        printf '%s' "$url"
-        return
+        printf '%s' "$url"; return
     fi
     printf '%s' "$url" | sed \
         -e "s|https://github.com/|${GH_PROXY}github.com/|g" \
@@ -173,7 +137,7 @@ rewrite_gh_links_in() {
 }
 
 # -----------------------------------------------------------------------------
-#  Spinner animation
+#  🎡  Spinner animation
 # -----------------------------------------------------------------------------
 SPINNER_PID=""
 
@@ -183,7 +147,7 @@ spin_start() {
     (
         local i=0
         while :; do
-            printf "\r${C_CYAN}  %s${C_RESET}  ${C_DIM}%s${C_RESET}" "${frames[$i]}" "$msg"
+            printf "\r${C_CYAN}  ${frames[$i]}${C_RESET}  ${C_DIM}%s${C_RESET}" "$msg"
             i=$(( (i + 1) % ${#frames[@]} ))
             sleep 0.08
         done
@@ -202,15 +166,15 @@ spin_stop() {
     fi
     printf "\r\033[K"
     case "$status" in
-        ok)   printf "${C_GREEN}  ✓${C_RESET}  %s\n" "$msg" ;;
-        fail) printf "${C_RED}  ✗${C_RESET}  %s\n" "$msg" ;;
-        warn) printf "${C_YELLOW}  !${C_RESET}  %s\n" "$msg" ;;
+        ok)   printf "${C_GREEN}  ✅${C_RESET}  %s\n" "$msg" ;;
+        fail) printf "${C_RED}  ❌${C_RESET}  %s\n" "$msg" ;;
+        warn) printf "${C_YELLOW}  ⚠️${C_RESET}   %s\n" "$msg" ;;
         *)    printf "  %s\n" "$msg" ;;
     esac
 }
 
 # -----------------------------------------------------------------------------
-#  Single-line rolling build log
+#  📜  Single-line rolling build log
 # -----------------------------------------------------------------------------
 ROLL_PID=""
 ROLL_STOP_FILE=""
@@ -226,7 +190,7 @@ roll_start() {
                 last_line="$(tail -n 1 "$log_file" 2>/dev/null || true)"
                 if [ -n "$last_line" ]; then
                     [ "${#last_line}" -gt 100 ] && last_line="${last_line:0:97}..."
-                    printf "\r\033[K${C_SKY}  ▸${C_RESET} ${C_DIM}%s${C_RESET}" "$last_line"
+                    printf "\r\033[K${C_SKY}  🔨${C_RESET} ${C_DIM}%s${C_RESET}" "$last_line"
                 fi
             fi
             sleep 0.12
@@ -251,7 +215,7 @@ roll_stop() {
 }
 
 # -----------------------------------------------------------------------------
-#  Error extraction with N lines of context
+#  🚨  Error extraction with context
 # -----------------------------------------------------------------------------
 ERROR_CTX="${ERROR_CTX:-200}"
 
@@ -266,7 +230,7 @@ print_error_context() {
 
     if [ -z "$first_err" ]; then
         echo
-        printf "${C_BG_RED}${C_WHITE}${C_BOLD}  Build failed · no 'error:' marker found · showing last 40 lines  ${C_RESET}\n"
+        printf "${C_BG_RED}${C_WHITE}${C_BOLD}  ❌ Build failed  ·  no 'error:' marker found  ${C_RESET}\n"
         echo
         tail -n 40 "$log_file" | sed 's/^/    /'
         return 0
@@ -280,173 +244,43 @@ print_error_context() {
     [ "$end" -gt "$total" ] && end="$total"
 
     echo
-    printf "${C_BG_RED}${C_WHITE}${C_BOLD}  Build failed  ·  first error at line %d of %d  ·  context ±%d lines  ${C_RESET}\n" \
+    printf "${C_BG_RED}${C_WHITE}${C_BOLD}  ❌ Build failed  ·  line %d / %d  ·  context ±%d  ${C_RESET}\n" \
         "$first_err" "$total" "$ctx"
     echo
-    printf "${C_DIM}  ── lines %d..%d ──────────────────────────────────────────${C_RESET}\n\n" \
+    printf "${C_DIM}  ── lines %d..%d ──────────────────────────────────${C_RESET}\n\n" \
         "$start" "$end"
 
     awk -v s="$start" -v e="$end" -v fe="$first_err" '
         NR >= s && NR <= e {
-            line = $0
             if (NR == fe) {
-                printf "\033[1;31m  ▶ %s\033[0m\n", line
+                printf "\033[1;31m  ▶ %s\033[0m\n", $0
             } else {
-                printf "    %s\n", line
+                printf "    %s\n", $0
             }
         }
     ' "$log_file"
 
     echo
-    printf "${C_DIM}  ──────────────────────────────────────────────────────────${C_RESET}\n"
+    printf "${C_DIM}  ──────────────────────────────────────────────────${C_RESET}\n"
     printf "  ${C_DIM}Full log:${C_RESET} ${C_BOLD}%s${C_RESET}\n" "$log_file"
 }
 
 # -----------------------------------------------------------------------------
-#  Kernel config helpers
-# -----------------------------------------------------------------------------
-
-# 归一化：把 "# CONFIG_X is not set" 转成 "CONFIG_X=n"
-normalize_config() {
-    local file="$1"
-    grep -E '^(CONFIG_[A-Z0-9_]+=.*|# CONFIG_[A-Z0-9_]+ is not set)' "$file" 2>/dev/null \
-        | sed -E 's/^# (CONFIG_[A-Z0-9_]+) is not set$/\1=n/' \
-        | sort -u
-}
-
-apply_config_files() {
-    local -n _files="$1"
-    [ "${#_files[@]}" -eq 0 ] && return 0
-
-    local merge_script="scripts/kconfig/merge_config.sh"
-    local tmp_fragment
-    tmp_fragment="$(mktemp /tmp/kcfg-frag-XXXXXX)"
-
-    for f in "${_files[@]}"; do
-        if [ ! -f "$f" ]; then
-            log_warn "Config file not found: $f"
-            continue
-        fi
-        echo "# ---- from $f ----" >> "$tmp_fragment"
-        cat "$f" >> "$tmp_fragment"
-    done
-
-    if [ ! -s "$tmp_fragment" ]; then
-        rm -f "$tmp_fragment"
-        return 0
-    fi
-
-    if [ -x "$merge_script" ]; then
-        "$merge_script" -m -O out out/.config "$tmp_fragment" >/dev/null 2>&1 || true
-    else
-        cat "$tmp_fragment" >> out/.config
-    fi
-
-    rm -f "$tmp_fragment"
-    return 0
-}
-
-apply_config_opts() {
-    local -n _opts="$1"
-    [ "${#_opts[@]}" -eq 0 ] && return 0
-
-    local tmp
-    tmp="$(mktemp /tmp/kcfg-opt-XXXXXX)"
-    for o in "${_opts[@]}"; do
-        printf '%s\n' "$o" >> "$tmp"
-    done
-
-    if [ -x "scripts/kconfig/merge_config.sh" ]; then
-        scripts/kconfig/merge_config.sh -m -O out out/.config "$tmp" >/dev/null 2>&1 || true
-    else
-        cat "$tmp" >> out/.config
-    fi
-
-    rm -f "$tmp"
-    return 0
-}
-
-# ---- 核心：对比配置前后的差异 ----
-show_config_changes() {
-    local before="$1"
-    local after="$2"
-
-    [ -f "$before" ] || return 0
-    [ -f "$after" ]  || return 0
-
-    local diff_lines="${DIFF_LINES:-50}"
-
-    local before_norm after_norm
-    before_norm="$(mktemp)"
-    after_norm="$(mktemp)"
-    normalize_config "$before" > "$before_norm"
-    normalize_config "$after"  > "$after_norm"
-
-    # 新增：after 里有、before 里没有（或值变了）
-    local added removed
-    added="$(comm -13 "$before_norm" "$after_norm" || true)"
-    removed="$(comm -23 "$before_norm" "$after_norm" || true)"
-
-    local added_count=0 removed_count=0
-    [ -n "$added" ]   && added_count="$(printf '%s\n' "$added"   | grep -c . || true)"
-    [ -n "$removed" ] && removed_count="$(printf '%s\n' "$removed" | grep -c . || true)"
-
-    echo
-    printf "${C_MAGENTA}${C_BOLD}  Config Changes  (after extra config + olddefconfig)${C_RESET}\n"
-    echo
-
-    if [ "$added_count" -eq 0 ] && [ "$removed_count" -eq 0 ]; then
-        log_ok "No changes (fragment had no effect or identical to defconfig)"
-        rm -f "$before_norm" "$after_norm"
-        return 0
-    fi
-
-    printf "  ${C_GREEN}${C_BOLD}[+] Added    %3d${C_RESET}\n" "$added_count"
-    printf "  ${C_RED}${C_BOLD}[-] Removed  %3d${C_RESET}\n" "$removed_count"
-    echo
-
-    if [ "$added_count" -gt 0 ]; then
-        printf "${C_BG_GREEN}${C_WHITE}${C_BOLD}  Added  ${C_RESET}\n"
-        printf '%s\n' "$added" | head -n "$diff_lines" | sed 's/^/      /'
-        if [ "$added_count" -gt "$diff_lines" ]; then
-            log_dim "... and $((added_count - diff_lines)) more"
-        fi
-        echo
-    fi
-
-    if [ "$removed_count" -gt 0 ]; then
-        printf "${C_BG_RED}${C_WHITE}${C_BOLD}  Removed  ${C_RESET}\n"
-        printf '%s\n' "$removed" | head -n "$diff_lines" | sed 's/^/      /'
-        if [ "$removed_count" -gt "$diff_lines" ]; then
-            log_dim "... and $((removed_count - diff_lines)) more"
-        fi
-        echo
-    fi
-
-    rm -f "$before_norm" "$after_norm"
-}
-
-show_config_diff_stat() {
-    [ -f out/.config ] || return 0
-    local total
-    total=$(grep -cE '^(CONFIG_[A-Z0-9_]+=|# CONFIG_[A-Z0-9_]+ is not set)' out/.config 2>/dev/null || echo 0)
-    log_dim "Final .config entries: $total"
-}
-
-# -----------------------------------------------------------------------------
-#  Logging helpers
+#  🎨  Logging helpers
 # -----------------------------------------------------------------------------
 log_section() {
-    local title="$1"
+    local num="$1"
+    local icon="$2"
+    local title="$3"
     echo
-    printf "${C_BG_ORANGE}${C_WHITE}${C_BOLD}  %s  ${C_RESET}\n" "$title"
+    printf "${C_BG_PURPLE}${C_WHITE}${C_BOLD}  %s  %s  ·  %s  ${C_RESET}\n" "$num" "$icon" "$title"
     echo
 }
 
-log_info()  { printf "${C_CYAN}  ▸${C_RESET}  %s\n" "$1"; }
-log_ok()    { printf "${C_GREEN}  ✓${C_RESET}  %s\n" "$1"; }
-log_warn()  { printf "${C_YELLOW}  !${C_RESET}  %s\n" "$1"; }
-log_error() { printf "${C_RED}  ✗${C_RESET}  %s\n" "$1" >&2; }
+log_info()  { printf "${C_SKY}  💡${C_RESET}  %s\n" "$1"; }
+log_ok()    { printf "${C_GREEN}  ✅${C_RESET}  %s\n" "$1"; }
+log_warn()  { printf "${C_YELLOW}  ⚠️${C_RESET}   %s\n" "$1"; }
+log_error() { printf "${C_RED}  ❌${C_RESET}  %s\n" "$1" >&2; }
 log_dim()   { printf "${C_DIM}     %s${C_RESET}\n" "$1"; }
 
 hr() {
@@ -456,56 +290,111 @@ hr() {
 }
 
 # -----------------------------------------------------------------------------
-#  Banner
+#  🎨  Dual-column printer
+# -----------------------------------------------------------------------------
+# 用法: dual_print "left_title" "left_lines_file" "right_title" "right_lines_file"
+dual_print() {
+    local ltitle="$1" lfile="$2"
+    local rtitle="$3" rfile="$4"
+    local lw=34
+    local cw=34
+
+    local lc rc
+    lc=$(wc -l < "$lfile" 2>/dev/null || echo 0)
+    rc=$(wc -l < "$rfile" 2>/dev/null || echo 0)
+    local max=$(( lc > rc ? lc : rc ))
+
+    # 表头
+    printf "  ${C_BG_GREEN}${C_WHITE}${C_BOLD} %-${lw}s ${C_RESET}" "$ltitle"
+    printf "  ${C_BG_RED}${C_WHITE}${C_BOLD} %-${lw}s ${C_RESET}\n" "$rtitle"
+
+    # 分隔线
+    printf "  ${C_GREEN}"
+    printf '─%.0s' $(seq 1 $lw)
+    printf "${C_RESET}  ${C_RED}"
+    printf '─%.0s' $(seq 1 $lw)
+    printf "${C_RESET}\n"
+
+    # 内容
+    local i=0
+    while [ "$i" -lt "$max" ]; do
+        i=$((i + 1))
+        local l r
+        l=$(sed -n "${i}p" "$lfile" 2>/dev/null || true)
+        r=$(sed -n "${i}p" "$rfile" 2>/dev/null || true)
+
+        [ "${#l}" -gt "$lw" ] && l="${l:0:$((lw-3))}..."
+        [ "${#r}" -gt "$lw" ] && r="${r:0:$((lw-3))}..."
+
+        printf "  ${C_MINT}%-${lw}s${C_RESET}  ${C_PINK}%-${lw}s${C_RESET}\n" "$l" "$r"
+    done
+}
+
+# -----------------------------------------------------------------------------
+#  🚀  Banner
 # -----------------------------------------------------------------------------
 banner() {
     clear 2>/dev/null || true
     echo
-    printf "${C_ORANGE}${C_BOLD}  ReSukiSU Kernel Builder${C_RESET}\n"
-    printf "${C_DIM}  everpal / MT6833${C_RESET}\n"
-    echo
+    printf "${C_ORANGE}${C_BOLD}"
+    cat <<'EOF'
+    ╭─────────────────────────────────────────────────────╮
+    │  🚀  ReSukiSU Kernel Builder                        │
+    │  🎯  everpal / MT6833  ·  Android Kernel 4.14      │
+    ╰─────────────────────────────────────────────────────╯
+EOF
+    printf "${C_RESET}\n"
+
+    printf "  ${C_LAVENDER}🌐 GitHub proxy${C_RESET}   "
     if [ -n "$GH_PROXY" ]; then
-        printf "  ${C_CYAN}GitHub proxy${C_RESET}  ${C_BOLD}%s${C_RESET}\n" "$GH_PROXY"
+        printf "${C_BOLD}%s${C_RESET}\n" "$GH_PROXY"
     else
-        printf "  ${C_DIM}GitHub proxy: disabled (use -cn to enable)${C_RESET}\n"
+        printf "${C_DIM}disabled${C_RESET}\n"
     fi
+
+    printf "  ${C_LAVENDER}🔄 Auto-update${C_RESET}    "
     if [ -n "$NO_UPDATE" ]; then
-        printf "  ${C_DIM}ReSukiSU auto-update: disabled${C_RESET}\n"
+        printf "${C_DIM}disabled${C_RESET}\n"
+    else
+        printf "${C_GREEN}enabled${C_RESET}\n"
     fi
-    if [ "${#CONFIG_FILES[@]}" -gt 0 ]; then
-        printf "  ${C_CYAN}Config fragments${C_RESET}  %d file(s)\n" "${#CONFIG_FILES[@]}"
+
+    printf "  ${C_LAVENDER}⚙️  Menuconfig${C_RESET}     "
+    if [ -n "$SKIP_MENUCONFIG" ]; then
+        printf "${C_DIM}skipped${C_RESET}\n"
+    else
+        printf "${C_GREEN}interactive${C_RESET}\n"
     fi
-    if [ "${#CONFIG_OPTS[@]}" -gt 0 ]; then
-        printf "  ${C_CYAN}Config overrides${C_RESET}  %d option(s)\n" "${#CONFIG_OPTS[@]}"
-    fi
-    [ -n "$MENUCONFIG" ] && printf "  ${C_CYAN}menuconfig${C_RESET}  will launch before compile\n"
-    [ -n "$SAVE_CONFIG" ] && printf "  ${C_CYAN}save-config${C_RESET}  will save final .config\n"
+
+    [ -n "$SAVE_CONFIG" ] && \
+        printf "  ${C_LAVENDER}💾 Save config${C_RESET}    ${C_GREEN}yes${C_RESET}\n"
+
+    [ -n "$CHECK_ONLY" ] && \
+        printf "  ${C_LAVENDER}🔍 Check only${C_RESET}     ${C_YELLOW}yes${C_RESET}\n"
+
     echo
 }
 
 # -----------------------------------------------------------------------------
-#  ReSukiSU version info
+#  📦  ReSukiSU version info
 # -----------------------------------------------------------------------------
 RSU_VERSION="unknown"
 RSU_COMMIT="unknown"
 RSU_BRANCH="unknown"
 RSU_DATE="unknown"
 RSU_DIRTY="clean"
+RSU_UPDATED="no"
 
 get_resukisu_info() {
     local dir="$CURRENT_DIR/ReSukiSU"
 
-    RSU_VERSION="unknown"
-    RSU_COMMIT="unknown"
-    RSU_BRANCH="unknown"
-    RSU_DATE="unknown"
+    RSU_VERSION="unknown"; RSU_COMMIT="unknown"
+    RSU_BRANCH="unknown";  RSU_DATE="unknown"
     RSU_DIRTY="clean"
 
     if [ ! -d "$dir/.git" ] && [ -d "$dir/kernel" ]; then
-        RSU_VERSION="vendored"
-        RSU_COMMIT="vendored"
-        RSU_BRANCH="main"
-        RSU_DATE="unknown"
+        RSU_VERSION="vendored"; RSU_COMMIT="vendored"
+        RSU_BRANCH="main";     RSU_DATE="unknown"
         RSU_DIRTY="clean"
         return 0
     fi
@@ -543,14 +432,8 @@ get_resukisu_info() {
     return 0
 }
 
-# -----------------------------------------------------------------------------
-#  ReSukiSU auto-update
-# -----------------------------------------------------------------------------
-RSU_UPDATED="no"
-
 update_resukisu() {
     local dir="$CURRENT_DIR/ReSukiSU"
-
     RSU_UPDATED="no"
 
     [ -d "$dir/.git" ] || return 0
@@ -586,24 +469,106 @@ update_resukisu() {
 
 print_rsu_panel() {
     echo
-    printf "${C_MAGENTA}${C_BOLD}  ReSukiSU Info${C_RESET}\n"
-    printf "${C_DIM}  Version       ${C_RESET} ${C_WHITE}%s${C_RESET}\n" "$RSU_VERSION"
-    printf "${C_DIM}  Commit        ${C_RESET} ${C_WHITE}%s${C_RESET}\n" "$RSU_COMMIT"
-    printf "${C_DIM}  Branch        ${C_RESET} ${C_WHITE}%s${C_RESET}\n" "$RSU_BRANCH"
-    printf "${C_DIM}  Commit Date   ${C_RESET} ${C_WHITE}%s${C_RESET}\n" "$RSU_DATE"
+    printf "${C_PINK}${C_BOLD}  📦 ReSukiSU Info${C_RESET}\n"
+    printf "  ${C_DIM}├─${C_RESET} ${C_DIM}Version${C_RESET}       ${C_WHITE}%s${C_RESET}\n" "$RSU_VERSION"
+    printf "  ${C_DIM}├─${C_RESET} ${C_DIM}Commit${C_RESET}        ${C_WHITE}%s${C_RESET}\n" "$RSU_COMMIT"
+    printf "  ${C_DIM}├─${C_RESET} ${C_DIM}Branch${C_RESET}        ${C_WHITE}%s${C_RESET}\n" "$RSU_BRANCH"
+    printf "  ${C_DIM}├─${C_RESET} ${C_DIM}Date${C_RESET}          ${C_WHITE}%s${C_RESET}\n" "$RSU_DATE"
     if [ "$RSU_DIRTY" = "dirty" ]; then
-        printf "${C_DIM}  Working Tree  ${C_RESET} ${C_YELLOW}dirty (local changes)${C_RESET}\n"
+        printf "  ${C_DIM}├─${C_RESET} ${C_DIM}Tree${C_RESET}          ${C_YELLOW}🌿 dirty${C_RESET}\n"
     else
-        printf "${C_DIM}  Working Tree  ${C_RESET} ${C_GREEN}clean${C_RESET}\n"
+        printf "  ${C_DIM}├─${C_RESET} ${C_DIM}Tree${C_RESET}          ${C_GREEN}🌿 clean${C_RESET}\n"
     fi
     if [ "$RSU_UPDATED" = "yes" ]; then
-        printf "${C_DIM}  Updated       ${C_RESET} ${C_GREEN}yes${C_RESET}\n"
+        printf "  ${C_DIM}└─${C_RESET} ${C_DIM}Updated${C_RESET}       ${C_GREEN}✅ yes${C_RESET}\n"
+    else
+        printf "  ${C_DIM}└─${C_RESET}\n"
     fi
     echo
 }
 
 # -----------------------------------------------------------------------------
-#  Config
+#  🔧  Config helpers
+# -----------------------------------------------------------------------------
+CFG_BEFORE=""
+CFG_AFTER=""
+
+norm_config() {
+    grep -E '^(CONFIG_[A-Z0-9_]+=.*|# CONFIG_[A-Z0-9_]+ is not set)' "$1" 2>/dev/null \
+        | sed -E 's/^# (CONFIG_[A-Z0-9_]+) is not set$/\1=n/' \
+        | sort -u
+}
+
+show_menuconfig_diff() {
+    local diff_lines="${DIFF_LINES:-100}"
+
+    if [ ! -f "$CFG_BEFORE" ] || [ ! -f "$CFG_AFTER" ]; then
+        return 0
+    fi
+
+    local b_norm a_norm
+    b_norm="$(mktemp)"; a_norm="$(mktemp)"
+    norm_config "$CFG_BEFORE" > "$b_norm"
+    norm_config "$CFG_AFTER"  > "$a_norm"
+
+    local added removed
+    added="$(comm -13 "$b_norm" "$a_norm" || true)"
+    removed="$(comm -23 "$b_norm" "$a_norm" || true)"
+
+    local added_n=0 removed_n=0
+    [ -n "$added" ]   && added_n=$(printf '%s\n' "$added"   | grep -c . || true)
+    [ -n "$removed" ] && removed_n=$(printf '%s\n' "$removed" | grep -c . || true)
+
+    echo
+    printf "${C_BG_BLUE}${C_WHITE}${C_BOLD}  🎨 Menuconfig Changes  ·  compared with defconfig state  ${C_RESET}\n"
+    echo
+
+    if [ "$added_n" -eq 0 ] && [ "$removed_n" -eq 0 ]; then
+        log_info "没有检测到配置改动"
+        rm -f "$b_norm" "$a_norm"
+        return 0
+    fi
+
+    printf "  ${C_GREEN}${C_BOLD}➕ Added${C_RESET}   ${C_GREEN}%d${C_RESET}\n" "$added_n"
+    printf "  ${C_RED}${C_BOLD}➖ Removed${C_RESET} ${C_RED}%d${C_RESET}\n" "$removed_n"
+    echo
+
+    # 准备双栏数据文件
+    local lf rf
+    lf="$(mktemp)"; rf="$(mktemp)"
+    printf '%s\n' "$added"   | head -n "$diff_lines" > "$lf"
+    printf '%s\n' "$removed" | head -n "$diff_lines" > "$rf"
+
+    dual_print "➕ 新增 (Added)" "$lf" "➖ 移除 (Removed)" "$rf"
+
+    if [ "$added_n" -gt "$diff_lines" ]; then
+        log_dim "... 还有 $((added_n - diff_lines)) 条 Added 未显示"
+    fi
+    if [ "$removed_n" -gt "$diff_lines" ]; then
+        log_dim "... 还有 $((removed_n - diff_lines)) 条 Removed 未显示"
+    fi
+
+    rm -f "$b_norm" "$a_norm" "$lf" "$rf"
+    echo
+}
+
+check_key_configs() {
+    echo
+    printf "${C_PINK}${C_BOLD}  🔍 Key Configs${C_RESET}\n"
+    for key in CONFIG_KSU CONFIG_DOCKER CONFIG_SYSVIPC CONFIG_IPC_NS CONFIG_ANDROID_PARANOID_NETWORK; do
+        if grep -qE "^${key}=y" out/.config 2>/dev/null; then
+            printf "  ${C_GREEN}✅${C_RESET}  ${C_WHITE}%-40s${C_RESET} ${C_GREEN}=y${C_RESET}\n" "$key"
+        elif grep -qE "^# ${key} is not set" out/.config 2>/dev/null; then
+            printf "  ${C_YELLOW}➖${C_RESET}  ${C_WHITE}%-40s${C_RESET} ${C_DIM}not set${C_RESET}\n" "$key"
+        else
+            printf "  ${C_RED}❓${C_RESET}  ${C_WHITE}%-40s${C_RESET} ${C_DIM}missing${C_RESET}\n" "$key"
+        fi
+    done
+    echo
+}
+
+# -----------------------------------------------------------------------------
+#  ⚙️  Config
 # -----------------------------------------------------------------------------
 CURRENT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$CURRENT_DIR"
@@ -619,21 +584,20 @@ ZIPNAME="ReSukiSU-AdrenalinKernel-${DATE}.zip"
 
 cleanup() {
     roll_stop 2>/dev/null || true
-    if [ -n "$SPINNER_PID" ]; then
-        kill "$SPINNER_PID" 2>/dev/null || true
-    fi
-    [ -n "${CFG_BEFORE:-}" ] && [ -f "${CFG_BEFORE:-}" ] && rm -f "$CFG_BEFORE"
-    [ -n "${CFG_AFTER:-}" ]  && [ -f "${CFG_AFTER:-}"  ] && rm -f "$CFG_AFTER"
+    [ -n "$SPINNER_PID" ] && kill "$SPINNER_PID" 2>/dev/null || true
+    for f in "${CFG_BEFORE:-}" "${CFG_AFTER:-}"; do
+        [ -n "$f" ] && [ -f "$f" ] && rm -f "$f"
+    done
 }
 trap cleanup EXIT
 
 # -----------------------------------------------------------------------------
-#  Main
+#  🎬  Main
 # -----------------------------------------------------------------------------
 banner
 
 # =============================================================================
-log_section "1 / 6  ·  清理旧构建产物"
+log_section "1 / 6" "🧹" "清理旧构建产物"
 # =============================================================================
 spin_start "Removing stale artifacts..."
 
@@ -648,14 +612,12 @@ rm -rf out/include/generated out/include/config
 rm -rf out/arch/arm64/kernel/vdso
 rm -f out/include/generated/vdso-offsets.h
 
-if [ "$CLEAN_BUILD" = true ]; then
-    rm -rf out
-fi
+[ "$CLEAN_BUILD" = true ] && rm -rf out
 
 spin_stop ok "Cleanup complete"
 
 # =============================================================================
-log_section "2 / 6  ·  工具链准备"
+log_section "2 / 6" "🔧" "工具链准备"
 # =============================================================================
 TC_DIR="${TC_DIR:-$HOME/toolchains/neutron-clang}"
 
@@ -670,7 +632,7 @@ else
 fi
 
 if [ -z "${CLANG:-}" ]; then
-    spin_stop fail "clang not found. Set TC_DIR or install clang."
+    spin_stop fail "clang not found"
     exit 1
 fi
 
@@ -679,7 +641,7 @@ export LD="${LD:-ld.lld}"
 
 if [ -z "$NO_CCACHE" ] && command -v ccache >/dev/null 2>&1; then
     CC="ccache $CC"
-    CCACHE_STATE="enabled"
+    CCACHE_STATE="enabled ⚡"
 else
     if [ -z "$NO_CCACHE" ]; then
         CCACHE_STATE="not installed"
@@ -690,7 +652,7 @@ fi
 spin_stop ok "Toolchain: $TOOLCHAIN_SRC · ccache: $CCACHE_STATE"
 
 # =============================================================================
-log_section "3 / 6  ·  ReSukiSU 源码准备"
+log_section "3 / 6" "📦" "ReSukiSU 源码准备"
 # =============================================================================
 if [ ! -d "$CURRENT_DIR/ReSukiSU/kernel" ]; then
     spin_start "Cloning ReSukiSU..."
@@ -726,7 +688,7 @@ else
 fi
 
 if [ -n "$GH_PROXY" ]; then
-    spin_start "Rewriting GitHub URLs in ReSukiSU scripts..."
+    spin_start "Rewriting GitHub URLs..."
     rewritten=$(rewrite_gh_links_in "$CURRENT_DIR/ReSukiSU")
     spin_stop ok "Rewrote $rewritten script(s)"
 fi
@@ -746,9 +708,9 @@ grep -q 'drivers/kernelsu/Kconfig' drivers/Kconfig || \
 log_ok "ReSukiSU integrated into kernel tree"
 
 # =============================================================================
-log_section "4 / 6  ·  内核配置"
+log_section "4 / 6" "⚙️" "内核配置"
 # =============================================================================
-echo "  Using compiler:"
+echo "  ${C_DIM}Using compiler:${C_RESET}"
 "$CLANG" --version | head -n 2 | sed 's/^/    /'
 echo
 
@@ -774,20 +736,6 @@ else
     exit 1
 fi
 
-# ---- 在追加配置前，保存 defconfig 状态快照 ----
-if [ "${#CONFIG_FILES[@]}" -gt 0 ] || [ "${#CONFIG_OPTS[@]}" -gt 0 ]; then
-    CFG_BEFORE="$(mktemp /tmp/kcfg-before-XXXXXX)"
-    cp out/.config "$CFG_BEFORE"
-fi
-
-# ---- 应用额外的配置片段 / 选项 ----
-if [ "${#CONFIG_FILES[@]}" -gt 0 ] || [ "${#CONFIG_OPTS[@]}" -gt 0 ]; then
-    spin_start "Applying extra kernel config ..."
-    apply_config_files CONFIG_FILES
-    apply_config_opts  CONFIG_OPTS
-    spin_stop ok "Extra config applied"
-fi
-
 spin_start "Running olddefconfig ..."
 if make "${MAKE_COMMON[@]}" olddefconfig >/dev/null 2>&1; then
     spin_stop ok "olddefconfig done"
@@ -796,45 +744,55 @@ else
     exit 1
 fi
 
-# ---- menuconfig（可选） ----
-if [ -n "$MENUCONFIG" ]; then
+# ---- menuconfig 快照 & 交互 ----
+if [ -z "$SKIP_MENUCONFIG" ]; then
+    CFG_BEFORE="$(mktemp /tmp/kcfg-before-XXXXXX)"
+    cp out/.config "$CFG_BEFORE"
+
     echo
-    log_info "Launching menuconfig (save and exit to continue)..."
+    printf "${C_BG_TEAL}${C_WHITE}${C_BOLD}  🎛️  menuconfig  ·  Interactive Kernel Configuration  ${C_RESET}\n"
     echo
+    printf "  ${C_SKY}💡 操作指南${C_RESET}\n"
+    printf "     ${C_WHITE}↑ ↓${C_RESET}       ${C_DIM}移动光标${C_RESET}\n"
+    printf "     ${C_WHITE}空格${C_RESET}      ${C_DIM}切换 y / n / m${C_RESET}\n"
+    printf "     ${C_WHITE}/${C_RESET}         ${C_DIM}搜索配置（例如 DOCKER、SYSVIPC）${C_RESET}\n"
+    printf "     ${C_WHITE}Enter${C_RESET}     ${C_DIM}进入子菜单${C_RESET}\n"
+    printf "     ${C_WHITE}ESC ESC${C_RESET}   ${C_DIM}返回上级${C_RESET}\n"
+    printf "     ${C_WHITE}Save${C_RESET}      ${C_DIM}保存（务必保存！）${C_RESET}\n"
+    printf "     ${C_WHITE}Exit${C_RESET}      ${C_DIM}退出${C_RESET}\n"
+    echo
+    printf "  ${C_YELLOW}⚠️  离开前记得 <Save>，否则改动会丢失${C_RESET}\n"
+    echo
+
+    set +e
     make "${MAKE_COMMON[@]}" menuconfig
+    menu_rc=$?
+    set -e
+
+    [ "$menu_rc" -ne 0 ] && log_warn "menuconfig 退出码 $menu_rc (usually normal)"
+
+    if [ ! -f out/.config ]; then
+        spin_stop fail "menuconfig 后 out/.config 消失了"
+        exit 1
+    fi
+
+    CFG_AFTER="$(mktemp /tmp/kcfg-after-XXXXXX)"
+    cp out/.config "$CFG_AFTER"
+
+    show_menuconfig_diff
+
+    rm -f "$CFG_BEFORE" "$CFG_AFTER"
+    CFG_BEFORE=""; CFG_AFTER=""
+else
+    log_info "Skipping menuconfig (--no-menuconfig)"
 fi
 
-# ---- 保存最终配置（可选） ----
 if [ -n "$SAVE_CONFIG" ]; then
     cp out/.config "$CURRENT_DIR/kernel.config"
     log_ok "Saved final config to $CURRENT_DIR/kernel.config"
 fi
 
-# ---- 显示配置差异 ----
-if [ -n "${CFG_BEFORE:-}" ] && [ -f "$CFG_BEFORE" ]; then
-    CFG_AFTER="$(mktemp /tmp/kcfg-after-XXXXXX)"
-    cp out/.config "$CFG_AFTER"
-    show_config_changes "$CFG_BEFORE" "$CFG_AFTER"
-    rm -f "$CFG_BEFORE" "$CFG_AFTER"
-    CFG_BEFORE=""
-    CFG_AFTER=""
-fi
-
-show_config_diff_stat
-
-# ---- 检查关键项是否生效 ----
-echo
-log_info "Checking key configs..."
-for key in CONFIG_KSU CONFIG_DOCKER CONFIG_SYSVIPC CONFIG_IPC_NS CONFIG_ANDROID_PARANOID_NETWORK; do
-    if grep -qE "^${key}=y" out/.config 2>/dev/null; then
-        log_ok  "${key}=y"
-    elif grep -qE "^# ${key} is not set" out/.config 2>/dev/null; then
-        log_warn "${key} is not set"
-    else
-        log_warn "${key} not present"
-    fi
-done
-echo
+check_key_configs
 
 if [ -n "$CHECK_ONLY" ]; then
     spin_start "Running prepare sanity check..."
@@ -848,7 +806,7 @@ if [ -n "$CHECK_ONLY" ]; then
 fi
 
 # =============================================================================
-log_section "5 / 6  ·  VDSO 符号生成"
+log_section "5 / 6" "📐" "VDSO 符号生成"
 # =============================================================================
 spin_start "Building vdso-offsets.h ..."
 if make "${MAKE_COMMON[@]}" arch/arm64/kernel/vdso/ >/dev/null 2>&1; then
@@ -864,7 +822,7 @@ else
 fi
 
 # =============================================================================
-log_section "6 / 6  ·  编译内核"
+log_section "6 / 6" "🔨" "编译内核"
 # =============================================================================
 echo
 log_info "Starting compilation (single-line rolling log below)..."
@@ -886,12 +844,12 @@ if make -j"$(nproc --all)" "${MAKE_COMMON[@]}" \
     echo
     hr
     log_ok "Kernel compiled successfully in ${BUILD_TIME}s"
-    log_dim "Image.gz: $CURRENT_DIR/out/arch/arm64/boot/Image.gz"
+    log_dim "📦 Image.gz: $CURRENT_DIR/out/arch/arm64/boot/Image.gz"
     hr
 
     if [ "$ZIP_ANY_KERNEL" = true ]; then
         echo
-        spin_start "Packaging AnyKernel3 zip ..."
+        spin_start "Packaging AnyKernel3 zip..."
         rm -rf AnyKernel3
 
         AK_URL="$(gh_url 'https://github.com/weaponmasterjax/AnyKernel3')"
@@ -910,8 +868,14 @@ if make -j"$(nproc --all)" "${MAKE_COMMON[@]}" \
 
     echo
     hr
-    printf "${C_GREEN}${C_BOLD}  DONE${C_RESET}\n"
-    printf "  ${C_DIM}Total time:${C_RESET} ${C_BOLD}%d minute(s) %d second(s)${C_RESET}\n" \
+    printf "${C_GREEN}${C_BOLD}"
+    cat <<'EOF'
+     ✨ ═══════════════════════════════════════ ✨
+              🎉  B U I L D   D O N E  🎉
+     ✨ ═══════════════════════════════════════ ✨
+EOF
+    printf "${C_RESET}\n"
+    printf "  ${C_DIM}⏱  Total time:${C_RESET} ${C_BOLD}%d min %d sec${C_RESET}\n" \
         $((SECONDS / 60)) $((SECONDS % 60))
     hr
     echo
