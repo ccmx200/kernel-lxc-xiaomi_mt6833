@@ -20,6 +20,11 @@
 set -u
 
 CKVM_VERSION="1.0"
+# Feature marker: bumped whenever the download-and-install path
+# changes meaning.  install() refuses a file that lacks it, so a
+# caching mirror serving an old revision is caught instead of
+# quietly downgrading the installed ckvm.
+CKVM_BUILD="store+ports+aria2+console"
 CKVM_ROOT="${CKVM_ROOT:-/var/lib/ckvm}"
 CKVM_FWDIR="${CKVM_FWDIR:-/usr/local/share/ckvm/firmware}"
 CKVM_BINDIR="${CKVM_BINDIR:-/usr/local/bin}"
@@ -1315,6 +1320,19 @@ resolve_repo() {
     return 0
 }
 # download one file from the resolved repo, through the download engine
+# A downloaded ckvm must parse, carry the build marker, and look like the
+# script we expect.  Cheap insurance against a caching mirror or a truncated
+# transfer - both of which have bitten this installer for real.
+verify_download() {
+    local f="$1"
+    [ -s "$f" ] || return 1
+    head -1 "$f" | grep -q '^#!/bin/bash' || return 1
+    grep -q 'CKVM_BUILD=' "$f" || return 1
+    grep -q 'cmd_versions()' "$f" || return 1
+    bash -n "$f" 2>/dev/null || return 1
+    return 0
+}
+
 fetch_repo_file() {
     local rel="$1" out="$2"
     [ -n "$CKVM_REPO" ] || resolve_repo
@@ -1367,6 +1385,11 @@ cmd_install() {
         # SELinux label and mv would fail on the security.selinux attribute
         tmp=$(mktemp "${TMPDIR:-/tmp}/ckvm.XXXXXX")
         if base=$(fetch_repo_file "kvm-vm.sh" "$tmp"); then
+            if ! verify_download "$tmp"; then
+                rm -f "$tmp"
+                die "the downloaded script did not verify (mirror serving a stale copy?)
+       try another source:  $0 install -cn <your-mirror>"
+            fi
             cat "$tmp" > "$CKVM_BINDIR/ckvm"
             chmod 0755 "$CKVM_BINDIR/ckvm"
             rm -f "$tmp"
