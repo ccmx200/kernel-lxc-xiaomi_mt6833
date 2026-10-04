@@ -29,7 +29,7 @@
 # =============================================================================
 set -u
 
-CKVM_VERSION="1.3"
+CKVM_VERSION="1.4"
 # 1.3: 'ckvm selftest' boots a throwaway guest to prove the install works.
 # 1.2: the core choice is explicit and defaults to ALL cores --cores all|big.
 # 1.1: qemu starts pinned to BOOT_CPU and its threads are widened to
