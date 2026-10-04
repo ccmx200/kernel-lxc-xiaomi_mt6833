@@ -109,6 +109,57 @@ ckvm create app --rel 22.04 --mem 1024 --disk 20
 
 **只要给了名字或任何选项，就是命令模式**，不会有任何提问。
 
+参数：
+
+| 选项 | 含义 | 默认 |
+|---|---|---|
+| `--rel V` | Ubuntu 版本 | `26.04` |
+| `--cpus N` | vCPU 数量 | `8` |
+| `--mem MB` | 内存 | `2048` |
+| `--disk GB` | 磁盘容量 | `50` |
+| `--port N` | 宿主机 SSH 端口 | 从 `8023` 起自动找空位 |
+| `--net M` | 网络模式 `user` / `host` | `user` |
+| `--fwd L` | 端口映射（见下） | `22` |
+
+### 端口映射怎么写
+
+交互式流程里问你「映射端口」之前会先把用法打出来。命令行等价的是 `--fwd`。
+
+格式是**逗号分隔**的列表，每一项两种写法：
+
+```text
+<guest端口>                 宿主机同号映射
+<宿主机端口>:<guest端口>     映射到指定端口
+```
+
+| 写法 | 含义 |
+|---|---|
+| `--fwd 22` | 只暴露 ssh。guest 的 22 → 该机的 `--port` |
+| `--fwd 22,80,443` | ssh 加上 web，80/443 同号 |
+| `--fwd 22,8080:80` | guest 的 80 → 宿主机 8080 |
+| `--fwd 22,2222:22` | 额外再把 guest 22 暴露到 2222 |
+| `--fwd 22,3306:3306,6379:6379` | mysql 和 redis |
+
+**两条规则要记住**：
+
+1. **guest 的 22 是特例** —— 它映射到这台虚拟机自己的 `--port`（从 8023 起
+   自动分配），所以多开不会互相抢，也不会占用容器自己的 22。
+2. **宿主机端口不能重复**。启动前会检查并提示是谁占着：
+
+   ```text
+   ! host port 8080 is already in use by ckvm guest 'ubuntu26'
+   !   pick another one, e.g. --fwd 22,18080:80
+   ```
+
+想随时复习：
+
+```bash
+ckvm ports          # 或者 ckvm help ports
+ckvm net <名字>     # 看某台实际生效的映射
+```
+
+> 用 `--net host` 时不需要映射 —— guest 会拿到自己的 IP 并自己跑 sshd。
+
 ### 看有哪些版本
 
 ```bash
@@ -136,37 +187,6 @@ ckvm versions
 ```bash
 ckvm start srv24
 ssh u0@127.0.0.1 -p 8025        # 密码 1
-```
-
----
-
-## 创建参数
-
-```bash
-ckvm create <名字> [选项]
-```
-
-| 选项 | 含义 | 默认 |
-|---|---|---|
-| `--cpus N` | vCPU 数量 | `8` |
-| `--mem MB` | 内存 | `2048` |
-| `--disk GB` | 磁盘容量 | `50` |
-| `--rel V` | Ubuntu 版本 | `26.04` |
-| `--port N` | 宿主机 SSH 端口 | 从 `8023` 起自动找空位 |
-| `--net M` | 网络模式 `user` / `host` | `user` |
-| `--fwd L` | 要映射的 guest 端口 | `22` |
-
-例子：
-
-```bash
-# 小机器
-ckvm create small --cpus 2 --mem 1024 --disk 20 --rel 24.04
-
-# 多开两个端口映射
-ckvm create web --fwd 22,80,443
-
-# guest 80 映射到宿主机 8080
-ckvm create app --fwd 22,8080:80
 ```
 
 ---
@@ -202,6 +222,7 @@ ckvm uninstall                   # 卸载
 ckvm create                      # 交互式（应用商店）
 ckvm create <名字> [选项]         # 命令式
 ckvm versions                    # 列出可选版本
+ckvm ports                       # 端口映射怎么写
 ckvm image <名字>                # 重新下载镜像
 ckvm start <名字> [-f]           # 启动（-f 前台）
 ckvm stop <名字>

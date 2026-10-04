@@ -355,6 +355,32 @@ check_host_port() {
     return 0
 }
 
+# Describe whatever is listening on a host port, to make a clash actionable.
+port_owner() {
+    local p="$1" pid comm name
+    # our own guest?
+    local d
+    for d in "$CKVM_ROOT"/*/; do
+        [ -f "$d/vm.conf" ] || continue
+        ( . "$d/vm.conf"
+          case "${FORWARDS:-}" in
+              *"$p"*|*":$p"*) printf '%s' "ckvm guest '$(basename "$d")'"; exit 0 ;;
+          esac
+          [ "${PORT:-}" = "$p" ] && { printf '%s' "ckvm guest '$(basename "$d")'"; exit 0; }
+        )
+    done
+    # someone else?
+    pid=$(ss -tlnp 2>/dev/null | awk -v P=":$p " '$4 ~ P {print $NF}' \
+          | grep -oE 'pid=[0-9]+' | head -1 | cut -d= -f2)
+    if [ -n "$pid" ]; then
+        comm=$(cat "/proc/$pid/comm" 2>/dev/null)
+        name=$(tr -d '\0' < "/proc/$pid/cmdline" 2>/dev/null | cut -d '' -f1)
+        printf '%s' "pid $pid (${comm:-${name:-unknown}})"
+        return 0
+    fi
+    printf '%s' ""
+}
+
 tap_name() { echo "ckvm-$1" | cut -c1-15; }
 
 tap_up() {
@@ -510,6 +536,26 @@ EOF
     done
 }
 
+# Explain the forward syntax once, before asking for it.
+explain_forwards() {
+    printf '\n' >&2
+    printf '  %s端口映射怎么写%s\n' "$C_B" "$C_RST" >&2
+    printf '  %s────────────────%s\n' "$C_DIM" "$C_RST" >&2
+    printf '    用逗号分隔。写一个数字表示「guest 和宿主机同号」，\n' >&2
+    printf '    写 %shost:guest%s 表示「guest 的某端口映射到宿主机的另一个端口」。\n' "$C_DIM" "$C_RST" >&2
+    printf '\n' >&2
+    printf '    %s22%s            guest 的 22  →  该虚拟机自己的 %sPORT%s（%s）\n' \
+           "$C_G" "$C_RST" "$C_C" "$C_RST" "$DEF_PORT_BASE 起自动分配" >&2
+    printf '    %s22,80,443%s    再加 80 和 443，同号映射\n' "$C_G" "$C_RST" >&2
+    printf '    %s22,8080:80%s   guest 的 80 映射到宿主机的 8080\n' "$C_G" "$C_RST" >&2
+    printf '    %s22,2222:22%s   再额外把 22 也暴露到 2222（可选）\n' "$C_G" "$C_RST" >&2
+    printf '\n' >&2
+    printf '    %s注意%s 宿主机端口不能重复占用；容器自己的 sshd 在 22，\n' \
+           "$C_Y" "$C_RST" >&2
+    printf '    所以 guest 的 22 默认不会占用宿主机的 22。\n' >&2
+    printf '\n' >&2
+}
+
 # --------------------------------------------------------------------------
 # create
 # --------------------------------------------------------------------------
@@ -654,7 +700,8 @@ cmd_create() {
         disk=$(ask_with_default "磁盘 (GiB):" "$DEF_DISK_GB")
         net_mode=$(ask_with_default "网络模式 user/host:" "$DEF_NET_MODE")
         if [ "$net_mode" = "user" ]; then
-            forwards=$(ask_with_default "映射端口 (逗号分隔):" "$DEF_FORWARDS")
+            explain_forwards
+            forwards=$(ask_with_default "映射端口:" "$DEF_FORWARDS")
             fwd_set=1
         fi
         printf '\n'
@@ -739,6 +786,38 @@ EOF
     say "启动： ckvm start $name"
 }
 
+cmd_help_ports() {
+    cat <<'EOF'
+端口映射（--fwd / 交互式里的「映射端口」）
+
+  格式：逗号分隔的列表，每一项是
+
+      <guest端口>            宿主机同号映射
+      <宿主机端口>:<guest端口>   映射到指定端口
+
+  规则
+
+    · guest 的 22 是个特例：它映射到这台虚拟机自己的 --port
+      （默认从 8023 起自动分配），所以多开时不会互相抢端口，
+      也不会占用容器自己的 22。
+    · 其他端口默认同号映射。
+    · 启动前会检查宿主机端口是否已被占用并给出提示。
+
+  例子
+
+    --fwd 22              只暴露 ssh（guest 22 -> 该机的 PORT）
+    --fwd 22,80,443       ssh 加上 80 和 443（同号）
+    --fwd 22,8080:80      guest 的 80 -> 宿主机 8080
+    --fwd 22,2222:22      额外再把 guest 22 暴露到 2222
+    --fwd 22,3306:3306,6379:6379   mysql 和 redis
+
+  如果改用 --net host，guest 会拿到自己的 IP 并自己跑 sshd，
+  这时不需要任何端口映射。
+
+  相关：ckvm net <名字>   查看某台虚拟机实际生效的映射
+EOF
+}
+
 cmd_versions() {
     if [ "$IS_TTY" = 1 ]; then
         pick_release >/dev/null
@@ -789,8 +868,10 @@ cmd_start() {
             for item in $hfwd; do
                 h=$(echo "$item" | sed 's/.*0\.0\.0\.0:\([0-9]*\)-.*/\1/')
                 if ! check_host_port "$h"; then
-                    warn "host port $h is already in use"
-                    warn "  (the container's own sshd is usually on 22; pick another with --port/--fwd)"
+                    local who
+                    who=$(port_owner "$h")
+                    warn "host port $h is already in use${who:+ by $who}"
+                    warn "  pick another one, e.g. --fwd 22,18080:80"
                 fi
             done
             net_args=(-netdev "user,id=n0${hfwd:+,$hfwd}"
@@ -1366,6 +1447,8 @@ ckvm $CKVM_VERSION - KVM guest manager (MT6833 / everpal)
                                    answer a few prompts (default on a tty)
   ckvm create <name> [options]     create a guest non-interactively
   ckvm versions                    list the releases the store offers
+  ckvm ports                       how port mapping works
+  ckvm help ports                  same thing
         --cpus N    vCPU count          (default $DEF_CPUS)
         --mem  MB   memory              (default $DEF_MEM)
         --disk GB   disk size           (default $DEF_DISK_GB)
@@ -1400,7 +1483,13 @@ EOF
 # Every subcommand that needs a guest name should fail clearly instead of
 # treating a flag as a guest.  -h/--help anywhere prints the help.
 case "${1:-help}" in
-    -h|--help|help) cmd_help; exit 0 ;;
+    -h|--help) cmd_help; exit 0 ;;
+    help)
+        case "${2:-}" in
+            ports|fwd|forward|network) cmd_help_ports; exit 0 ;;
+            *) cmd_help; exit 0 ;;
+        esac
+        ;;
 esac
 if [ $# -ge 2 ]; then
     case "$2" in
@@ -1426,6 +1515,7 @@ case "${1:-help}" in
     create)    shift; cmd_create "$@" ;;
     image)     shift; cmd_image "$@" ;;
     versions|list-releases|releases) cmd_versions ;;
+    ports|fwd)  cmd_help_ports ;;
     start)     shift; cmd_start "$@" ;;
     stop)      shift; cmd_stop "$@" ;;
     restart)   shift; cmd_restart "$@" ;;
