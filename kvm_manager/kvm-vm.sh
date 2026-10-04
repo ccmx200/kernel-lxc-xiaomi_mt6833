@@ -705,7 +705,10 @@ make_seed() {
     permissions: "0755"
     content: |
       #!/bin/sh
-      # Let root log in with a password (Ubuntu cloud images forbid it).
+      # Root password login on Ubuntu cloud images.
+      #
+      # The image's drop-in sets PasswordAuthentication no, and sshd Includes
+      # it after cloud-init's file, so it takes precedence.
       sed -i -e "/^PasswordAuthentication/d" \
              -e "/^KbdInteractiveAuthentication/d" \
              /etc/ssh/sshd_config.d/60-cloudimg-settings.conf 2>/dev/null || true
@@ -713,7 +716,39 @@ make_seed() {
       printf "%s\n" "PermitRootLogin yes" > "$d"
       printf "%s\n" "PasswordAuthentication yes" >> "$d"
       printf "%s\n" "KbdInteractiveAuthentication yes" >> "$d"
-      systemctl restart ssh 2>/dev/null || systemctl restart sshd 2>/dev/null || true
+
+      # Host keys can exist but be EMPTY.  On a real 22.04 guest all three
+      # were 0 bytes, created before cloud-init ran, so cloud-init skipped
+      # generating them and sshd exited with
+      #     sshd: no hostkeys available -- exiting.
+      # ssh-keygen -A will not overwrite an existing file, so remove what is
+      # missing or empty first.
+      need=0
+      for t in rsa ecdsa ed25519; do
+          k=/etc/ssh/ssh_host_${t}_key
+          if [ ! -s "$k" ]; then
+              rm -f "$k"
+              rm -f "$k.pub"
+              need=1
+          fi
+      done
+      [ "$need" = 1 ] && ssh-keygen -A >/dev/null 2>&1
+
+      rm -rf /run/sshd
+      mkdir -p /run/sshd
+      chmod 0755 /run/sshd
+
+      i=0
+      while [ "$i" -lt 5 ]; do
+          systemctl restart ssh 2>/dev/null || systemctl restart sshd 2>/dev/null
+          if systemctl is-active ssh >/dev/null 2>&1 || \
+             systemctl is-active sshd >/dev/null 2>&1; then
+              exit 0
+          fi
+          i=$((i + 1))
+          sleep 2
+      done
+      exit 0
 runcmd:
   - [ /usr/local/sbin/ckvm-ssh-fix ]'
 
