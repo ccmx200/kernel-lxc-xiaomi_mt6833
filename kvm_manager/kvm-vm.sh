@@ -120,13 +120,58 @@ ensure_aria2() {
 }
 
 # download_url <url> <outfile> <label>
+#
+# Progress needs the real total size.  Taking it from the file that aria2c is
+# writing does NOT work: aria2 writes segments sparsely, so the file size
+# jumps far ahead of the bytes actually fetched and "downloaded / size"
+# produces nonsense like 12514%.  So ask the server for Content-Length once,
+# then clamp.
 download_url() {
     local url="$1" out="$2" label="${3:-downloading}"
     download_pick_backend >/dev/null
 
+    local total=""
+    total=$(curl -sSLkI --max-time 25 "$url" 2>/dev/null | \
+            awk 'BEGIN{IGNORECASE=1} /^content-length:/{gsub(/\r/,"");print $2}' | tail -1)
+    case "$total" in ''|*[!0-9]*) total="" ;; esac
+
+    # already complete?
+    if [ -n "$total" ] && [ -f "$out" ] && [ "$(stat -c%s "$out" 2>/dev/null)" = "$total" ]; then
+        say "$label: already downloaded"
+        return 0
+    fi
+
+    _progress() {
+        # $1 pid, $2 file, $3 label, $4 total (may be empty)
+        local pid="$1" file="$2" lbl="$3" tot="$4"
+        local i=0 cur pct
+        while kill -0 "$pid" 2>/dev/null; do
+            cur=$(stat -c%s "$file" 2>/dev/null || echo 0)
+            if [ -n "$tot" ]; then
+                [ "$cur" -gt "$tot" ] && cur="$tot"
+                pct=$(( cur * 100 / tot ))
+                ui_tick $((i++)) "$pct" "$lbl" \
+                        "  $(numfmt --to=iec "$cur" 2>/dev/null || echo "$cur")/$(numfmt --to=iec "$tot" 2>/dev/null || echo "$tot")"
+            else
+                ui_tick $((i++)) "" "$lbl" \
+                        "  $(numfmt --to=iec "$cur" 2>/dev/null || echo "$cur")"
+            fi
+            sleep 0.4
+        done
+    }
+
     if [ "$DL_BACKEND" = "aria2c" ]; then
-        # -x16 -s16 is aria2's recommended shape for a single large file.
-        # --console-log-level=warn keeps aria2 quiet so our own bar shows.
+        # aria2 writes straight into $out unless there is a control file to
+        # resume from, in which case it may already span the whole length.
+        local watch="$out"
+        if [ -e "$out.aria2" ] || [ -e "$out" ]; then
+            # fall back to counting the aria2 control file's progress is not
+            # exposed, so use the smaller of file size vs total (already
+            # clamped) - acceptable because a partial file here is only a
+            # truncated previous attempt.
+            watch="$out"
+        fi
+        rm -f "$out.aria2.keep"
         if [ -t 1 ]; then
             aria2c -x16 -s16 -k1M -c \
                    --console-log-level=warn --summary-interval=0 \
@@ -134,21 +179,8 @@ download_url() {
                    --file-allocation=none \
                    -d "$(dirname "$out")" -o "$(basename "$out")" "$url" \
                    >/tmp/ckvm-aria2.log 2>&1 &
-            local pid=$! i=0
-            local total
-            total=$(stat -c%s "$out" 2>/dev/null || echo 0)
-            while kill -0 "$pid" 2>/dev/null; do
-                local cur pct=""
-                cur=$(stat -c%s "$out" 2>/dev/null || echo 0)
-                if [ "$total" -le 0 ] && [ -f "$out.aria2" ]; then
-                    total=$(du -b "$out" 2>/dev/null | cut -f1)
-                fi
-                pct=$(awk -v c="$cur" -v t="$total" \
-                      'BEGIN{ if (t>0) printf "%d", c*100/t; else print "" }')
-                ui_tick $((i++)) "$pct" "$label" \
-                        "  $(numfmt --to=iec "$cur" 2>/dev/null || echo "$cur")"
-                sleep 0.4
-            done
+            local pid=$!
+            _progress "$pid" "$watch" "$label" "$total"
             wait "$pid"; local rc=$?
             ui_stop
             if [ $rc -ne 0 ] || [ ! -s "$out" ]; then
@@ -168,28 +200,19 @@ download_url() {
         return 1
     fi
 
-    # curl fallback, with the same animated bar
+    # curl fallback, measured on a .part file so it starts from zero
     if [ -t 1 ]; then
+        rm -f "$out.part"
         curl -fSLk --retry 3 -o "$out.part" "$url" 2>/dev/null &
-        local pid=$! i=0
-        local total
-        total=$(curl -sSLkI "$url" 2>/dev/null | \
-                awk 'BEGIN{IGNORECASE=1}/^content-length:/{gsub(/\r/,"");print $2}' | tail -1)
-        while kill -0 "$pid" 2>/dev/null; do
-            local cur pct=""
-            cur=$(stat -c%s "$out.part" 2>/dev/null || echo 0)
-            [ -n "$total" ] && pct=$(awk -v c="$cur" -v t="$total" \
-                'BEGIN{ if (t>0) printf "%d", c*100/t; else print "" }')
-            ui_tick $((i++)) "$pct" "$label" \
-                    "  $(numfmt --to=iec "$cur" 2>/dev/null || echo "$cur")"
-            sleep 0.4
-        done
+        local pid=$!
+        _progress "$pid" "$out.part" "$label" "$total"
         wait "$pid"; local rc=$?
         ui_stop
         [ $rc -eq 0 ] && [ -s "$out.part" ] && { mv -f "$out.part" "$out"; return 0; }
         rm -f "$out.part"
         return 1
     fi
+    rm -f "$out.part"
     curl -fSLk --retry 3 -o "$out.part" "$url" 2>/dev/null && \
         mv -f "$out.part" "$out" && return 0
     rm -f "$out.part"
