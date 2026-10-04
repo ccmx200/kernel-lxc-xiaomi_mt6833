@@ -1,203 +1,195 @@
-# ReSukiSU 内核修改说明
+# Everpal / MT6833 Kernel
 
-本源码树基于 [weaponmasterjax/kernel_xiaomi_mt6833-new](https://github.com/weaponmasterjax/kernel_xiaomi_mt6833-new) `-b pro` 分支，并将原有的 `KernelSU-Next` 替换为 **ReSukiSU**，同时集成 **LXC/Docker 内核支持**。
+ReSukiSU + KVM + BBRv2 + zstd/lz4 + Binder 优化内核。
 
----
+## 基本信息
 
-## 📁 目录与集成方式
+- 设备：xiaomi MT6833 / everpal
+- 内核版本：Linux 4.14.356
+- 当前版本号：
+  ```text
+  4.14.356-by-ccmx-Everpal-KVM-CuiCanMX-v1.0-g9eae9631915b
+  ```
+- 默认 defconfig：
+  ```text
+  arch/arm64/configs/everpal_defconfig
+  ```
+- 编译脚本：
+  ```text
+  build.sh
+  ```
 
-| 项目 | 路径 |
-|------|------|
-| ReSukiSU 源码 | `ReSukiSU/` |
-| 内核构建入口 | `drivers/kernelsu -> ../ReSukiSU/kernel`（软链接） |
-| 设备 defconfig | `arch/arm64/configs/everpal_defconfig` |
-| LXC/Docker 支持 | `utils/`（Kconfig + 补丁） |
-| 构建脚本 | `build.sh` |
-| 输出目录 | `out/` |
+## 已集成功能
 
----
+### ReSukiSU
 
-## ⚙️ 内核配置说明
+- 源码内置：
+  ```text
+  ReSukiSU/
+  ```
+- 内核入口：
+  ```text
+  drivers/kernelsu -> ../ReSukiSU/kernel
+  ```
+- Hook 模式：
+  ```text
+  CONFIG_KSU=y
+  CONFIG_KSU_MANUAL_HOOK=y
+  # CONFIG_KSU_TRACEPOINT_HOOK is not set
+  # CONFIG_KSU_SUSFS is not set
+  ```
 
-### ReSukiSU Hook 模式
+### KVM / EL2 / vGIC / ITS
 
-```text
-CONFIG_KSU=y
-# CONFIG_KSU_TRACEPOINT_HOOK is not set
-CONFIG_KSU_MANUAL_HOOK=y
-# CONFIG_KSU_SUSFS is not set
-CONFIG_KSU_MANUAL_HOOK_AUTO_SETUID_HOOK=y
-CONFIG_KSU_MANUAL_HOOK_AUTO_INITRC_HOOK=y
-CONFIG_KSU_MANUAL_HOOK_AUTO_INPUT_HOOK=y
-```
-
-**为什么使用 manual hook？**
-
-当前内核为 4.14（non-GKI），ReSukiSU 的默认 Tracepoint Hook 仅支持 GKI 2.0（5.10+）内核，因此必须切到 **manual hook** 模式。该模式兼容 Linux 3.4 ~ 6.18，正好覆盖本内核。
-
-**为什么禁用 SUSFS？**
-
-原来内核中来自 KernelSU-Next 的旧 SUSFS 补丁与 ReSukiSU 当前的 SUSFS 检查不兼容；SUSFS 官方也已停止 Non-GKI 支持。为保证 4.14 MTK 内核可编译、可开机，本构建先禁用 `CONFIG_KSU_SUSFS`。ReSukiSU 的 Root 功能不受影响。
-
-### LXC / Docker 支持
-
-```text
-CONFIG_DOCKER=y
-# CONFIG_ANDROID_PARANOID_NETWORK is not set
-```
-
-- `CONFIG_DOCKER` 由 `utils/Kconfig` 提供，会自动 `select` 出 namespaces、cgroups、veth、bridge、overlayfs、nf_nat、iptables 等依赖项
-- `ANDROID_PARANOID_NETWORK` 必须关闭，否则容器内 `ping`、`apt` 会 `Permission denied`
-
-如需 SysV IPC（PostgreSQL 等程序依赖），额外启用：
+已开启：
 
 ```text
-CONFIG_SYSVIPC=y
-CONFIG_SYSVIPC_SYSCTL=y
-CONFIG_POSIX_MQUEUE=y
-CONFIG_IPC_NS=y
+CONFIG_KVM=y
+CONFIG_VIRTUALIZATION=y
+CONFIG_ARM64_VHE=y
 ```
 
----
+已关闭 LTO：
 
-## 🔨 构建
-
-### 前置依赖
-
-```bash
-## archlinux
-sudo pacman -S --needed base-devel clang llvm lld ccache \
-    bc libelf openssl flex bison pahole xmlto kmod inetutils \
-    aarch64-linux-gnu-gcc openbsd-netcat git zip
+```text
+# CONFIG_LTO_CLANG is not set
+CONFIG_LTO_NONE=y
 ```
 
-### 基本用法
+并恢复标准：
 
-```bash
-cd /root/kernel-lxc_xiaomi_mtk810_mt6833-resukisu
-./build.sh
+```c
+void *val = &sym;
 ```
 
-脚本会依次执行：
+已移植 vGIC/ITS 相关修复：
 
-1. **清理旧构建产物**（含 `out/` 下的残留）
-2. **检测工具链**（优先 neutron-clang，否则系统 clang），自动启用 ccache
-3. **准备 ReSukiSU 源码**：不存在则克隆，已存在则自动检查更新
-4. **配置内核**：加载 `everpal_defconfig` 并执行 `olddefconfig`
-5. **生成 vdso-offsets.h**：解决 4.14 并行编译依赖问题
-6. **编译 `Image.gz`**：单行滚动日志显示最新编译命令
-7. **打包 AnyKernel3**：生成可刷入 zip
+- ITS outer cacheability 默认改为 `SameAsInner`
+- 移除过严的 stage-2 read permission fault 检查
+- 增加 `KVM_DEV_ARM_ITS_CTRL_RESET`
+- 修复保存 ITE 时 NULL collection 导致内核崩溃
+- VCPU ioctl 使用 `task_pid(current)`
 
-### 命令行选项
+真机确认：
 
-```bash
-# 默认：走 https://git.yylx.win/ 加速，自动更新 ReSukiSU，启用 ccache
-./build.sh
-
-# 只做环境/配置检查，不完整编译
-./build.sh --check --no-ccache --no-update
-
-# 自定义 GitHub 加速代理
-./build.sh --proxy https://your-proxy.example/
-
-# 使用 -cn 也可启用/覆盖加速
-./build.sh -cn https://your-proxy.example/
-
-# 跳过 ReSukiSU 自动更新
-./build.sh -nu
-
-# 关闭 ccache
-./build.sh --no-ccache
-
-# 完全清理后编译 + 加速
-CLEAN_BUILD=true ./build.sh -cn
-
-# 调整错误上下文行数（默认前后各 200 行）
-ERROR_CTX=300 ./build.sh -cn
-
-# 自定义工具链目录
-TC_DIR=/opt/clang ./build.sh
+```text
+CPU: All CPU(s) started at EL2
+kvm [1]: VHE mode initialized successfully
+kvm [1]: GIC system register CPU interface enabled
 ```
 
-### 输出文件
+注意：QEMU 11 在旧 4.14 KVM 上仍可能报 ID 寄存器设置错误：
 
-| 文件 | 说明 |
-|------|------|
-| `out/arch/arm64/boot/Image.gz` | 编译出的内核镜像 |
-| `ReSukiSU-AdrenalinKernel-YYYYMMDD-HHMM.zip` | AnyKernel3 打包后的可刷入 zip |
+```text
+Failed to put registers after init: Invalid argument
+```
 
----
+这不是内核 KVM 没起来，而是 QEMU 版本/KVM register ABI 兼容问题。需要旧版 QEMU 或已适配的 QEMU。
 
-## 🧪 快速检查
+### BBRv2
+
+已移植并设为默认：
+
+```text
+CONFIG_TCP_CONG_BBR=y
+CONFIG_TCP_CONG_BBR2=y
+CONFIG_DEFAULT_BBR2=y
+CONFIG_DEFAULT_TCP_CONG="bbr2"
+CONFIG_NET_SCH_DEFAULT=y
+CONFIG_NET_SCH_FQ=y
+CONFIG_DEFAULT_FQ=y
+```
+
+### zstd / lz4 / zram
+
+已升级：
+
+```text
+zstd 1.5.7
+lz4  1.10.0
+```
+
+配置：
+
+```text
+CONFIG_CRYPTO_ZSTD=y
+CONFIG_ZSTD_COMMON=y
+CONFIG_ZSTD_COMPRESS=y
+CONFIG_ZSTD_DECOMPRESS=y
+CONFIG_CRYPTO_LZ4=y
+CONFIG_CRYPTO_LZ4HC=y
+CONFIG_LZ4_COMPRESS=y
+CONFIG_LZ4HC_COMPRESS=y
+CONFIG_LZ4_DECOMPRESS=y
+```
+
+zram 默认压缩算法：
+
+```c
+static const char *default_compressor = "zstd";
+```
+
+### Binder
+
+已移植：
+
+- Oneway 垃圾消息检测
+- 位图描述符查找
+
+### cgroup 稳定性
+
+已加入 `cgroup_file_open/release/write/poll` NULL 检查，避免 cgroup 文件释放 alignment fault 导致随机重启。
+
+### THP
+
+已关闭：
+
+```text
+# CONFIG_TRANSPARENT_HUGEPAGE is not set
+```
+
+原因：该 4.14 THP 回移在 MIUI mem reclaim 场景可能触发 `reclaim_pte_range` 崩溃。
+
+## 未包含
+
+- MGLRU：未移植。它依赖大量 mm/cgroup/pid 基础回移，强行合并风险较高。
+- LTS 4.14.357-openela 全量升级：未做。
+- CPU7 EAS 功耗模型修复：未移植。
+- Chopin 专属 DTB / preloader / 超频 / EROFS 注入等：未移植。
+
+## 编译
 
 ```sh
-./build.sh --check --no-ccache --no-update
+cd /root/kernel-lxc_xiaomi_mtk810_mt6833-resukisu
+./build.sh --no-menuconfig --no-update
 ```
 
-该模式只检查工具链、defconfig、olddefconfig 和 `make prepare`，不会完整编译。
+快速检查配置：
 
----
-
-## 🧩 ReSukiSU 版本信息
-
-每次构建时脚本会自动从 git 和源码中提取以下信息并显示：
-
-- **Version**：`git describe --tags` 或 `KSU_VERSION` 宏
-- **Commit**：当前提交短哈希
-- **Branch**：分支名
-- **Commit Date**：最后一次提交时间
-- **Working Tree**：`clean` 或 `dirty`
-
-如需跳过自动更新（保留本地修改），用 `-nu`。
-
----
-
-## 🛠 常见问题
-
-### 编译相关
-
-| 问题 | 原因 | 解决 |
-|------|------|------|
-| `vdso_offset_sigtramp` 未声明 | `out/include/generated/vdso-offsets.h` 是空的旧文件 | 脚本已处理，如需手动：`rm -rf out/include/generated && make ... arch/arm64/kernel/vdso/` |
-| `unknown type name 'syscall_fn_t'` | 4.14 内核无此类型定义 | 手动在报错文件头部加 `typedef long (*syscall_fn_t)(const struct pt_regs *);` |
-| `timespec` / `timespec64` 不匹配 | btrfs 源码版本混乱 | 在 defconfig 中 `# CONFIG_BTRFS_FS is not set` |
-| `too many errors` 后 hugetlbpage.c 崩 | 源码拼写错误 | 关 `CONFIG_HUGETLBFS`，或改 `ptep` 为 `pte` |
-
----
-
-## 📦 目录结构
-
-```
-kernel-lxc_xiaomi_mtk810_mt6833-resukisu/
-├── build.sh                  # 构建脚本
-├── ReSukiSU/                 # ReSukiSU 源码（独立 git）
-│   └── kernel/               # → 软链到 drivers/kernelsu
-├── utils/                    # LXC/Docker 内核支持
-│   ├── Kconfig
-│   ├── fix_cgroup.patch
-│   └── ...
-├── arch/arm64/
-│   ├── configs/everpal_defconfig
-│   └── mm/hugetlbpage.c      # 已修复 ptep 拼写
-├── drivers/
-│   ├── kernelsu -> ../ReSukiSU/kernel
-│   ├── Makefile
-│   └── Kconfig
-├── Kconfig                   # 已加 source "utils/Kconfig"
-└── out/                      # 构建输出
+```sh
+./build.sh --check --no-menuconfig --no-update
 ```
 
----
+## 输出
 
-## 🔗 相关链接
+```text
+out/arch/arm64/boot/Image.gz
+ReSukiSU-AdrenalinKernel-YYYYMMDD-HHMM.zip
+```
 
-- [ReSukiSU 官方仓库](https://github.com/ReSukiSU/ReSukiSU)
-- [LXC/Docker 内核支持（tomxi1997）](https://github.com/tomxi1997/lxc-docker-support-for-android)
-- [LXC Magisk 模块](https://github.com/tomxi1997/lxc-magisk-modules-for-android-)
-- [AnyKernel3](https://github.com/weaponmasterjax/AnyKernel3)
+当前最新产物示例：
 
----
+```text
+/root/ReSukiSU-AdrenalinKernel-20261004-1056.zip
+```
 
-## 📝 许可
+## 刷入
 
-本源码树的内核部分遵循原仓库的许可协议。ReSukiSU、LXC/Docker 补丁、AnyKernel3 各自遵循其原始许可。
+请自行使用 fastboot / magiskboot 等方式刷入对应 boot 镜像。
+
+刷机前务必备份原 boot。
+
+## License
+
+内核源码遵循其原始 GPL-2.0 许可证。
+ReSukiSU、Linux 内核回移代码等遵循各自原始许可证。
