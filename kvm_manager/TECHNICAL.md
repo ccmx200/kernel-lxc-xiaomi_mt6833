@@ -1,6 +1,13 @@
 # ckvm 技术文档
 
+**作者**：璀璨梦星 · cuicanmx · <https://github.com/ccmx200>
+
 本文解释 **为什么** ckvm 要这么写。每条结论都给出出处或本机实测数据。
+引用到的外部项目（Linux 内核、QEMU、ARM 规范、Limbo、EDK2、
+`mtk-soc-disable-geniezone` 等）在第 10 章「参考出处」逐一列出。
+
+> 本工具按原样提供，不附带任何担保。刷写内核或分区表可能导致设备变砖或
+> 数据丢失，风险自负。完整免责条款见仓库根目录 README。
 面向需要排查问题、移植到别的机型、或想改这套东西的人。
 
 用户向的用法说明在 [README.md](README.md)。
@@ -1046,7 +1053,7 @@ runcmd:
 ```text
 设备     小米 MT6833 / evergo
 容器     droidspaces Debian 13，systemd 为 PID 1
-内核     4.14.356-Evergo-KVM-CuiCanMX-v1.0
+内核     4.14.356-Evergo-KVM-cuicanmx-v1.0
 QEMU     /usr/bin/qemu-system-aarch64
 guest    Ubuntu 26.04.1 LTS，kernel 7.0.0-38-generic
 ```

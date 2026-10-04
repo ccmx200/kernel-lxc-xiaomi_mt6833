@@ -20,6 +20,8 @@
 set -u
 
 CKVM_VERSION="1.0"
+CKVM_AUTHOR="璀璨梦星 · cuicanmx"
+CKVM_HOME="github.com/ccmx200"
 # Feature marker: bumped whenever the download-and-install path
 # changes meaning.  install() refuses a file that lacks it, so a
 # caching mirror serving an old revision is caught instead of
@@ -61,6 +63,25 @@ TAP_NETMASK="24"
 # output helpers
 # --------------------------------------------------------------------------
 say()  { printf '  %s\n' "$*"; }
+
+# a brighter tone for the author line.  NOTE: it must be a literal escape,
+# not a "\033" string - printf %s does not interpret escapes.
+if [ -t 1 ] && [ "${TERM:-dumb}" != "dumb" ] && [ -z "${NO_COLOR:-}" ]; then
+    C_AUTHOR=$'\033[38;5;213m'
+else
+    C_AUTHOR=''
+fi
+
+# Shown once at startup so the name and author are always visible.
+banner() {
+    [ -t 1 ] || return 0
+    printf '\n  %sckvm%s %s·%s KVM 虚拟机管理器 %s%s%s\n' \
+           "$C_B" "$C_RST" "$C_DIM" "$C_RST" "$C_DIM" "$CKVM_VERSION" "$C_RST"
+    printf '  %s作者  %s%s璀璨梦星 · cuicanmx%s   %s%s%s\n\n' \
+           "$C_DIM" "$C_RST" "$C_AUTHOR" "$C_RST" "$C_DIM" "$CKVM_HOME" "$C_RST"
+}
+
+
 warn() { printf '  ! %s\n' "$*" >&2; }
 die()  { printf '  ERROR: %s\n' "$*" >&2; exit 1; }
 need_root() { [ "$(id -u)" = 0 ] || die "run as root"; }
@@ -1013,11 +1034,9 @@ cmd_help_ports() {
 EOF
 }
 
+# Always a plain listing.  The interactive picker lives in `ckvm create`,
+# so calling versions from a script must never block on stdin.
 cmd_versions() {
-    if [ "$IS_TTY" = 1 ]; then
-        pick_release >/dev/null
-        return 0
-    fi
     printf '  %-8s %-12s %-5s %s\n' VERSION CODENAME LTS SIZE
     while IFS='|' read -r ver code lts size; do
         [ -n "$ver" ] || continue
@@ -1700,10 +1719,19 @@ ckvm $CKVM_VERSION - KVM guest manager (MT6833 / evergo)
   ckvm edit <name>                 edit a guest's vm.conf
 
 Files: $CKVM_ROOT/<name>/    firmware: $CKVM_FWDIR
+
+作者  $CKVM_AUTHOR    $CKVM_HOME
+      MIT / 见仓库 License；按原样提供，刷机风险自负
 EOF
 }
 # Every subcommand that needs a guest name should fail clearly instead of
 # treating a flag as a guest.  -h/--help anywhere prints the help.
+# Always show who wrote this, once, unless the output is being captured.
+banner
+
+case "${1:-help}" in
+    --version|-V) exit 0 ;;
+esac
 case "${1:-help}" in
     -h|--help) cmd_help; exit 0 ;;
     help)

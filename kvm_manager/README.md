@@ -524,11 +524,31 @@ ckvm console <名字> -a       # 显示全部
 ```text
 设备    小米 MT6833 / evergo
 容器    droidspaces（Debian 13，systemd 作为 PID 1）
-内核    4.14.356-Evergo-KVM-CuiCanMX-v1.0
+内核    4.14.356-Evergo-KVM-cuicanmx-v1.0
 guest   Ubuntu 26.04.1 LTS
 ```
 
 ---
+
+## 作者与许可
+
+| 项目 | 内容 |
+|---|---|
+| 作者 | 璀璨梦星 · cuicanmx |
+| GitHub | <https://github.com/ccmx200> |
+| 仓库 | `ccmx200/kernel-lxc-xiaomi_mt6833` 的 `kvm_manager/` |
+
+ckvm 本身按仓库声明的许可分发。它依赖的外部组件各有其许可：
+
+| 组件 | 来源 | 许可 |
+|---|---|---|
+| UEFI 固件 | Limbo for Tensor（`wasdwasd0105/limbo_tensor`） | 见其项目声明 |
+| Ubuntu cloud image | Canonical | 见 Ubuntu 许可 |
+| QEMU / aria2 / cloud-init 等 | 各自上游 | 各自上游许可 |
+
+**免责声明**：本工具按原样提供，不附带任何形式的担保。刷写内核、修改分区表
+等操作可能导致设备变砖或数据丢失，**风险自负**，作者不承担责任。完整条款见
+仓库根目录 [README](../README.md) 的「免责声明」一节。
 
 ## 文档
 

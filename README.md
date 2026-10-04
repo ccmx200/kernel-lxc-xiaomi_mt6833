@@ -2,14 +2,19 @@
 
 ReSukiSU + KVM + BBRv2 + zstd/lz4 + Binder 优化内核。
 
+> **作者**：璀璨梦星 · cuicanmx · <https://github.com/ccmx200>
+>
+> 本项目在社区成果之上整合而成，**并非全部原创**。各部分来源见
+> [移植与出处](#移植与出处) 与 [致谢](#致谢)。
+
 ## 基本信息
 
 - 设备：xiaomi MT6833 / evergo
 - 内核版本：Linux 4.14.356
 - 当前版本号：
   ```text
-  4.14.356-Evergo-KVM-CuiCanMX-v1.0
-  # uname -r -> 4.14.356-Evergo-KVM-CuiCanMX-v1.0
+  4.14.356-Evergo-KVM-cuicanmx-v1.0
+  # uname -r -> 4.14.356-Evergo-KVM-cuicanmx-v1.0
   ```
 - 默认 defconfig：
   ```text
@@ -321,7 +326,98 @@ ReSukiSU-AdrenalinKernel-YYYYMMDD-HHMM.zip
 
 刷机前务必备份原 boot。
 
+---
+
+## 免责声明
+
+**请在使用前完整阅读本节。刷写内核或分区表属于高风险操作。**
+
+1. **按原样提供（AS IS）**
+   本项目及其全部产物（内核镜像、刷机包、脚本、文档）按"原样"提供，
+   **不附带任何形式的明示或暗示担保**，包括但不限于对适销性、特定用途
+   适用性和不侵权的担保。
+
+2. **风险自负**
+   刷写自定义内核、修改 GPT 分区表、执行 `fastboot flash` 等操作**可能导致
+   设备变砖、无法开机、丢失全部数据、失去保修**。使用者须自行承担全部风险。
+   作者与贡献者**不对任何直接、间接、附带或后果性损害承担责任**，包括数据
+   丢失、设备损坏、收入或利润损失。
+
+3. **前置要求**
+   本项目面向**已解锁引导程序、已获得 root 权限**的设备。使用前请确认你
+   了解如何进入 fastboot / recovery、如何备份分区，并**务必保留原厂镜像**。
+
+4. **不隶属声明**
+   本项目与**小米（Xiaomi）、联发科（MediaTek）、Ubuntu/Canonical、
+   Google 及其他商标持有者没有任何隶属、赞助或背书关系**。所有商标归其
+   各自所有者所有。
+
+5. **禁止商业用途**
+   未经作者书面许可，**不得将本项目或其衍生作品用于商业目的**，包括但不限于
+   预装、捆绑销售、以付费服务形式分发。
+
+6. **禁止非法用途**
+   不得将本项目用于任何违反当地法律法规的用途。使用者须自行确保其使用行为
+   合法合规。
+
+7. **无技术支持义务**
+   作者没有提供技术支持、修复缺陷或持续维护的义务。Issue 与 PR 可能不被
+   响应。
+
+8. **保留修改权利**
+   作者保留随时修改、暂停或终止本项目的权利，恕不另行通知。
+
+9. **OTA 与系统更新**
+   系统 OTA 可能还原被修改的分区（例如 GPT），更新后相关修改会失效，
+   需要重新执行。升级系统前请确认你知道后果。
+
+10. **继续使用即表示接受**
+    下载、编译、刷写或以任何方式使用本项目，即表示你已阅读、理解并同意
+    上述全部条款。**若不同意，请立即停止使用并删除相关文件。**
+
+---
+
+## 移植与出处
+
+本项目整合了多项社区成果与上游内核代码。以下按**代码中可确认**的信息标注
+来源；无法从代码中确认的部分只描述其性质，不臆造具体提交。
+
+| 组件 | 来源 | 可确认依据 |
+|---|---|---|
+| ReSukiSU（root 方案） | ReSukiSU 上游项目，以源码形式内置于 `ReSukiSU/`，经 `drivers/kernelsu` 符号链接接入内核 | 目录内自带 `LICENSE` / `CONTRIBUTING.md` / `SECURITY.md` |
+| BBRv2 拥塞控制 | Linux 内核上游的 BBRv2 实现（`net/ipv4/tcp_bbr2.c`） | 文件头保留原作者注释与 `TODO(ncardwell)` 标记，作者为 Neal Cardwell |
+| Binder Oneway 垃圾消息检测<br>位图描述符查找 | 上游内核回移。相关符号为 `BR_ONEWAY_SPAM_SUSPECT`、`BINDER_WORK_TRANSACTION_ONEWAY_SPAM_SUSPECT`、`dbitmap.h` | 这些符号出现在上游内核较新版本中 |
+| BBRv2 / zstd / lz4 / Binder / cgroup / THP 等回移 | 上游内核与各上游库 | 见各项说明 |
+| zstd | 上游 zstd 项目（版本 1.5.7） | `lib/zstd/` |
+| lz4 | 上游 lz4 项目（版本 1.10.0） | `lib/lz4/lz4.h` 的 `LZ4_VERSION_MAJOR` 等版本宏 |
+| KVM NISV / 外部数据中止注入 | Linux 内核上游 5.10 引入的机制，回移至本 4.14 树 | 见 [docs/KVM.md](docs/KVM.md) 的出处列表 |
+| KVM / vGIC / ITS 修复 | 上游内核回移 | 见 `docs/KVM.md` |
+| 不写 NVRAM 的 EDK2 固件 | Limbo for Tensor 项目（`wasdwasd0105/limbo_tensor`）随 APK 分发 | 见 `kvm_manager/TECHNICAL.md` 第 4 节 |
+| 禁用 GenieZone 的工具链 | `jsbsbxjxh66/mtk-soc-disable-geniezone`（MIT） | 见 `kvm_manager/TECHNICAL.md` 第 11 节 |
+
+> **诚实说明**：本仓库由多方成果整合而成。若你是某项代码的原作者而此处未
+> 列出或标注有误，请提 Issue，会尽快更正。
+
+---
+
+## 致谢
+
+- **ReSukiSU** 及其贡献者 —— root 方案
+- **Neal Cardwell** 与 BBRv2 的贡献者 —— 拥塞控制
+- **jsbsbxjxh66**（酷安）—— `mtk-soc-disable-geniezone`，禁用 GenieZone
+  并释放 EL2 的工具链
+- **Limbo for Tensor**（`wasdwasd0105`）—— 提供不写 NVRAM 的 EDK2 固件
+- **Linux 内核社区** —— 本仓库大量代码回移自上游
+- 以及所有在公开渠道分享 MTK 平台经验的人
+
+---
+
 ## License
 
-内核源码遵循其原始 GPL-2.0 许可证。
-ReSukiSU、Linux 内核回移代码等遵循各自原始许可证。
+内核源码遵循其原始 **GPL-2.0** 许可证。
+
+ReSukiSU、Linux 内核回移代码、zstd、lz4、EDK2 固件、
+`mtk-soc-disable-geniezone` 等分别遵循**各自的原始许可证**：
+使用、修改或再分发这些部分时，请一并遵守其许可条款。
+
+`mtk-soc-disable-geniezone` 为 MIT；Limbo 的固件请遵循其项目声明。
