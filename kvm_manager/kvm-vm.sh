@@ -18,15 +18,19 @@
 #  Multi-VM: each guest lives in its own directory under $CKVM_ROOT and has
 #  its own disk, firmware copy, seed and TCP port.
 #
-#  Two hardware facts are baked in; see docs/KVM.md for the measurements:
-#   * QEMU must be pinned to one core type (big.LITTLE!) or vCPU creation
-#     fails with EINVAL.  Default CPUSET=6-7 (the two Cortex-A76 cores).
+#  Two hardware facts are baked in; see kvm_manager/TECHNICAL.md sections 5
+#  and 12 for the measurements:
+#   * QEMU must not be migrated between the big and little clusters while it
+#     initialises vCPUs - the feature registers differ and KVM answers EINVAL
+#     ("Failed to put registers after init").  It is therefore started pinned
+#     to a single core and widened to the chosen core set afterwards.
 #   * The firmware must be the NVRAM-free EDK2 build, otherwise the guest
 #     wedges as soon as the firmware writes its variable store.
 # =============================================================================
 set -u
 
-CKVM_VERSION="1.1"
+CKVM_VERSION="1.2"
+# 1.2: the core choice is explicit and defaults to ALL cores --cores all|big.
 # 1.1: qemu starts pinned to BOOT_CPU and its threads are widened to
 #      CPUSET once the guest is up.  Before this, a CPUSET spanning
 #      both clusters made QEMU fail at startup about 4 times in 5
@@ -39,7 +43,7 @@ CKVM_HOME="github.com/ccmx200"
 # changes meaning.  install() refuses a file that lacks it, so a
 # caching mirror serving an old revision is caught instead of
 # quietly downgrading the installed ckvm.
-CKVM_BUILD="store+ports+aria2+console+bootpin"
+CKVM_BUILD="store+ports+aria2+console+bootpin+cores"
 CKVM_ROOT="${CKVM_ROOT:-/var/lib/ckvm}"
 CKVM_FWDIR="${CKVM_FWDIR:-/usr/local/share/ckvm/firmware}"
 CKVM_BINDIR="${CKVM_BINDIR:-/usr/local/bin}"
@@ -54,13 +58,24 @@ MIRROR_APT="${MIRROR_APT:-https://mirrors.ustc.edu.cn/ubuntu-ports}"
 DEF_CPUS=8
 DEF_MEM=2048
 DEF_DISK_GB=50
-DEF_CPUSET=6-7
+# Physical core sets.  The guest is pinned to one of these:
+#   FULL  all 8 cores - 6x Cortex-A55 + 2x Cortex-A76.  Best throughput.
+#   BIG   the 2 Cortex-A76 only.  Best single-thread latency.
+# Names rather than masks, because the numbers are machine specific and
+# nobody should have to remember them.
+CORESET_FULL="0-7"
+CORESET_BIG="6-7"
+DEF_CORES="all"          # all | big
+
+# Derived from DEF_CORES below; kept as a variable so a vm.conf can
+# override the mask directly if someone really wants to.
+DEF_CPUSET="$CORESET_FULL"
 # During vCPU initialisation QEMU must not be migrated between the A55 and
 # A76 clusters: the feature registers differ, KVM refuses the write-back and
 # QEMU dies with "Failed to put registers after init".  So the process is
 # pinned to ONE core while it starts and its affinity is widened to CPUSET
 # once the guest is running.  Measured: booting 8 vCPU directly on 0-7 worked
-# 1/5 times; with this dance, 5/5.  Empty disables the widening.
+# 1/5 times; with this dance, 5/5.
 DEF_BOOT_CPU=6
 # Empty means "ask" in interactive mode; command mode falls back to
 # "ubuntu" (what the Ubuntu cloud images themselves use).
@@ -880,6 +895,7 @@ cmd_create() {
     local name="" cpus="" mem="" disk="" rel="" port=""
     local net_mode="" forwards="" fwd_set=0
     local vm_user="" vm_pass=""
+    local cores=""
     local interactive=0
 
     # decide the mode first: bare "ckvm create" on a TTY is interactive
@@ -890,6 +906,7 @@ cmd_create() {
     while [ $# -gt 0 ]; do
         case "$1" in
             --cpus) cpus="$2"; shift 2 ;;
+            --cores) cores="$2"; shift 2 ;;
             --mem)  mem="$2";  shift 2 ;;
             --disk) disk="$2"; shift 2 ;;
             --rel)  rel="$2";  shift 2 ;;
@@ -921,6 +938,15 @@ cmd_create() {
         printf '\n'
         name=$(ask_with_default "虚拟机名字:" "ubuntu${rel%%.*}$(echo "$rel" | cut -d. -f2)")
         cpus=$(ask_with_default "vCPU 数量:" "$DEF_CPUS")
+        printf '  %s物理核心:%s  %s1)%s 全部 8 核（6×A55 + 2×A76，吞吐优先）\n' \
+               "$C_DIM" "$C_RST" "$C_B" "$C_RST"
+        printf '             %s2)%s 仅 2 个大核（A76，单核延迟优先）\n' "$C_B" "$C_RST"
+        local core_ans
+        core_ans=$(ask_with_default "选择 [1/2]:" "1")
+        case "$core_ans" in
+            2|big|BIG|大核) cores="big" ;;
+            *)              cores="all" ;;
+        esac
         mem=$(ask_with_default "内存 (MiB):" "$DEF_MEM")
         disk=$(ask_with_default "磁盘 (GiB):" "$DEF_DISK_GB")
         net_mode=$(ask_with_default "网络模式 user/host:" "$DEF_NET_MODE")
@@ -955,6 +981,8 @@ cmd_create() {
     [ -n "$rel" ]       || rel="$DEF_REL"
     [ -n "$name" ]      || name="ubuntu${rel%%.*}$(echo "$rel" | cut -d. -f2)"
     [ -n "$cpus" ]      || cpus="$DEF_CPUS"
+    [ -n "$cores" ]     || cores="$DEF_CORES"
+    local cpuset; cpuset=$(cores_to_mask "$cores")
     [ -n "$mem" ]       || mem="$DEF_MEM"
     [ -n "$disk" ]      || disk="$DEF_DISK_GB"
     [ -n "$net_mode" ]  || net_mode="$DEF_NET_MODE"
@@ -1008,7 +1036,8 @@ PORT=$port
 # Pin to one core type.  big.LITTLE: 6x A55 (0xd05) + 2x A76 (0xd0b) expose
 # different ID registers, and an unpinned QEMU gets EINVAL when it writes
 # them back.  Cores 6,7 are the A76 pair.
-CPUSET=$DEF_CPUSET
+# Core choice: all cores (default) or just the big ones.
+CPUSET=$cpuset
 BOOT_CPU=${BOOT_CPU:-$DEF_BOOT_CPU}
 VM_USER=$vm_user
 VM_PASS=$vm_pass
@@ -1033,6 +1062,7 @@ EOF
         fetch_image "$name" || warn "镜像下载失败；稍后可跑 'ckvm image $name'"
     fi
     make_seed "$name"
+    say "物理核心: $(cores_to_label "$cpuset")"
     printf '\n'
     say "启动： ckvm start $name"
 }
@@ -1251,6 +1281,27 @@ widen_affinity() {
         taskset -pc "$CPUSET" "$(basename "$t")" >/dev/null 2>&1 || true
     done
     return 0
+}
+
+
+# Map a user-facing core choice to a mask.  Accepts the names, or a raw
+# mask for anyone who wants something else.
+cores_to_mask() {
+    case "${1:-}" in
+        all|ALL|full|FULL) echo "$CORESET_FULL" ;;
+        big|BIG|a76|A76)   echo "$CORESET_BIG" ;;
+        "")                echo "$DEF_CPUSET" ;;
+        *)                 echo "$1" ;;
+    esac
+}
+
+# Human description for the choice, for the confirmation line.
+cores_to_label() {
+    case "$1" in
+        "$CORESET_FULL") echo "全部 8 个物理核（6×A55 + 2×A76）" ;;
+        "$CORESET_BIG")  echo "仅 2 个大核（A76）" ;;
+        *)               echo "自定义掩码 $1" ;;
+    esac
 }
 
 show_access() {
@@ -1807,6 +1858,12 @@ ckvm $CKVM_VERSION - KVM guest manager (MT6833 / evergo)
   ckvm ports                       how port mapping works
   ckvm help ports                  same thing
         --cpus N    vCPU count          (default $DEF_CPUS)
+        --cores C   which physical cores to use:
+                      all  = 全部 8 核（6×A55 + 2×A76），吞吐优先
+                      big  = 仅 2 个大核（A76），单核延迟优先
+                    (default $DEF_CORES)
+                    实测 sha256 八线程吞吐: all 约 7.4-7.7 GB/s,
+                    big 约 2.9-3.0 GB/s；all 的启动会慢 8-12 秒
         --mem  MB   memory              (default $DEF_MEM)
         --disk GB   disk size           (default $DEF_DISK_GB)
         --rel  V    Ubuntu release      (default $DEF_REL)
