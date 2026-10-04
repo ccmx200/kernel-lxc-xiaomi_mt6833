@@ -19,6 +19,7 @@
 8. [systemd 与安装流程](#8-systemd-与安装流程)
 9. [实测数据集](#9-实测数据集)
 10. [参考出处](#10-参考出处)
+11. [在天玑810（MT6833）上禁用 GenieZone 并释放 EL2](#11-在天玑810mt6833上禁用-geniezone-并释放-el2)
 
 ---
 
@@ -1147,7 +1148,15 @@ $ ckvm list
 - **netplan 文档** — `network-config` 的 v2 语法。
   <https://netplan.readthedocs.io/>
 
-### 10.5 工具
+### 10.5 禁用 GenieZone / 释放 EL2
+
+- **mtk-soc-disable-geniezone** — jsbsbxjxh66（酷安），MIT。提供
+  `detect_gz_bypass.py`（检测 preloader 能否走 GPT 方案）与
+  `patch_gz_gpt.py`（改写 GZ 分区 LBA 并重算 CRC）。第 11 节的全部操作
+  基于此项目。
+  <https://github.com/jsbsbxjxh66/mtk-soc-disable-geniezone>
+
+### 10.6 工具
 
 - **aria2 手册** — `-x` / `-s` / `-k` / `-c` 等选项语义。
   <https://aria2.github.io/manual/en/html/aria2c.html>
@@ -1156,11 +1165,279 @@ $ ckvm list
 - **QEMU 系统模拟文档** — `virt` 机型、`pflash`、`-netdev user/tap`。
   <https://www.qemu.org/docs/master/system/>
 
-### 10.6 镜像源
+### 10.7 镜像源
 
 - 南京大学镜像站：<https://mirror.nju.edu.cn/ubuntu-cloud-images/>
 - 中国科学技术大学镜像站：<https://mirrors.ustc.edu.cn/>
 - Ubuntu 官方 cloud images：<https://cloud-images.ubuntu.com/releases/>
+
+---
+
+## 11. 在天玑810（MT6833）上禁用 GenieZone 并释放 EL2
+
+> **本节内容由使用者提供并整理，实践过程记录自实际设备操作。**
+> 原文是一份独立记录，此处并入技术文档，作为 KVM 工作的前提步骤。
+
+### 11.1 致谢
+
+本实践参考并使用了酷安用户 **jsbsbxjxh66** 开发的开源项目
+`mtk-soc-disable-geniezone`。该项目提供了完整的检测、修改与补丁工具链，
+使得在联发科平台上禁用 GenieZone 成为可能。
+
+| 项目 | 内容 |
+|---|---|
+| 项目地址 | `github.com/jsbsbxjxh66/mtk-soc-disable-geniezone` |
+| 作者 | jsbsbxjxh66（酷安） |
+| 协议 | MIT |
+
+### 11.2 设备与目标
+
+| 项目 | 内容 |
+|---|---|
+| 设备 | 天玑810（MT6833），代号 `evergo` |
+| 平台代际 | 天玑 v5 |
+| 存储类型 | UFS（扇区大小 4096 字节） |
+| 目标 | 禁用 GenieZone（GZ），释放 EL2，为运行 KVM 做准备 |
+
+根据 jsbsbxjxh66 项目文档，天玑 v5 平台的 GZ 初始化完全由 **preloader**
+负责，LK 中无 GZ 代码。因此采用 **GPT 方案 A（无效 LBA）** 即可在 preloader
+层面禁用 GZ，无需修改 LK 或 ATF。
+
+### 11.3 第一步：检测 preloader 可行性
+
+从设备提取 `boot1.bin`（即 preloader 分区），运行检测脚本：
+
+```bash
+python3 detect_gz_bypass.py boot1.bin
+```
+
+检测结果：
+
+```text
+文件大小: 4,194,304 bytes (4.0 MB)
+GFH: load_addr=0x00200F10  BASE=0x001FFE20  Thumb PIC  GFH偏移=0x1000
+NoGZ: 2 处  CMP #512: 0x271E8
+assert_fatal: 0x3D978 (global)  halt_on_assert: 0x00272DC8
+
+GPT 修改方案: 可用
+halt_on_assert 未强制置 1, assert 非致命
+存储类型: UFS
+
+重名方案 (gz→gx): 不可行
+  "gz" 2 处代码引用 (0x4F418(2))
+  主引导函数 (0x2AB38-0x2C338) 包含 gz 分区名引用
+  主引导循环依赖 gz 名称解析, 重名导致引导流水线中断
+无效 LBA 欺骗:    有 UFS 越界风险
+  "LBA out of range" @0x59AC0
+
+推荐: 无效 LBA 方案 (只需修改 PGPT)
+```
+
+结论：
+
+- **GPT 方案可用** —— `halt_on_assert` 未被强制置 1，assert 非致命，I/O 失败后
+  preloader 可正常设置 `NoGZ` 并继续启动。
+- **重名方案不可行** —— 主引导函数独立引用 `gz` 分区名，重命名为 `gx` 会导致
+  引导流水线中断，设备黑砖。
+- **UFS 越界风险** —— 脚本提示越界 LBA 可能被 UFS 控制器拒绝。但
+  jsbsbxjxh66 项目的兼容性列表显示，同为 MT6833 的 OPPO A55 已验证该方案
+  可用，因此决定继续。
+
+### 11.4 第二步：修改 GPT 分区表
+
+先预览：
+
+```bash
+python3 patch_gz_gpt.py pgpt.bin --dry-run
+```
+
+确认脚本正确识别 `gz_a`（LBA `0xac600`–`0xae5ff`）和 `gz_b`
+（LBA `0xd1e00`–`0xd3dff`）后，生成修改后的 GPT：
+
+```bash
+python3 patch_gz_gpt.py pgpt.bin -o pgpt_patched.bin
+```
+
+```text
+找到 2 个 GZ 分区:
+  gz_a: LBA 0xac600 - 0xae5ff (8192 扇区, 32.0 MB)
+  gz_b: LBA 0xd1e00 - 0xd3dff (8192 扇区, 32.0 MB)
+
+已备份原始文件到: pgpt_backup.bin
+
+修改详情 (改 LBA 越界):
+  无效 LBA: 0x3b96000 (最后有效 LBA: 0x3b95fff)
+  gz_a: Start LBA 0xac600 → 0x3b96000, End LBA 0xae5ff → 0x3b96000
+  gz_b: Start LBA 0xd1e00 → 0x3b96002, End LBA 0xd3dff → 0x3b96002
+
+CRC 更新:
+  Entries CRC32: 0xbbd764b2 → 0xb00b51ab
+  Header CRC32:  0xb253f760 → 0x07bd9b95
+
+完成! 共修改 23 字节
+输出文件: pgpt_patched.bin
+备份文件: pgpt_backup.bin
+```
+
+脚本自动备份原始文件，并更新 GPT 的 Header CRC32 与 Entries CRC32。
+
+### 11.5 第三步：刷入 PGPT 分区
+
+首次直接刷完整的 `pgpt_patched.bin`（512 KB）会失败：
+
+```text
+FAILED (remote: 'size too large')
+```
+
+原因是 `pgpt` 分区实际只有 **32 KB**（32768 字节），而完整 GPT 镜像包含主
+GPT、备份 GPT 等结构，共 512 KB。
+
+提取前 32 KB 再刷：
+
+```bash
+head -c 32768 pgpt_patched.bin > pgpt_32k.bin
+# 或者
+dd if=pgpt_patched.bin of=pgpt_32k.bin bs=4096 count=8
+
+fastboot flash pgpt pgpt_32k.bin
+```
+
+```text
+Sending 'pgpt' (32 KB)  OKAY
+Writing 'pgpt'          OKAY
+Finished
+```
+
+重启后设备正常开机，进入系统，**无变砖现象**。
+
+### 11.6 第四步：验证 GZ 是否被禁用
+
+```bash
+adb shell su
+
+# 设备树里不应有 gz 节点
+ls /proc/device-tree/chosen/
+find /proc/device-tree -name "*gz*"
+
+# 内核日志里不应有 GZ 初始化
+dmesg | grep -iE "nogz|gz is disabled|gz_init"
+
+# KVM 设备节点
+ls -l /dev/kvm
+
+# 启动参数
+cat /proc/cmdline
+```
+
+结果：
+
+| 检查 | 结果 |
+|---|---|
+| `/proc/device-tree` 下 `*gz*` | 无任何结果 |
+| `dmesg` 中 `nogz` / `gz_init` | 无输出 |
+| `/dev/kvm` | `No such file or directory` |
+| `/proc/cmdline` 中 `el2` / `kvm` / `hvc` | 无 |
+
+结论：
+
+- **条件一满足** —— 设备树中无 GZ 相关节点、`dmesg` 无 GZ 初始化日志，
+  表明 preloader 读取越界 LBA 失败后已设置 `NoGZ`，跳过了 GZ 加载。
+  **GZ 已禁用，EL2 已释放。**
+- **条件二未满足** —— `/dev/kvm` 不存在，启动参数中无 EL2/KVM 字样，
+  表明当时的内核未开启 KVM 支持。
+
+### 11.7 第五步：内核编译准备
+
+```bash
+git clone https://github.com/ccmx200/kernel-lxc-xiaomi_mt6833
+cd kernel-lxc_xiaomi_mt6833
+```
+
+切换到 `resukisu` 分支后 `git pull` 遇到本地 `build.sh` 冲突：
+
+```text
+error: Your local changes to the following files would be overwritten by merge:
+        build.sh
+```
+
+用 stash 暂存再恢复：
+
+```bash
+git stash
+git pull
+git stash pop
+```
+
+计划：
+
+- 配置内核开启 `CONFIG_KVM`
+- 添加可识别的版本号（如 `-NoGZ-EL2-KVM`），便于 `uname -a` 辨认
+- 编译并刷入，确认 `/dev/kvm` 出现、内核运行在 EL2
+- 用 QEMU/KVM 运行虚拟机
+
+### 11.8 关键命令汇总
+
+```bash
+# 1. 检测 preloader
+python3 detect_gz_bypass.py boot1.bin
+
+# 2. 修改 GPT
+python3 patch_gz_gpt.py pgpt.bin -o pgpt_patched.bin
+
+# 3. 提取 32KB
+head -c 32768 pgpt_patched.bin > pgpt_32k.bin
+
+# 4. 刷入 PGPT
+fastboot flash pgpt pgpt_32k.bin
+fastboot reboot
+
+# 5. 验证
+adb shell su
+dmesg | grep -iE "nogz|gz is disabled"
+find /proc/device-tree -name "*gz*"
+ls -l /dev/kvm
+
+# 6. 还原（如需）
+head -c 32768 pgpt_backup.bin > pgpt_backup_32k.bin
+fastboot flash pgpt pgpt_backup_32k.bin
+```
+
+### 11.9 经验与提醒
+
+1. **严格区分方案** —— MT6833 上重名方案（`--rename`）会导致黑砖，必须使用
+   无效 LBA 方案。
+2. **分区大小限制** —— `pgpt` 分区仅 32 KB，刷写前必须从完整 GPT 镜像中提取
+   前 32 KB。
+3. **UFS 越界风险** —— 部分 UFS 控制器遇到越界 LBA 可能崩溃而非返回错误，
+   操作前须做好救砖准备。
+4. **备份至关重要** —— `patch_gz_gpt.py` 会自动备份，务必保留
+   `pgpt_backup.bin`。
+5. **OTA 更新** —— 系统 OTA 可能还原 GPT，更新后需重新刷入修改后的 PGPT。
+6. **区分来源** —— 本实践使用 GPT 方案，**未修改 preloader**，也未刷入旧版
+   preloader。这与 jsbsbxjxh66 文章中提及的"改 preloader"路径不同，请勿混淆。
+7. **v5 平台优势** —— 天玑 v5 平台禁用 GZ 后无需 ATF 补丁，设备可稳定运行，
+   不会出现 VCP 看门狗重启或 DEVMPU 违规问题。
+
+### 11.10 与本文其他章节的关系
+
+| 条件 | 状态 | 说明 |
+|---|---|---|
+| preloader 未把 EL2 交给 GZ | ✅ 已满足 | 通过 GPT 无效 LBA 方案禁用 GZ |
+| 内核开启 KVM | 取决于内核 | 见第 1.2 节与第 3 节 |
+
+本节记录的是**条件一**：把 EL2 从 GenieZone 手里拿回来。第 1.2 节描述的
+"厂商固件占据 EL2" 是本文 KVM 工作最初面对的状态；一旦按本节禁用 GZ，
+EL2 就重新归内核所有，`CONFIG_ARM64_VHE` 与 KVM 才有落脚点。
+
+两条路径的其余部分（`ESR_EL2.ISV == 0`、NISV 回移、绑核、固件选择）与本节
+正交，不因 GZ 是否禁用而改变。
+
+### 11.11 致谢（重申）
+
+再次感谢酷安用户 **jsbsbxjxh66** 开发并开源了
+`mtk-soc-disable-geniezone`。该项目的检测脚本准确识别了 preloader 特性，
+修改脚本安全高效地完成了 GPT 越界 LBA 改写与 CRC 校验更新，使得在不修改
+preloader 代码、不破坏签名验证的前提下，成功禁用 GenieZone 并释放 EL2。
 
 ---
 
