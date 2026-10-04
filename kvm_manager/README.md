@@ -524,9 +524,61 @@ gzip 或裸 `Image`。必须走 UEFI。
 
 ---
 
+## 装完能不能跑：自检
+
+装完想知道这台机器到底能不能跑，直接：
+
+```sh
+ckvm selftest
+```
+
+它会**真的启一台一次性虚拟机**并验证：
+
+```text
+  ckvm selftest
+
+  root                          ok
+  qemu-system-aarch64           ok
+  /dev/kvm                      ok
+  cloud-localds                 ok
+  firmware                      ok
+  free disk                     ok (87246 MiB)
+
+  启动测试: 2 vCPU / 1024 MiB / 3G, 全核掩码 0-7
+  fetch image (26.04)           ok
+  build seed                    ok
+  qemu starts on cpuset 0-7     ok
+  guest reaches login           ok (56s)
+  guest reports its CPUs        ok (2 CPU)
+  firmware did not wedge        ok
+
+  ✓ 自检通过，这台机器可以跑虚拟机
+```
+
+测完自动删除；加 `--keep` 留下来，可以 `ckvm console` 进去看。
+`ckvm install --selftest` 装完直接跑一次。
+
+### 它比安装时的检查多测了什么
+
+安装时的校验只确认**下载的文件完整**（首行 shebang、`CKVM_BUILD=` 标记、
+`bash -n` 通过）。文件完好 **不等于** 能跑 —— 下面这些它一个都测不出来，
+而这些都是实际遇到过的：
+
+| 故障 | 文件检查 |
+|---|---|
+| 固件写 NVRAM 就卡死，永不进内核 | 通过 ❌ |
+| 核掩码跨簇被 QEMU 拒绝 | 通过 ❌ |
+| guest 起了但 sshd 没起来 | 通过 ❌ |
+| 固件断言 / 异常 | 通过 ❌ |
+
+`ckvm selftest` 把虚拟机真的跑起来，所以上面这些当场暴露。
+
+---
+
 ## 自查
 
 ```bash
+ckvm selftest            # 真的启一台测试机，确认这套能跑
 ckvm net                 # 容器网卡、路由、各虚拟机网络模式
 ckvm net <名字>          # 单机的 tap、NAT 规则、访问方式
 ckvm status <名字>       # 状态 + 串口末尾

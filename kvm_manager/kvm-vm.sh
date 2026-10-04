@@ -29,7 +29,8 @@
 # =============================================================================
 set -u
 
-CKVM_VERSION="1.2"
+CKVM_VERSION="1.3"
+# 1.3: 'ckvm selftest' boots a throwaway guest to prove the install works.
 # 1.2: the core choice is explicit and defaults to ALL cores --cores all|big.
 # 1.1: qemu starts pinned to BOOT_CPU and its threads are widened to
 #      CPUSET once the guest is up.  Before this, a CPUSET spanning
@@ -43,7 +44,7 @@ CKVM_HOME="github.com/ccmx200"
 # changes meaning.  install() refuses a file that lacks it, so a
 # caching mirror serving an old revision is caught instead of
 # quietly downgrading the installed ckvm.
-CKVM_BUILD="store+ports+aria2+console+bootpin+cores"
+CKVM_BUILD="store+ports+aria2+console+bootpin+cores+selftest"
 CKVM_ROOT="${CKVM_ROOT:-/var/lib/ckvm}"
 CKVM_FWDIR="${CKVM_FWDIR:-/usr/local/share/ckvm/firmware}"
 CKVM_BINDIR="${CKVM_BINDIR:-/usr/local/bin}"
@@ -1730,7 +1731,7 @@ fetch_repo_file() {
 
 cmd_install() {
     need_root
-    local accel="${CKVM_ACCEL:-0}"
+    local accel="${CKVM_ACCEL:-0}" RUN_SELFTEST=0
     while [ $# -gt 0 ]; do
         case "$1" in
             -cn|--cn|--china)
@@ -1742,6 +1743,7 @@ cmd_install() {
                 fi
                 ;;
             --repo|--mirror) accel="$2"; shift 2 ;;
+            --selftest)      RUN_SELFTEST=1; shift ;;
             *) shift ;;
         esac
     done
@@ -1822,7 +1824,11 @@ cmd_install() {
     write_unit
     systemctl daemon-reload
     say ""
+    if [ "$RUN_SELFTEST" = 1 ]; then
+        cmd_selftest || true
+    fi
     say "try:  ckvm create ubuntu26 && ckvm start ubuntu26 && ckvm list"
+    say "      or: ckvm selftest   (boot a throwaway guest to prove it works)"
 }
 cmd_uninstall() {
     need_root
@@ -1830,6 +1836,205 @@ cmd_uninstall() {
     rm -f "$SYSTEMD_DIR/ckvm@.service" "$CKVM_BINDIR/ckvm"
     systemctl daemon-reload
     say "removed ckvm (guest data in $CKVM_ROOT kept; delete it manually)"
+}
+
+
+# ---------------------------------------------------------------------------
+# selftest - prove this install can actually boot a guest
+#
+# The installer's check only ever proved the downloaded file was intact.  It
+# never ran anything, so a build that could not boot at all would install and
+# report success.  This boots a throwaway guest and checks the things that
+# have broken in practice: /dev/kvm usable, the core mask QEMU accepts,
+# working firmware, and a guest that reaches a login prompt with CPUs up.
+# ---------------------------------------------------------------------------
+SELFTEST_NAME="ckvm-selftest"
+SELFTEST_KEEP=0
+SELFTEST_FAILED=0
+
+st_step() { printf '  %-30s' "$1"; }
+st_ok()   { printf '%sok%s\n' "$C_G" "$C_RST"; }
+st_no()   { printf '%sfail%s  %s\n' "$C_R" "$C_RST" "$1"; SELFTEST_FAILED=$((SELFTEST_FAILED + 1)); }
+
+st_cleanup() {
+    local d; d=$(vm_dir "$SELFTEST_NAME" 2>/dev/null)
+    local p; p=$(running_pid "$SELFTEST_NAME" 2>/dev/null)
+    if [ -n "$p" ]; then
+        kill "$p" 2>/dev/null
+        sleep 2
+        kill -9 "$p" 2>/dev/null
+    fi
+    if [ "$SELFTEST_KEEP" = 1 ]; then
+        say "测试机保留: ckvm console $SELFTEST_NAME"
+    else
+        rm -rf "$CKVM_ROOT/$SELFTEST_NAME" 2>/dev/null
+    fi
+    return 0
+}
+
+cmd_selftest() {
+    need_root
+    local rel=""
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --keep) SELFTEST_KEEP=1; shift ;;
+            *)      rel="$1"; shift ;;
+        esac
+    done
+    [ -n "$rel" ] || rel="$DEF_REL"
+
+    trap 'st_cleanup' EXIT INT TERM
+    printf '\n  %sckvm selftest%s\n\n' "$C_B" "$C_RST"
+
+    # ---------------------------------------------------------- environment
+    st_step "root"
+    if [ "$(id -u)" = 0 ]; then st_ok; else st_no "not root"; fi
+
+    st_step "qemu-system-aarch64"
+    if [ -x "$QEMU" ] || command -v "$QEMU" >/dev/null 2>&1; then st_ok; else st_no "not found"; fi
+
+    st_step "/dev/kvm"
+    if [ -r /dev/kvm ] && [ -w /dev/kvm ]; then st_ok; else st_no "missing or not writable"; fi
+
+    st_step "cloud-localds"
+    if command -v cloud-localds >/dev/null 2>&1; then st_ok; else st_no "cloud-image-utils missing"; fi
+
+    st_step "firmware"
+    if [ -s "$CKVM_FWDIR/edk2_qemu_aarch64_nonvram.fd" ]; then
+        st_ok
+    else
+        st_no "missing edk2_qemu_aarch64_nonvram.fd"
+    fi
+
+    st_step "free disk"
+    local avail
+    avail=$(df -Pm "$CKVM_ROOT" 2>/dev/null | awk 'NR==2{print $4}')
+    if [ -n "$avail" ] && [ "$avail" -ge 2048 ]; then
+        printf '%sok%s (%s MiB)\n' "$C_G" "$C_RST" "$avail"
+    else
+        st_no "need >=2048 MiB, have ${avail:-?}"
+    fi
+
+    if [ "$SELFTEST_FAILED" -gt 0 ]; then
+        printf '\n  %s✗ %d 项环境检查失败，跳过启动测试%s\n\n' "$C_R" "$SELFTEST_FAILED" "$C_RST"
+        return 1
+    fi
+
+    # ------------------------------------------------------ throwaway guest
+    printf '\n  %s启动测试: 2 vCPU / 1024 MiB / 3G, 全核掩码 %s%s\n\n' \
+           "$C_DIM" "$CORESET_FULL" "$C_RST"
+
+    rm -rf "$CKVM_ROOT/$SELFTEST_NAME"
+    mkdir -p "$CKVM_ROOT/$SELFTEST_NAME"
+    cat > "$CKVM_ROOT/$SELFTEST_NAME/vm.conf" <<EOF
+NAME=$SELFTEST_NAME
+UBUNTU_REL=$rel
+CPUS=2
+MEM=1024
+DISK_GB=3
+PORT=$DEF_PORT_BASE
+CPUSET=$CORESET_FULL
+BOOT_CPU=$DEF_BOOT_CPU
+VM_USER=root
+VM_PASS=selftest
+VM_HOSTNAME=$SELFTEST_NAME
+NET_MODE=user
+FORWARDS=22
+EOF
+
+    st_step "fetch image ($rel)"
+    if fetch_image "$SELFTEST_NAME" >/dev/null 2>&1; then
+        st_ok
+    else
+        st_no "download failed"
+        printf '\n  %s✗ 无法取得镜像%s\n\n' "$C_R" "$C_RST"
+        return 1
+    fi
+
+    st_step "build seed"
+    if make_seed "$SELFTEST_NAME" >/dev/null 2>&1 \
+       && [ -f "$CKVM_ROOT/$SELFTEST_NAME/seed.img" ]; then
+        st_ok
+    else
+        st_no "cloud-localds failed"
+        return 1
+    fi
+
+    # ----------------------------------------------------------- run qemu
+    local d; d=$(vm_dir "$SELFTEST_NAME")
+    # both halves, exactly as cmd_create does
+    cp -f "$CKVM_FWDIR/edk2_qemu_aarch64_nonvram.fd" "$d/uefi-code.fd"
+    cp -f "$CKVM_FWDIR/edk2_vars.fd" "$d/uefi-vars.fd"
+    : > "$d/serial.log"
+
+    st_step "qemu starts on cpuset $CORESET_FULL"
+    setsid taskset -c "${BOOT_CPU:-$CORESET_FULL}" "$QEMU" \
+        -name "$SELFTEST_NAME" -M virt,gic-version=3 -cpu max -accel kvm \
+        -smp 2 -m 1024 \
+        -drive if=pflash,format=raw,unit=0,file="$d/uefi-code.fd",readonly=on \
+        -drive if=pflash,format=raw,unit=1,file="$d/uefi-vars.fd" \
+        -drive if=virtio,format=qcow2,file="$d/disk.qcow2" \
+        -drive if=virtio,format=raw,readonly=on,file="$d/seed.img" \
+        -netdev user,id=n0 -device virtio-net-pci,netdev=n0 \
+        -device virtio-rng-pci -display none \
+        -serial file:"$d/serial.log" > "$d/qemu.err" 2>&1 &
+    # running_pid reads this file, and cmd_start writes it the same way
+    echo $! > "$(vm_pid "$SELFTEST_NAME")"
+    sleep 6
+    local p; p=$(running_pid "$SELFTEST_NAME" 2>/dev/null)
+    if [ -n "$p" ]; then
+        st_ok
+        widen_affinity "$p"
+    else
+        st_no "qemu refused to start"
+        printf '    %s\n' "$(tail -2 "$d/qemu.err" 2>/dev/null | tr '\n' ' ')"
+        printf '\n  %s✗ 启动失败%s\n\n' "$C_R" "$C_RST"
+        return 1
+    fi
+
+    st_step "guest reaches login"
+    local i=0
+    while [ "$i" -lt 180 ]; do
+        sleep 2; i=$((i + 2))
+        grep -aq "login:" "$d/serial.log" 2>/dev/null && break
+        [ -n "$(running_pid "$SELFTEST_NAME" 2>/dev/null)" ] || break
+    done
+    if grep -aq "login:" "$d/serial.log" 2>/dev/null; then
+        printf '%sok%s (%ss)\n' "$C_G" "$C_RST" "$i"
+    else
+        st_no "no login prompt after ${i}s"
+        printf '    %s\n' "$(tail -2 "$d/qemu.err" 2>/dev/null | tr '\n' ' ')"
+    fi
+
+    st_step "guest reports its CPUs"
+    # single-CPU guests print "Brought up 1 node, 1 CPU"; SMP guests print
+    # "SMP: Total of N processors activated".  Accept either.
+    local n
+    n=$(grep -ao 'SMP: Total of [0-9]\+' "$d/serial.log" 2>/dev/null | tail -1 | grep -o '[0-9]\+')
+    if [ -z "$n" ]; then
+        n=$(grep -ao 'Brought up [0-9]\+ node[s]*, [0-9]\+ CPU' "$d/serial.log" 2>/dev/null \
+            | tail -1 | grep -o '[0-9]\+ CPU' | grep -o '[0-9]\+')
+    fi
+    if [ "${n:-0}" -ge 1 ]; then
+        printf '%sok%s (%s CPU)\n' "$C_G" "$C_RST" "$n"
+    else
+        st_no "guest never reported its CPU count"
+    fi
+
+    st_step "firmware did not wedge"
+    if grep -aqi 'ASSERT\|Synchronous exception' "$d/serial.log" 2>/dev/null; then
+        st_no "firmware assertion in the serial log"
+    else
+        st_ok
+    fi
+
+    printf '\n'
+    if [ "$SELFTEST_FAILED" -eq 0 ]; then
+        printf '  %s✓ 自检通过，这台机器可以跑虚拟机%s\n\n' "$C_G" "$C_RST"
+        return 0
+    fi
+    printf '  %s✗ %d 项失败%s\n\n' "$C_R" "$SELFTEST_FAILED" "$C_RST"
+    return 1
 }
 
 cmd_help() {
@@ -1855,6 +2060,11 @@ ckvm $CKVM_VERSION - KVM guest manager (MT6833 / evergo)
                                    answer a few prompts (default on a tty)
   ckvm create <name> [options]     create a guest non-interactively
   ckvm versions                    list the releases the store offers
+  ckvm selftest [--keep]           boot a throwaway guest to prove this
+                                   install works: checks /dev/kvm, qemu,
+                                   firmware, the core mask, and that the
+                                   guest reaches a login prompt.
+                                   --keep leaves it for inspection
   ckvm ports                       how port mapping works
   ckvm help ports                  same thing
         --cpus N    vCPU count          (default $DEF_CPUS)
@@ -1953,6 +2163,7 @@ case "${1:-help}" in
     config)    shift; cmd_config "$@" ;;
     edit)      shift; cmd_edit "$@" ;;
     net)       shift; cmd_net "$@" ;;
+    selftest)  shift; cmd_selftest "$@" ;;
     help|-h|--help) cmd_help ;;
     *)         cmd_help; exit 1 ;;
 esac

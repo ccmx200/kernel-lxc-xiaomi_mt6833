@@ -32,6 +32,7 @@
 10. [参考出处](#10-参考出处)
 11. [在红米 Note 11 5G（MT6833）上禁用 GenieZone 并释放 EL2](#11-在红米-note-11-5gmt6833上禁用-geniezone-并释放-el2)
 12. [vCPU 数量与物理核绑定](#12-vcpu-数量与物理核绑定)
+13. [自检：装完为什么要真启一台虚拟机](#13-自检装完为什么要真启一台虚拟机)
 
 ---
 
@@ -1699,6 +1700,69 @@ Limbo 在 Pixel 设备上的原始描述是：
 DDI 0487 对 `ID_AA64*` 系列寄存器的定义支持了这个推断。
 
 来源：<https://developer.arm.com/documentation/ddi0487/latest>
+
+
+---
+
+## 13. 自检：为什么装完要真启一台虚拟机
+
+`ckvm install` 原本的校验（`verify_download`）只做四件事：文件非空、首行是
+`#!/bin/bash`、含 `CKVM_BUILD=`、`bash -n` 通过。它保证的是**下载没有损坏
+或被镜像投毒**，不保证**装完能跑**。
+
+这个区别在开发过程中反复造成误判：文件是好的、命令能执行、帮助能打印，
+但虚拟机根本起不来。文件级校验测不出下列任何一项：
+
+| 故障 | 现象 | 文件校验 |
+|---|---|---|
+| 固件写 NVRAM 卡死 | guest 停在 UEFI，永不进内核 | 通过 |
+| 核掩码跨簇被拒 | QEMU 立即退出 `Failed to put registers` | 通过 |
+| 空 host key | guest 起来了但 sshd `no hostkeys` 退出 | 通过 |
+| 固件断言 | `ASSERT [ArmPlatformPrePeiCore]` | 通过 |
+| 磁盘/镜像损坏 | 启动后找不到根文件系统 | 通过 |
+
+### 13.1 `ckvm selftest` 做什么
+
+分两段。第一段是**廉价的环境检查**，任一失败就跳过第二段，不必等下载：
+
+```text
+root / qemu-system-aarch64 / /dev/kvm / cloud-localds / firmware / free disk
+```
+
+第二段是**真实的启动验证**：建一台一次性 guest（2 vCPU、1024 MiB、3G 磁盘、
+全核掩码），用与 `ckvm start` 相同的 QEMU 参数启动，然后断言：
+
+* QEMU 进程存活（即核掩码与固件都被接受）
+* 串口出现 `login:`，并记录耗时
+* guest 报告了 CPU 数量（接受 `SMP: Total of N` 与 `Brought up 1 node, N CPU`
+  两种写法 —— 只测一种会在单 vCPU 时误报）
+* 串口里没有 `ASSERT` 或 `Synchronous exception`
+
+结束后自动删除测试机；`--keep` 保留它供 `ckvm console` 检查。
+
+### 13.2 实现上踩到的坑
+
+写这个自检时踩了几个，都记在这里以免以后重复：
+
+1. **不能只拷 `uefi-vars.fd`。** `cmd_create` 会拷**两个**固件文件
+   （`uefi-code.fd` 与 `uefi-vars.fd`），只拷一个 QEMU 会报
+   `Could not open .../uefi-code.fd`。自检里必须照做。
+2. **必须写 `qemu.pid`。** `running_pid` 是读这个文件的，不写它就认为
+   QEMU 没起来 —— 即使 QEMU 已经正常引导。症状是"启动失败"但
+   `qemu.err` 是空的。
+3. **颜色变量名是 `C_G` / `C_R`**，不是 `C_GREEN` / `C_RED`；用错会在
+   `set -u` 下直接中断。
+4. **测试脚本里别用 `pkill -f ckvm-selftest`** —— 它连自己的命令行一起匹配，
+   会把发起测试的 shell 杀掉。用 `pkill -f 'name ckvm-selftest'`。
+5. **1 个 vCPU 的 guest 不稳。** 有一次固件抛异常（串口出现
+   `X29=... SP=... PSTATE=... EL1h`）。自检改用 2 vCPU，既更接近实际使用，
+   也更稳。
+
+### 13.3 与第 12 节的关系
+
+自检用的掩码是 `CORESET_FULL`（全核），也就是第 12 节那个"先钉单核再放开"
+的路径。所以自检同时也在验证核掩码逻辑 —— 如果有人把
+`widen_affinity` 改坏了，`ckvm selftest` 会当场失败。
 
 
 ## 附：本机原始测量记录
