@@ -4,8 +4,9 @@ ReSukiSU + KVM + BBRv2 + zstd/lz4 + Binder 优化内核。
 
 > **作者**：璀璨梦星 · cuicanmx · <https://github.com/ccmx200>
 >
-> 本项目在社区成果之上整合而成，**并非全部原创**。各部分来源见
-> [移植与出处](#移植与出处) 与 [致谢](#致谢)。
+> 本项目在社区成果之上整合而成，**并非全部原创**。主要移植来源为
+> [`seriaTvT/kernel_mt6893`](https://github.com/seriaTvT/kernel_mt6893)；
+> 各部分来源见 [移植与出处](#移植与出处) 与 [致谢](#致谢)。
 
 ## 基本信息
 
@@ -379,19 +380,44 @@ ReSukiSU-AdrenalinKernel-YYYYMMDD-HHMM.zip
 
 ## 移植与出处
 
-本项目整合了多项社区成果与上游内核代码。以下按**代码中可确认**的信息标注
-来源；无法从代码中确认的部分只描述其性质，不臆造具体提交。
+本项目整合了多项社区成果与上游内核代码。以下按**代码与提交记录中可确认**的
+信息标注来源。
+
+### 主要移植来源
+
+**BBRv2、LZ4 / zstd、以及 KVM vGIC/ITS 修复迁移自
+[`seriaTvT/kernel_mt6893`](https://github.com/seriaTvT/kernel_mt6893)。**
+
+对应提交：
+
+```text
+b5c5fce5b  migrate BBRv2 + LZ4/zstd and KVM vGIC/ITS fixes from kernel_mt6893
+d377ff482  wip: migrate bbr/fq/zram lz4 from chopin      (更早的一次尝试)
+```
+
+逐项核对的依据（与本机 `/root/kernel_mt6893` 工作树对比）：
+
+| 组件 | 与该仓库的关系 |
+|---|---|
+| `net/ipv4/tcp_bbr2.c` | 内容**完全相同** |
+| `lib/lz4/` | 内容**完全相同** |
+| `lib/zstd/` | 内容**完全相同** |
+| `drivers/android/dbitmap.h` | 内容**完全相同** |
+| `include/uapi/linux/android/binder.h` | 内容**完全相同** |
+| `drivers/android/binder.c` | 有差异（本仓库另有改动） |
+| KVM vGIC/ITS 修复 | 由 `b5c5fce5b` 一并迁移 |
+
+### 各组件来源一览
 
 | 组件 | 来源 | 可确认依据 |
 |---|---|---|
+| BBRv2 拥塞控制 | `seriaTvT/kernel_mt6893`（其自身实现源自 Linux 内核上游） | `tcp_bbr2.c` 与该仓库逐字节相同；文件头保留原作者注释与 `TODO(ncardwell)` |
+| lz4（1.10.0） | `seriaTvT/kernel_mt6893`（上游为 lz4 项目） | `lib/lz4/lz4.h` 的 `LZ4_VERSION_MAJOR/MINOR/RELEASE` = 1/10/0；目录与该仓库相同 |
+| zstd（1.5.7） | `seriaTvT/kernel_mt6893`（上游为 zstd 项目） | `include/linux/zstd_lib.h` 的 `ZSTD_VERSION_*` = 1/5/7；目录与该仓库相同 |
+| Binder Oneway 垃圾消息检测<br>位图描述符查找 | `dbitmap.h` 与 `binder.h` 与 `kernel_mt6893` 相同；`binder.c` 另有本地改动 | 符号 `BR_ONEWAY_SPAM_SUSPECT`、`BINDER_WORK_TRANSACTION_ONEWAY_SPAM_SUSPECT`、`dbitmap.h` |
+| KVM vGIC / ITS 修复 | 由 `b5c5fce5b` 迁自 `kernel_mt6893` | 提交说明 |
 | ReSukiSU（root 方案） | ReSukiSU 上游项目，以源码形式内置于 `ReSukiSU/`，经 `drivers/kernelsu` 符号链接接入内核 | 目录内自带 `LICENSE` / `CONTRIBUTING.md` / `SECURITY.md` |
-| BBRv2 拥塞控制 | Linux 内核上游的 BBRv2 实现（`net/ipv4/tcp_bbr2.c`） | 文件头保留原作者注释与 `TODO(ncardwell)` 标记，作者为 Neal Cardwell |
-| Binder Oneway 垃圾消息检测<br>位图描述符查找 | 上游内核回移。相关符号为 `BR_ONEWAY_SPAM_SUSPECT`、`BINDER_WORK_TRANSACTION_ONEWAY_SPAM_SUSPECT`、`dbitmap.h` | 这些符号出现在上游内核较新版本中 |
-| BBRv2 / zstd / lz4 / Binder / cgroup / THP 等回移 | 上游内核与各上游库 | 见各项说明 |
-| zstd | 上游 zstd 项目（版本 1.5.7） | `lib/zstd/` |
-| lz4 | 上游 lz4 项目（版本 1.10.0） | `lib/lz4/lz4.h` 的 `LZ4_VERSION_MAJOR` 等版本宏 |
 | KVM NISV / 外部数据中止注入 | Linux 内核上游 5.10 引入的机制，回移至本 4.14 树 | 见 [docs/KVM.md](docs/KVM.md) 的出处列表 |
-| KVM / vGIC / ITS 修复 | 上游内核回移 | 见 `docs/KVM.md` |
 | 不写 NVRAM 的 EDK2 固件 | Limbo for Tensor 项目（`wasdwasd0105/limbo_tensor`）随 APK 分发 | 见 `kvm_manager/TECHNICAL.md` 第 4 节 |
 | 禁用 GenieZone 的工具链 | `jsbsbxjxh66/mtk-soc-disable-geniezone`（MIT） | 见 `kvm_manager/TECHNICAL.md` 第 11 节 |
 
@@ -402,6 +428,9 @@ ReSukiSU-AdrenalinKernel-YYYYMMDD-HHMM.zip
 
 ## 致谢
 
+- **[`seriaTvT/kernel_mt6893`](https://github.com/seriaTvT/kernel_mt6893)**
+  —— **本项目的主要移植来源**。BBRv2、LZ4 / zstd、KVM vGIC/ITS 修复以及
+  Binder 的位图描述符相关代码都来自这个仓库。特别感谢。
 - **ReSukiSU** 及其贡献者 —— root 方案
 - **Neal Cardwell** 与 BBRv2 的贡献者 —— 拥塞控制
 - **jsbsbxjxh66**（酷安）—— `mtk-soc-disable-geniezone`，禁用 GenieZone
