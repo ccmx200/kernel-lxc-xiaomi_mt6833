@@ -189,112 +189,109 @@ static const char *default_compressor = "zstd";
 
 ## 用虚拟机（KVM / UEFI）
 
-内核已经带 KVM，可以直接在这台手机上跑一个完整的 Ubuntu 虚拟机，
-而且是**硬件加速**的（不是模拟），装了 UEFI 固件所以**能装系统、能跑 Windows**。
+内核带 KVM，可以在这台手机上跑**硬件加速**的完整虚拟机，装了 UEFI 固件，
+能装系统、能多开。
 
-如果你只想用、不想理解原理，照着下面做就行。
-想了解"为什么必须这么配"的，看 [`docs/KVM.md`](docs/KVM.md)。
-
-### 一句话原理
-
-虚拟机要有两个东西：**固件**（相当于电脑的 BIOS）和**系统盘**。
-
-- 固件：**必须用不写 NVRAM 的那个版本**。普通固件一写就会让虚拟机卡死，
-  这是硬伤，不是配置问题。脚本里已经帮你换好了。
-- 系统盘：一个 qcow2 文件，里面是 Ubuntu。
-
-### 准备工作（一键）
+### 安装
 
 ```bash
-bash /root/kvm-vm.sh setup
+./kvm_manager/kvm-vm.sh install     # 装成 ckvm 命令 + systemd 服务
 ```
 
-它会自动下载 Ubuntu 26.04 的 arm64 镜像、转成 qcow2、扩到你配置的容量、
-生成 cloud-init，然后找 UEFI 固件。
+### 创建与启动
 
-**关于固件**：必须是「不写 NVRAM」的那一份，它不在任何 git 仓库里
-（Limbo 分发在 APK 内），所以没法自动下载。脚本会依次在下面这些位置找：
+```bash
+ckvm create ubuntu26                     # 自动下载 Ubuntu 26.04 镜像并建盘
+ckvm start ubuntu26
+ssh u0@127.0.0.1 -p 8023                 # 密码 1
+```
+
+可以调参数：
+
+```bash
+ckvm create win --cpus 4 --mem 1536 --disk 50 --rel 24.04 --port 8030
+```
+
+### 多开
+
+每个虚拟机有独立目录、独立磁盘、独立端口，互不影响：
+
+```bash
+ckvm create a
+ckvm create b
+ckvm start a && ckvm start b
+ckvm list
+```
 
 ```text
-/sdcard/limbo_fw/edk2_qemu_aarch64_nonvram.fd
-/root/limbo_fw/edk2_qemu_aarch64_nonvram.fd
-<vmdir>/uefi-code.fd
+  NAME      STATE    CPUS   MEM      DISK    PORT   SSH
+  a         running  8      2048     50G     8023   ssh u0@127.0.0.1 -p 8023
+  b         running  8      2048     50G     8024   ssh u0@127.0.0.1 -p 8024
 ```
 
-找不到时它会直接告诉你从 Termux 怎么拷（一条 `su -c` 命令）。
-
-### 配置
-
-设置都在 `<vmdir>/vm.conf`，可以直接编辑：
+### 命令行一览
 
 ```bash
-bash /root/kvm-vm.sh config     # 看当前配置
-bash /root/kvm-vm.sh edit       # 改
+ckvm list                    # 所有虚拟机及状态
+ckvm status <name>           # 详细状态 + 串口末尾
+ckvm console <name>          # 实时看串口
+ckvm stop|restart <name>
+ckvm rm <name> [-f]          # 删除
+ckvm config [name]           # 看配置
+ckvm edit <name>             # 改配置
 ```
+
+### systemd 管理
+
+```bash
+ckvm enable ubuntu26         # 启用并启动，且开机自启
+systemctl status ckvm@ubuntu26
+systemctl stop   ckvm@ubuntu26
+ckvm disable ubuntu26
+```
+
+### 镜像源（国内加速）
+
+默认已经配好国内源，改脚本顶部的变量即可切换：
+
+```bash
+MIRROR_IMAGE_LIST="https://mirror.nju.edu.cn/ubuntu-cloud-images https://cloud-images.ubuntu.com"
+MIRROR_APT="https://mirrors.ustc.edu.cn/ubuntu-ports"
+```
+
+镜像按顺序回退，第一个失败自动试下一个。`MIRROR_APT` 会写进 guest 的
+cloud-init，装完系统后 apt 直接走 USTC。
+
+> USTC 的 cloud-images 目录只镜像了 amd64，arm64 会 403，所以镜像走 NJU。
+
+### 配置文件
+
+全局：脚本顶部。单个虚拟机：`/var/lib/ckvm/<name>/vm.conf`
 
 ```ini
-CPUS=8            # vCPU 数（绑核后 8 个可用）
+CPUS=8            # vCPU 数
 MEM=2048          # 内存 MiB
-DISK_GB=50        # 磁盘容量
-SSH_PORT=8023
-CPUSET=6-7        # 绑定的物理核（两个大核）
-USERNAME=u0_207
-PASSWORD=1
+DISK_GB=50
+PORT=8023
+CPUSET=6-7        # 绑定的物理核，别乱改（见下）
+VM_USER=u0
+VM_PASS=1
 ```
 
-### 日常使用
+### 四个坑（都已在脚本里处理）
 
-启动脚本已经放在仓库里，也复制到了容器的 `/root/kvm-vm.sh`：
+1. **必须绑核**。这台机器是 big.LITTLE（6 个 A55 + 2 个 A76），KVM 在不同
+   核上暴露的 ID 寄存器不同。不绑核 QEMU 会随机报
+   `Failed to put registers after init`。脚本固定 `taskset -c 6-7`。
+   **绑核后 8 核也能用。**
+2. **固件必须是不写 NVRAM 的那份**。普通 EDK2 一写变量存储就会让虚拟机
+   卡死，这是 ARM 架构限制（写 MMIO 的指令不置 `ISV` 位，KVM 无法解码）。
+3. **NVRAM 每次要刷新**。脚本每次 `start` 都从模板拷一份干净的，
+   否则 GRUB 会卡在加载后不动。
+4. **固件不能自动下载**。它只打包在 Limbo 的 APK 里，不在任何 git 仓库。
+   `ckvm install` 会自动在常见位置找；找不到会打印从 Termux 拷贝的命令。
 
-```bash
-bash /root/kvm-vm.sh setup     # 首次准备（下载镜像等）
-bash /root/kvm-vm.sh start     # 开机
-bash /root/kvm-vm.sh status    # 看状态、看串口
-bash /root/kvm-vm.sh console   # 实时看画面（串口文字）
-bash /root/kvm-vm.sh stop      # 关机
-```
-
-约 30 秒后会出现登录提示。**开机大约需要半分钟**，别急。
-
-### 登录
-
-虚拟机里的 SSH 映射在容器的 `8023` 端口：
-
-```bash
-ssh u0_207@127.0.0.1 -p 8023      # 密码：1
-```
-
-如果要从电脑（不是容器里）连，先开一条隧道：
-
-```bash
-plink -pw 1 -N -L 8023:127.0.0.1:8023 -P 22 root@<手机IP>
-ssh u0_207@127.0.0.1 -p 8023
-```
-
-### 几个必须知道的坑
-
-1. **别去掉 `taskset`**。启动脚本用 `taskset -c 6-7` 把 QEMU 绑到两个
-   大核上。这台机器是大小核（6 个 A55 + 2 个 A76），寄存器值不同；不绑核
-   会随机启动失败，报 `Failed to put registers after init`。
-   **绑了核之后 8 核也能用。**
-2. **别用 `-kernel` 直接引导**。这个镜像的内核是 PE32+ 格式，QEMU 不认。
-   必须走 UEFI（也就是上面这套）。
-3. **配置改 `vm.conf`**。vCPU 数、内存、磁盘、端口、用户名密码都在
-   里面，改完 `start` 生效。
-4. **没有图形界面**，现在只有串口文字。要 VNC 自己加
-   `-device virtio-gpu-pci`。
-
-### 实测效果
-
-```text
-Ubuntu 26.04.1 LTS
-内核    7.0.0-38-generic
-CPU     3 核
-内存    1946 MiB
-磁盘    48G（50G 盘，已自动扩容）
-```
-
----
+想要图形界面自己加 `-device virtio-gpu-pci` 配 VNC；默认只有串口。
 
 ## 编译
 
