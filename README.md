@@ -187,6 +187,113 @@ static const char *default_compressor = "zstd";
 原因：该 4.14 THP 回移在 MIUI mem reclaim 场景可能触发 `reclaim_pte_range` 崩溃。
 
 
+## 在 KVM 上运行 Ubuntu 26.04（实机验证可用）
+
+下面是本内核在 MT6833 / everpal 上实际跑通 Ubuntu 26.04 guest 的完整方案。
+
+### 为什么不能直接用标准 UEFI 固件
+
+ARM 规定：**带 writeback 的 load/store（如后索引 `ldr x0, [x1], #4`）以及
+`LDXR/STXR` 这类指令永不置 `ESR_EL2.ISV` 位**，而 QEMU 的 NISV 处理器不做
+指令解码，只能把外部数据中止注入 guest，无法代替真正的指令模拟。
+标准 EDK2/AAVMF 在写 pflash NVRAM 变量时恰好使用这类指令，于是：
+
+```text
+kvm: load/store instruction decoding not implemented
+vCPU -> paused (internal-error)   （旧内核）
+        或 活锁（打上 NISV 回移后，CPU 满载但无进展）
+```
+
+解决办法是**换一个不写 NVRAM 的 EDK2 固件**。本方案使用 Limbo 项目随 APK
+分发的 `edk2_qemu_aarch64_nonvram.fd`。换用后 UEFI 正常启动，`dmesg` 中
+NISV abort 计数为 0。
+
+### 文件准备
+
+```text
+/root/vm26/disk.qcow2       Ubuntu 26.04 系统盘（qcow2，50G 虚拟）
+/root/vm26/uefi-code.fd     非易失变量版 EDK2（edk2_qemu_aarch64_nonvram.fd）
+/root/vm26/uefi-vars.fd     NVRAM 变量存储（每次启动前从模板复制一份干净的）
+/root/vm26/seed.img         cloud-init，创建用户 u0_207 / 密码 1
+```
+
+### 启动脚本
+
+```bash
+#!/bin/bash
+# 1) 停掉旧 guest（先温柔后强制，务必留出间隔）
+for p in $(pgrep -f qemu-system-aarch64); do kill -15 "$p"; done
+sleep 5
+for p in $(pgrep -f qemu-system-aarch64); do kill -9 "$p"; done
+sleep 5
+
+# 2) 干净 NVRAM（关键：被污染的变量存储会让 GRUB 卡死）
+cp -f /root/limbo_fw/edk2_vars.fd /root/vm26/uefi-vars.fd
+
+# 3) 预热：首个 KVM guest 常因 EINVAL 启动失败，先跑一个一次性的
+/usr/bin/qemu-system-aarch64 -name warm -M virt,gic-version=3 -cpu max \
+  -accel kvm -smp 1 -m 512 -display none -serial null >/dev/null 2>&1 &
+sleep 5; kill -15 %1 2>/dev/null; sleep 4; kill -9 %1 2>/dev/null; sleep 2
+
+# 4) 正式启动
+nohup /usr/bin/qemu-system-aarch64 -name ubuntu2604 \
+  -M virt,gic-version=3 -cpu max -accel kvm -smp 4 -m 2048 \
+  -drive if=pflash,format=raw,unit=0,file=/root/vm26/uefi-code.fd,readonly=on \
+  -drive if=pflash,format=raw,unit=1,file=/root/vm26/uefi-vars.fd \
+  -drive if=virtio,format=qcow2,file=/root/vm26/disk.qcow2 \
+  -drive if=virtio,format=raw,readonly=on,file=/root/vm26/seed.img \
+  -netdev user,id=n0,hostfwd=tcp:0.0.0.0:8023-:22 \
+  -device virtio-net-pci,netdev=n0 -device virtio-rng-pci \
+  -display none -serial file:/tmp/kvm.log \
+  > /tmp/kvm.err 2>&1 &
+```
+
+约 30 秒后串口出现登录提示：
+
+```text
+ubuntu2604 login:
+```
+
+### 登录
+
+容器内 `8023` 即 guest 的 `22`：
+
+```bash
+ssh u0_207@127.0.0.1 -p 8023      # 密码 1
+```
+
+从局域网访问需要经宿主机转发，或在本地建立隧道：
+
+```bash
+plink -pw 1 -N -L 8023:127.0.0.1:8023 -P 22 root@<宿主IP>
+ssh u0_207@127.0.0.1 -p 8023
+```
+
+### 实测结果
+
+```text
+PRETTY_NAME="Ubuntu 26.04.1 LTS"
+kernel        7.0.0-38-generic
+vCPU          3        (-smp 4，guest 保留 1 个)
+Memory        1946 MiB
+/dev/root     48G  2% used     (50G 磁盘，cloud-init 已自动扩容)
+```
+
+### 已知限制与坑
+
+1. **vCPU 数量**：`-smp 4` 是可用的上限，`-smp 8` 会让固件断言失败
+   （`ASSERT [ArmPlatformPrePeiCore]`）。Limbo 的"100% Success Mode"也是
+   先跑 4 核。少于 4 核（1/2）在本内核上同样会 `Failed to put registers`。
+2. **KVM vCPU 创建是间歇性的**：每次销毁 guest 后紧接着启动，首次常报
+   `Failed to put registers after init: Invalid argument`。上面脚本里的
+   **间隔 + 预热 guest** 是为规避它，实测有效。
+3. **NVRAM 必须每次用干净副本**：反复启动会污染变量存储，表现为 GRUB 加载
+   后卡死（CPU 满载、串口不动）。
+4. **不要用 `-kernel` 引导该镜像的内核**：26.04 的 `/boot/vmlinuz-*` 是
+   PE32+ EFI 应用，QEMU 的 arm64 加载器只接受 gzip 或裸 `Image`。
+5. **`-display none`**：本方案只有串口。要图形界面需自行加
+   `-device virtio-gpu-pci` 配合 VNC。
+
 ## 编译
 
 ```sh
