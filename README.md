@@ -70,21 +70,7 @@ void *val = &sym;
 - 修复保存 ITE 时 NULL collection 导致内核崩溃
 - VCPU ioctl 使用 `task_pid(current)`
 
-真机确认：
 
-```text
-CPU: All CPU(s) started at EL2
-kvm [1]: VHE mode initialized successfully
-kvm [1]: GIC system register CPU interface enabled
-```
-
-注意：QEMU 11 在旧 4.14 KVM 上仍可能报 ID 寄存器设置错误：
-
-```text
-Failed to put registers after init: Invalid argument
-```
-
-这不是内核 KVM 没起来，而是 QEMU 版本/KVM register ABI 兼容问题。需要旧版 QEMU 或已适配的 QEMU。
 
 ### BBRv2
 
@@ -150,12 +136,6 @@ static const char *default_compressor = "zstd";
 
 原因：该 4.14 THP 回移在 MIUI mem reclaim 场景可能触发 `reclaim_pte_range` 崩溃。
 
-## 未包含
-
-- MGLRU：未移植。它依赖大量 mm/cgroup/pid 基础回移，强行合并风险较高。
-- LTS 4.14.357-openela 全量升级：未做。
-- CPU7 EAS 功耗模型修复：未移植。
-- Chopin 专属 DTB / preloader / 超频 / EROFS 注入等：未移植。
 
 ## 编译
 
@@ -175,12 +155,6 @@ cd /root/kernel-lxc_xiaomi_mtk810_mt6833-resukisu
 ```text
 out/arch/arm64/boot/Image.gz
 ReSukiSU-AdrenalinKernel-YYYYMMDD-HHMM.zip
-```
-
-当前最新产物示例：
-
-```text
-/root/ReSukiSU-AdrenalinKernel-20261004-1056.zip
 ```
 
 ## 刷入
