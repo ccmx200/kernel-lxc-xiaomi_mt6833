@@ -155,7 +155,7 @@ ckvm rm <名字> [-f]              # 删除（-f 可删运行中的）
 
 ckvm list                        # 所有虚拟机
 ckvm status <名字>               # 详细状态 + 串口末尾
-ckvm console <名字>              # 实时看串口，Ctrl-C 退出
+ckvm console <名字> [-a|-n N]    # 实时看串口，Ctrl-C 断开
 
 ckvm enable <名字>               # systemd 启用 + 启动 + 开机自启
 ckvm disable <名字>
@@ -362,6 +362,17 @@ su -c 'cp /sdcard/limbo_fw/edk2_*.fd /usr/local/share/ckvm/firmware/'
 **想换用户名密码**
 改 `vm.conf` 的 `VM_USER`/`VM_PASS` 后 `ckvm rm` 重建（cloud-init 只在首次
 启动生效），或进系统 `passwd`。
+
+**`ckvm console` 要 Ctrl-C 才能退出，正常吗**
+正常。它默认只显示**新输出**，不会重放开机时的 bootlog。想看历史：
+
+```bash
+ckvm console <名字> -n 50    # 先显示最后 50 行
+ckvm console <名字> -a       # 显示全部
+```
+
+串口里的终端控制序列（DCS / OSC / 私有模式）会被自动剥掉，颜色保留。
+**要交互登录用 ssh 更方便** —— `ckvm status <名字>` 会告诉你地址。
 
 **想要图形界面**
 默认只有串口。自己在 QEMU 参数里加 `-device virtio-gpu-pci` 配 VNC。

@@ -711,12 +711,92 @@ cmd_status() {
     say "serial:  $(wc -c < "$(vm_log "$name")" 2>/dev/null || echo 0) bytes"
     grep -aq "login:" "$(vm_log "$name")" 2>/dev/null && say "login prompt: present"
     say "--- serial tail ---"
-    tr -d '\000' < "$(vm_log "$name")" 2>/dev/null | tail -8
+    tail -n 8 "$(vm_log "$name")" 2>/dev/null | strip_serial
 }
 
+# Strip the terminal-control traffic that UEFI, GRUB and the kernel emit on a
+# serial port: DCS, OSC, private mode setters (ESC[!p, ESC[?7h), cursor moves,
+# position reports.  SGR colour sequences are preserved so a console stays
+# readable.
+#
+# Implemented in Python on purpose: doing this correctly with sed/awk is a
+# trap.  GNU sed 4.9 has no -u (so it buffers a live stream), BRE cannot
+# express the CSI parameter ranges, and the awk version silently mis-parsed
+# private-mode sequences.
+SERIAL_SAN_PY='
+import re, sys
+SGR  = rb"\x1b\[[0-9;]*m"
+DROP = re.compile(
+    rb"\x1b\[[0-9:;<=>?!]*[a-ln-zA-LN-Z]"
+    rb"|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)"
+    rb"|\x1bP[^\x1b]*\x1b\\"
+    rb"|\x1b[()][A-Z0-9]"
+    rb"|\x1b[=>]"
+    rb"|\x1b")
+def sanitize(b):
+    out, pos = [], 0
+    for m in re.finditer(SGR, b):
+        out.append(DROP.sub(b"", b[pos:m.start()]))
+        out.append(m.group(0))
+        pos = m.end()
+    out.append(DROP.sub(b"", b[pos:]))
+    return b"".join(out)
+sys.stdout.buffer.write(sanitize(sys.stdin.buffer.read()))
+'
+
+strip_serial() {
+    if command -v python3 >/dev/null 2>&1; then
+        python3 -u -c "$SERIAL_SAN_PY"
+    else
+        # no python3: drop every escape (colour is lost, text stays clean)
+        tr -d '\000' | sed -e 's/'$(printf '\033')'\[[0-9;]*[a-zA-Z]//g'
+    fi
+}
+
+# usage: ckvm console <name> [-a] [-n N]
+#   default: attach and only show NEW output (no boot-log replay)
+#   -a     : replay the whole log first
+#   -n N   : replay the last N lines first
 cmd_console() {
-    load_vm "$1"
-    tail -f "$(vm_log "$1")" | tr -d '\000'
+    local name="$1"; shift || true
+    local replay=-1
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -a|--all) replay=0; shift ;;
+            -n)       replay="${2:-40}"; shift 2 ;;
+            *)        shift ;;
+        esac
+    done
+
+    load_vm "$name"
+    local log; log=$(vm_log "$name")
+    if [ ! -f "$log" ]; then
+        warn "no serial log for '$name' (is it running? try: ckvm start $name)"
+        return 1
+    fi
+    if ! running_pid "$name" >/dev/null; then
+        warn "guest '$name' is not running; showing the stale log"
+    fi
+
+    say "serial console for '$name'  (Ctrl-C to detach; the guest keeps running)"
+    say "  log: $log"
+    say "  tip: an interactive login is easier over ssh - see 'ckvm status $name'"
+    printf '\n'
+
+    local lines
+    if [ "$replay" -eq 0 ]; then
+        lines=$(wc -l < "$log")
+    elif [ "$replay" -gt 0 ]; then
+        lines="$replay"
+    else
+        lines=0                    # attach only: skip everything already there
+    fi
+
+    if [ "$lines" -gt 0 ]; then
+        tail -n "$lines" "$log" | strip_serial
+    fi
+    # tail -F (capital) survives log rotation/recreation
+    tail -c +$(( $(stat -c%s "$log") + 1 )) -F "$log" 2>/dev/null | strip_serial
 }
 
 cmd_rm() {
