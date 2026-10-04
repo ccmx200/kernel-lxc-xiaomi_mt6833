@@ -13,37 +13,60 @@
 curl -fsSLk https://raw.githubusercontent.com/ccmx200/kernel-lxc-xiaomi_mt6833/resukisu/kvm_manager/kvm-vm.sh | bash -s -- install
 ```
 
-### GitHub 被墙时
+**默认走 GitHub 官方源**，不做任何加速或改写。
 
-这台设备实测**直连 GitHub 会被重置连接**（`raw.githubusercontent.com`
-和 `github.com` 都是 `Connection reset by peer`），用镜像即可：
+### 国内网络：显式加 `-cn`
 
 ```bash
-# 镜像 1
-curl -fsSLk https://git.yylx.win/github.com/ccmx200/kernel-lxc-xiaomi_mt6833/raw/resukisu/kvm_manager/kvm-vm.sh | bash -s -- install
-
-# 镜像 2
-curl -fsSLk https://ghproxy.net/https://raw.githubusercontent.com/ccmx200/kernel-lxc-xiaomi_mt6833/resukisu/kvm_manager/kvm-vm.sh | bash -s -- install
-
-# 镜像 3
-curl -fsSLk https://gh-proxy.com/https://raw.githubusercontent.com/ccmx200/kernel-lxc-xiaomi_mt6833/resukisu/kvm_manager/kvm-vm.sh | bash -s -- install
+curl -fsSLk https://raw.githubusercontent.com/ccmx200/kernel-lxc-xiaomi_mt6833/resukisu/kvm_manager/kvm-vm.sh | bash -s -- install -cn
 ```
 
-`install` 内部**自己也有镜像回退**：下载脚本和固件时会依次尝试上面这些源，
-哪个通用哪个。所以只要你的网络能到其中任意一个，第一条命令就能装完。
-
-也可以手动指定源：
+或者用环境变量：
 
 ```bash
-curl -fsSLk <镜像地址>/kvm-vm.sh | bash -s -- install
-# 或
-REPO_LIST="https://git.yylx.win/github.com/ccmx200/kernel-lxc-xiaomi_mt6833/raw/resukisu" bash kvm-vm.sh install
+CKVM_ACCEL=1 curl -fsSLk <地址> | bash -s -- install
+```
+
+`-cn` 会按顺序探测这些加速地址，用第一个通的：
+
+```text
+git.yylx.win   →   ghproxy.net   →   gh-proxy.com
+```
+
+**加速是显式选择，不是默认行为。** 不加 `-cn` 就老老实实走 GitHub；
+加了 `-cn` 但都不通会自动回落到 GitHub，不会静默改源。
+
+### 直接给地址
+
+```bash
+curl -fsSLk https://你的镜像/kvm-vm.sh | bash -s -- install
+```
+
+### GitHub 被墙时
+
+这台设备实测**直连 GitHub 会被重置**（`raw.githubusercontent.com` 和
+`github.com` 都是 `Connection reset by peer`）。
+
+这种情况下的正确做法是**先手动把脚本抓下来再装**（`-cn` 内部也会探测，
+但 curl 自己那一跳已经在墙上了，得先绕过）：
+
+```bash
+# 任选一个能通的加速地址去抓脚本本身
+curl -fsSLk https://git.yylx.win/github.com/ccmx200/kernel-lxc-xiaomi_mt6833/raw/resukisu/kvm_manager/kvm-vm.sh -o /tmp/ckvm.sh
+bash /tmp/ckvm.sh install -cn          # 脚本和固件的下载走加速
+```
+
+或者：
+
+```bash
+curl -fsSLk https://ghproxy.net/https://raw.githubusercontent.com/ccmx200/kernel-lxc-xiaomi_mt6833/resukisu/kvm_manager/kvm-vm.sh -o /tmp/ckvm.sh
+bash /tmp/ckvm.sh install -cn
 ```
 
 ### 想先看脚本内容
 
 ```bash
-curl -fsSLk <上面任一个地址> -o /tmp/ckvm.sh
+curl -fsSLk <地址> -o /tmp/ckvm.sh
 less /tmp/ckvm.sh
 bash /tmp/ckvm.sh install
 ```
@@ -99,6 +122,8 @@ ckvm create <名字> [选项]
 | `--disk GB` | 磁盘容量 | `50` |
 | `--rel V` | Ubuntu 版本 | `26.04` |
 | `--port N` | 宿主机 SSH 端口 | 从 `8023` 起自动找空位 |
+| `--net M` | 网络模式 `user` / `host` | `user` |
+| `--fwd L` | 要映射的 guest 端口 | `22` |
 
 例如装一个 24.04 的小机器：
 
@@ -150,9 +175,119 @@ ckvm console <名字>              # 实时看串口，Ctrl-C 退出
 ckvm enable <名字>               # systemd 启用 + 启动 + 开机自启
 ckvm disable <名字>
 
+ckvm net [名字]                  # 看容器/虚拟机的网络情况
 ckvm config [名字]               # 看全局或单个配置
 ckvm edit <名字>                 # 编辑单个配置
 ```
+
+---
+
+## 网络
+
+有两种模式，创建时用 `--net` 选。
+
+### user 模式（默认）
+
+QEMU 自己做 NAT，用**端口映射**访问。不需要 tap、不需要额外权限，
+任何环境都能用。
+
+```bash
+ckvm create web --fwd 22,80,443           # 22 映射到 --port，80/443 同号
+ckvm create app --fwd 22,8080:80          # guest 80 映射到宿主机 8080
+```
+
+规则：
+
+- guest 的 **22** 会映射到该虚拟机的 `PORT`（默认从 8023 起自动分配），
+  这样多开时不会互相抢端口
+- 其他端口默认**同号映射**，也可以写 `宿主机端口:guest端口`
+- 启动时会检查端口占用，被占了会提示
+
+```text
+$ ckvm start web
+  guest 'web' running (pid 11506, 4 vCPU, 1536 MiB, cpuset 6-7)
+  network: user-mode NAT
+    ssh u0@127.0.0.1 -p 8023   (password: 1)
+    port 80 -> 127.0.0.1:80
+    port 443 -> 127.0.0.1:443
+```
+
+### host 模式（tap）
+
+给 guest 一块 tap 网卡，它在**容器的网段**里拿到自己的 IP，自己跑 sshd，
+**完全不需要端口映射**。
+
+```bash
+ckvm create srv --net host
+ckvm start srv
+```
+
+```text
+$ ckvm start srv
+  tap ckvm-srv up: host 172.28.100.1 / guest 172.28.100.2
+  guest 'srv' running (pid 9978, 2 vCPU, 1024 MiB, cpuset 6-7)
+  network: tap, the guest is on this container's network
+    guest ip : 172.28.100.2/24   gateway 172.28.100.1
+    ssh      : u0@172.28.100.2   (password: 1)
+    from the container, no port forward needed.
+```
+
+脚本会自动：
+
+- 建 tap 设备 `ckvm-<名字>`，配好 `172.28.100.1/24`
+- 开 `ip_forward`，加 MASQUERADE 和 FORWARD 规则，让 guest 能上网
+- 通过 cloud-init 给 guest 配静态 IP 和网关
+- `stop` / `rm` 时自动拆掉 tap 和 iptables 规则
+
+`ckvm list` 会直接显示该连哪个地址：
+
+```text
+  NAME             STATE    CPUS   MEM      DISK    PORT   SSH
+  srv              running  2      1024     50G     8031   ssh u0@172.28.100.2
+  web              running  4      1536     50G     8023   ssh u0@127.0.0.1 -p 8023
+```
+
+### ⚠️ 关于「直接上局域网」
+
+**host 模式拿到的 `172.28.100.x` 是容器内部网段的地址，不是手机在局域网上
+的地址。** 从局域网里另一台电脑是直连不到的，因为 droidspaces 容器有自己的
+网络命名空间。
+
+想让 guest 真正出现在局域网上，只有两条路：
+
+**a) 用 user 模式 + 从 Android 侧转发（推荐，最简单）**
+
+guest 的端口映射在容器里。要让局域网能访问，需要在 Android 宿主机上把端口
+转进容器。`ckvm net <名字>` 会打印具体命令。
+
+**b) 在 Android 侧做桥接**
+
+需要 Android 宿主机的 root shell：
+
+```bash
+# 在手机上，root 身份
+ip link add br-ckvm type bridge
+ip link set eth0 master br-ckvm        # 容器的 veth 对端
+ip link set br-ckvm up
+```
+
+这样 guest 就出现在手机所在的网段里了。
+
+### 查看网络情况
+
+```bash
+ckvm net            # 容器网卡、路由、所有虚拟机的网络模式
+ckvm net <名字>     # 单个虚拟机的 tap、NAT 规则、访问方式和下一步提示
+```
+
+### 避开 droidspaces 的 SSH
+
+容器自己的 sshd 在 **22**，Android 宿主机的 sshd 在 `172.28.0.1:22`。
+host 模式下 guest **自己跑 sshd**（在 `172.28.100.2:22`），和上面两个都不冲突，
+也不会经过 droidspaces 的端口转发。
+
+user 模式下 guest 的 22 会被映射到 `8023+`，同样不碰容器的 22。
+
 
 ---
 
@@ -188,7 +323,7 @@ journalctl -u     ckvm@ubuntu26
 | `CKVM_BINDIR` | `/usr/local/bin` | 命令安装位置 |
 | `MIRROR_IMAGE_LIST` | NJU + 官方 | 系统镜像源，按顺序回退 |
 | `MIRROR_APT` | USTC | 写进 cloud-init 的 apt 源 |
-| `REPO_LIST` | GitHub + 三个镜像 | 安装时取脚本和固件的源 |
+| `CKVM_ACCEL` | `0` | 设 `1` 等价于 `install -cn` |
 
 ### 单个虚拟机
 
@@ -226,8 +361,12 @@ apt 源：  https://mirrors.ustc.edu.cn/ubuntu-ports
 ```bash
 export MIRROR_IMAGE_LIST="https://mirrors.tuna.tsinghua.edu.cn/ubuntu-cloud-images"
 export MIRROR_APT="https://mirrors.aliyun.com/ubuntu-ports"
-curl -fsSLk <镜像地址>/kvm-vm.sh | bash -s -- install
+curl -fsSLk <地址> | bash -s -- install
 ```
+
+> 注意区分两类源：`MIRROR_IMAGE_LIST` / `MIRROR_APT` 是**装进 guest 的**
+> 系统镜像和 apt 源；`-cn` 只影响 **ckvm 自己从哪下载**（脚本和固件）。
+> 两者互不相关。
 
 > **实测提醒**：USTC 的 `ubuntu-cloud-images` 目录**只镜像了 amd64**，
 > arm64 请求返回 403，所以镜像默认走 NJU。USTC 的 apt 源是正常的。

@@ -40,6 +40,16 @@ DEF_PASS=1
 DEF_REL=26.04
 DEF_PORT_BASE=8023
 
+# ---- networking ---------------------------------------------------------
+# NET_MODE=user : QEMU user-mode NAT with explicit hostfwd mappings (default)
+# NET_MODE=host : a tap device; the guest gets a real IP on this container's
+#                 network and runs its own sshd, no port forwards needed
+DEF_NET_MODE=user
+DEF_FORWARDS="22"            # guest ports to expose, comma separated
+TAP_IP_HOST="172.28.100.1"   # container side of the tap (host mode)
+TAP_IP_GUEST="172.28.100.2"  # guest address (host mode)
+TAP_NETMASK="24"
+
 say()  { printf '  %s\n' "$*"; }
 warn() { printf '  ! %s\n' "$*" >&2; }
 die()  { printf '  ERROR: %s\n' "$*" >&2; exit 1; }
@@ -143,6 +153,66 @@ running_pid() {
     return 1
 }
 
+# --------------------------------------------------------------------------
+# networking helpers
+# --------------------------------------------------------------------------
+# FORWARDS is a comma separated list of guest ports.  Each is published on the
+# host on the same number by default, or on "hostport:guestport" if given.
+# Port 22 is special-cased: it is published as PORT unless overridden.
+build_hostfwd() {
+    local list="${FORWARDS:-22}" item h g out=""
+    local IFS=','
+    for item in $list; do
+        case "$item" in
+            *:*) h="${item%%:*}"; g="${item#*:}" ;;
+            *)   g="$item";       h="$item" ;;
+        esac
+        # 22 maps onto our allocated PORT so several guests can coexist
+        [ "$g" = "22" ] && h="$PORT"
+        out="$out,hostfwd=tcp:0.0.0.0:${h}-:${g}"
+    done
+    echo "${out#,}"
+}
+
+check_host_port() {
+    local p="$1"
+    ss -tln 2>/dev/null | grep -q ":$p " && return 1
+    return 0
+}
+
+tap_name() { echo "ckvm-$1" | cut -c1-15; }
+
+tap_up() {
+    local name="$1" tap; tap=$(tap_name "$name")
+    command -v ip >/dev/null || { warn "iproute2 missing; cannot use host networking"; return 1; }
+    [ -c /dev/net/tun ] || { warn "/dev/net/tun missing; cannot use host networking"; return 1; }
+
+    ip link show "$tap" >/dev/null 2>&1 && ip link del "$tap" 2>/dev/null
+    ip tuntap add dev "$tap" mode tap || { warn "cannot create $tap"; return 1; }
+    ip addr add "${TAP_IP_HOST}/${TAP_NETMASK}" dev "$tap" 2>/dev/null
+    ip link set "$tap" up || return 1
+
+    # let the guest reach the outside world
+    sysctl -qw net.ipv4.ip_forward=1 2>/dev/null
+    iptables -t nat -C POSTROUTING -s "${TAP_IP_GUEST}/${TAP_NETMASK}" \
+        -o eth0 -j MASQUERADE 2>/dev/null \
+        || iptables -t nat -A POSTROUTING -s "${TAP_IP_GUEST}/${TAP_NETMASK}" \
+        -o eth0 -j MASQUERADE 2>/dev/null
+    iptables -C FORWARD -i "$tap" -j ACCEPT 2>/dev/null \
+        || iptables -I FORWARD -i "$tap" -j ACCEPT 2>/dev/null
+    echo "$tap"
+    return 0
+}
+
+tap_down() {
+    local name="$1" tap; tap=$(tap_name "$name")
+    iptables -t nat -D POSTROUTING -s "${TAP_IP_GUEST}/${TAP_NETMASK}" \
+        -o eth0 -j MASQUERADE 2>/dev/null
+    iptables -D FORWARD -i "$tap" -j ACCEPT 2>/dev/null
+    ip link del "$tap" 2>/dev/null
+    return 0
+}
+
 image_urls() {
     local rel="$1" f="ubuntu-${rel}-server-cloudimg-arm64.img" m
     for m in $MIRROR_IMAGE_LIST; do
@@ -192,8 +262,30 @@ EOF
 instance-id: ckvm-$name
 local-hostname: $VM_HOSTNAME
 EOF
-    cloud-localds "$d/seed.img" "$d/user-data" "$d/meta-data"
-    say "seed.img written (user $VM_USER / password $VM_PASS)"
+
+    # host/tap mode: no DHCP server exists, so pin the address in the guest
+    if [ "${NET_MODE:-user}" = "host" ] || [ "${NET_MODE:-user}" = "tap" ]; then
+        cat > "$d/network-config" <<EOF
+version: 2
+ethernets:
+  main:
+    match:
+      name: "en*"
+    dhcp4: false
+    addresses: [${TAP_IP_GUEST}/${TAP_NETMASK}]
+    routes:
+      - to: default
+        via: ${TAP_IP_HOST}
+    nameservers:
+      addresses: [223.5.5.5, 119.29.29.29]
+EOF
+        cloud-localds --network-config="$d/network-config" \
+            "$d/seed.img" "$d/user-data" "$d/meta-data"
+        say "seed.img written (user $VM_USER / password $VM_PASS, static ${TAP_IP_GUEST})"
+    else
+        cloud-localds "$d/seed.img" "$d/user-data" "$d/meta-data"
+        say "seed.img written (user $VM_USER / password $VM_PASS)"
+    fi
 }
 
 fetch_image() {
@@ -226,6 +318,7 @@ cmd_create() {
     need_root
     local name="" cpus="$DEF_CPUS" mem="$DEF_MEM" disk="$DEF_DISK_GB"
     local rel="$DEF_REL" port=""
+    local net_mode="$DEF_NET_MODE" forwards="$DEF_FORWARDS" fwd_set=0
 
     while [ $# -gt 0 ]; do
         case "$1" in
@@ -234,10 +327,18 @@ cmd_create() {
             --disk) disk="$2"; shift 2 ;;
             --rel)  rel="$2";  shift 2 ;;
             --port) port="$2"; shift 2 ;;
+            --net)  net_mode="$2"; shift 2 ;;
+            --fwd)  forwards="$2"; fwd_set=1; shift 2 ;;
             *)      name="$1"; shift ;;
         esac
     done
-    [ -n "$name" ] || die "usage: ckvm create <name> [--cpus N] [--mem MB] [--disk GB] [--rel 26.04] [--port N]"
+    [ -n "$name" ] || die "usage: ckvm create <name> [--cpus N] [--mem MB] [--disk GB] [--rel 26.04] [--port N] [--net user|host] [--fwd 22,80,443]"
+    case "$net_mode" in
+        user|host) ;;
+        *) die "--net must be 'user' or 'host'" ;;
+    esac
+    # host mode needs no port forwards unless asked for extra ones
+    [ "$net_mode" = "host" ] && [ "$fwd_set" = 0 ] && forwards=""
     valid_name "$name"
     # a directory without vm.conf is a half-finished create, not an existing
     # guest, so allow it to be resumed
@@ -264,6 +365,10 @@ CPUSET=$DEF_CPUSET
 VM_USER=$DEF_USER
 VM_PASS=$DEF_PASS
 VM_HOSTNAME=$name
+# user = QEMU NAT with the forwards below (works everywhere, needs no tap)
+# host = tap device, guest gets $TAP_IP_GUEST and runs its own sshd
+NET_MODE=$net_mode
+FORWARDS=$forwards
 EOF
 
     cp -f "$CKVM_FWDIR/edk2_qemu_aarch64_nonvram.fd" "$d/uefi-code.fd"
@@ -271,6 +376,7 @@ EOF
     cp -f "$CKVM_FWDIR/edk2_vars.fd" "$d/uefi-vars.fd"
 
     say "guest '$name' created (port $port, ${cpus} vCPU, ${mem} MiB, ${disk}G)"
+    say "network: $net_mode${forwards:+ (forwards: $forwards)}"
     if [ -s "$d/disk.qcow2" ]; then
         say "disk already present; skipping the download"
         qemu-img resize "$d/disk.qcow2" "${disk}G" >/dev/null
@@ -307,6 +413,38 @@ cmd_start() {
     # fresh NVRAM from the pristine template: a stale store makes GRUB hang
     [ -f "$CKVM_FWDIR/edk2_vars.fd" ] && cp -f "$CKVM_FWDIR/edk2_vars.fd" "$d/uefi-vars.fd"
 
+    # ---- networking ------------------------------------------------------
+    local net_args=() tap=""
+    case "${NET_MODE:-user}" in
+        user)
+            # warn about port clashes before QEMU does, it is much clearer
+            local hfwd item h
+            hfwd=$(build_hostfwd)
+            local IFS=','
+            for item in $hfwd; do
+                h=$(echo "$item" | sed 's/.*0\.0\.0\.0:\([0-9]*\)-.*/\1/')
+                if ! check_host_port "$h"; then
+                    warn "host port $h is already in use"
+                    warn "  (the container's own sshd is usually on 22; pick another with --port/--fwd)"
+                fi
+            done
+            net_args=(-netdev "user,id=n0${hfwd:+,$hfwd}"
+                       -device virtio-net-pci,netdev=n0)
+            ;;
+        host|tap)
+            tap=$(tap_up "$name") || die "could not set up tap networking"
+            net_args=(-netdev "tap,id=n0,script=no,downscript=no,ifname=$tap"
+                       -device virtio-net-pci,netdev=n0)
+            say "tap $tap up: host ${TAP_IP_HOST} / guest ${TAP_IP_GUEST}"
+            ;;
+        none)
+            net_args=()
+            ;;
+        *)
+            die "unknown NET_MODE '${NET_MODE}' in the vm.conf"
+            ;;
+    esac
+
     rm -f "$(vm_log "$name")" "$d/qemu.err"
     local args=(
         "$QEMU" -name "$name"
@@ -315,8 +453,8 @@ cmd_start() {
         -drive if=pflash,format=raw,unit=1,file="$d/uefi-vars.fd"
         -drive if=virtio,format=qcow2,file="$d/disk.qcow2"
         -drive if=virtio,format=raw,readonly=on,file="$d/seed.img"
-        -netdev user,id=n0,hostfwd=tcp:0.0.0.0:${PORT}-:22
-        -device virtio-net-pci,netdev=n0 -device virtio-rng-pci
+        "${net_args[@]}"
+        -device virtio-rng-pci
         -display none -serial file:"$(vm_log "$name")"
     )
 
@@ -328,11 +466,47 @@ cmd_start() {
     echo $! > "$(vm_pid "$name")"
     sleep 6
     local p; p=$(cat "$(vm_pid "$name")")
-    kill -0 "$p" 2>/dev/null || die "failed to start: $(head -1 "$d/qemu.err")"
+    if ! kill -0 "$p" 2>/dev/null; then
+        [ -n "$tap" ] && tap_down "$name"
+        die "failed to start: $(head -1 "$d/qemu.err")"
+    fi
     say "guest '$name' running (pid $p, ${CPUS} vCPU, ${MEM} MiB, cpuset $CPUSET)"
-    say "ssh ${VM_USER}@127.0.0.1 -p ${PORT}   (password: ${VM_PASS})"
+    show_access "$name"
 }
 
+# how to reach this guest
+show_access() {
+    local name="$1"; load_vm "$name"
+    case "${NET_MODE:-user}" in
+        user)
+            local hfwd item h g
+            hfwd=$(build_hostfwd)
+            say "network: user-mode NAT"
+            local IFS=','
+            for item in $hfwd; do
+                h=$(echo "$item" | sed 's/.*0\.0\.0\.0:\([0-9]*\)-.*/\1/')
+                g=$(echo "$item" | sed 's/.*-:\([0-9]*\).*/\1/')
+                if [ "$g" = "22" ]; then
+                    say "  ssh ${VM_USER}@127.0.0.1 -p ${h}   (password: ${VM_PASS})"
+                else
+                    say "  port $g -> 127.0.0.1:$h"
+                fi
+            done
+            ;;
+        host|tap)
+            say "network: tap, the guest is on this container's network"
+            say "  guest ip : ${TAP_IP_GUEST}/24   gateway ${TAP_IP_HOST}"
+            say "  ssh      : ${VM_USER}@${TAP_IP_GUEST}   (password: ${VM_PASS})"
+            say "  from the container, no port forward needed."
+            if ! ip -4 addr show eth0 2>/dev/null | grep -q "inet "; then :; fi
+            say "  NOTE: this is the container's network (inside droidspaces)."
+            say "        It is NOT the phone's LAN address."
+            say "        To reach the guest from the LAN, forward on the Android"
+            say "        side (see: ckvm net $name) or use user mode."
+            ;;
+        none) say "network: none" ;;
+    esac
+}
 cmd_stop() {
     need_root
     local name="$1" p
@@ -340,6 +514,7 @@ cmd_stop() {
         kill -15 "$p" 2>/dev/null; sleep 4
         kill -0 "$p" 2>/dev/null && kill -9 "$p" 2>/dev/null
         rm -f "$(vm_pid "$name")"
+        tap_down "$name" >/dev/null 2>&1
         say "guest '$name' stopped"
     else
         say "guest '$name' is not running"
@@ -362,9 +537,14 @@ cmd_list() {
         name=$(basename "$d")
         if p=$(running_pid "$name"); then state="running"; else state="stopped"; fi
         ( . "$d/vm.conf"
+          local how
+          case "${NET_MODE:-user}" in
+              host|tap) how="ssh ${VM_USER}@${TAP_IP_GUEST}" ;;
+              none)     how="(no network)" ;;
+              *)        how="ssh ${VM_USER}@127.0.0.1 -p ${PORT}" ;;
+          esac
           printf '  %-16s %-8s %-6s %-8s %-7s %-6s %s\n' \
-                 "$name" "$state" "$CPUS" "$MEM" "${DISK_GB}G" "$PORT" \
-                 "ssh ${VM_USER}@127.0.0.1 -p ${PORT}" )
+                 "$name" "$state" "$CPUS" "$MEM" "${DISK_GB}G" "$PORT" "$how" )
     done
 }
 
@@ -466,31 +646,114 @@ cmd_config() {
 
 cmd_edit() { load_vm "$1"; ${EDITOR:-vi} "$(vm_conf "$1")"; }
 
-# Where to fetch ourselves from.  GitHub is blocked on some networks (raw.
-# githubusercontent.com resets the connection on this device), so we try a
-# list and use whichever answers first.
-REPO_PATH="github.com/ccmx200/kernel-lxc-xiaomi_mt6833/raw/resukisu/kvm_manager"
-REPO_LIST="${REPO_LIST:-https://raw.githubusercontent.com/ccmx200/kernel-lxc-xiaomi_mt6833/resukisu/kvm_manager https://git.yylx.win/github.com/ccmx200/kernel-lxc-xiaomi_mt6833/raw/resukisu/kvm_manager https://ghproxy.net/https://raw.githubusercontent.com/ccmx200/kernel-lxc-xiaomi_mt6833/resukisu/kvm_manager https://gh-proxy.com/https://raw.githubusercontent.com/ccmx200/kernel-lxc-xiaomi_mt6833/resukisu/kvm_manager}"
-REPO_RAW="${REPO_RAW:-}"
+# --------------------------------------------------------------------------
+# network report
+# --------------------------------------------------------------------------
+cmd_net() {
+    local name="${1:-}" d
+    if [ -z "$name" ]; then
+        say "container network:"
+        ip -4 -o addr show 2>/dev/null | awk '{print "  "$2"  "$4}'
+        say "default route: $(ip route 2>/dev/null | awk '/^default/{print $3; exit}')"
+        say ""
+        say "guests:"
+        for d in "$CKVM_ROOT"/*/; do
+            [ -f "$d/vm.conf" ] || continue
+            ( . "$d/vm.conf"
+              printf '  %-14s mode=%-6s forwards=%s\n' \
+                     "$(basename "$d")" "${NET_MODE:-user}" "${FORWARDS:--}" )
+        done
+        return 0
+    fi
+    load_vm "$name"
+    say "guest:   $name"
+    say "mode:    ${NET_MODE:-user}"
+    say "forwards:${FORWARDS:- (none)}"
+    say ""
+    show_access "$name"
+    say ""
+    if [ "${NET_MODE:-user}" = "host" ] || [ "${NET_MODE:-user}" = "tap" ]; then
+        local tap; tap=$(tap_name "$name")
+        say "tap device $tap:"
+        ip -4 addr show "$tap" 2>/dev/null | sed 's/^/  /' || say "  (not up)"
+        say ""
+        say "NAT rules:"
+        iptables -t nat -S POSTROUTING 2>/dev/null | grep -- "$TAP_IP_GUEST" | sed 's/^/  /' || true
+        iptables -S FORWARD 2>/dev/null | grep -- "$tap" | sed 's/^/  /' || true
+        say ""
+        say "This address lives inside the droidspaces container, so it is not"
+        say "visible on the phone's LAN.  Two ways to expose it:"
+        say ""
+        say "  a) keep it simple - use user mode with explicit forwards:"
+        say "       ckvm config $name     # set NET_MODE=user FORWARDS=22,80"
+        say "       ckvm restart $name"
+        say ""
+        say "  b) bridge on the Android side (needs the host's root shell):"
+        say "       # on the phone, as root:"
+        say "       ip link add br-ckvm type bridge"
+        say "       ip link set eth0 master br-ckvm    # container's veth peer"
+        say "       ip link set br-ckvm up"
+        say "     then the guest is reachable as ${TAP_IP_GUEST} from anywhere"
+        say "     that can route to the phone."
+        say ""
+        say "  Port 22 on this container is its own sshd; the guest's sshd is"
+        say "  separate and does not conflict in host mode."
+    fi
+}
 
-# download a repo file, trying every mirror; echoes the base that worked
+# Where ckvm fetches itself and the firmware from.
+#
+# The default is plain GitHub.  Acceleration is opt-in: pass -cn to install,
+# or set CKVM_ACCEL=1, and the well-known GitHub-frontend mirrors are used
+# instead.  Nothing here silently rewrites the source.
+REPO_GITHUB="https://raw.githubusercontent.com/ccmx200/kernel-lxc-xiaomi_mt6833/resukisu/kvm_manager"
+REPO_GITHUB_CN="https://git.yylx.win/github.com/ccmx200/kernel-lxc-xiaomi_mt6833/raw/resukisu/kvm_manager"
+# name=url pairs so `-cn` can fall through them in order if one is down
+REPO_MIRRORS_CN="git.yylx.win=https://git.yylx.win/github.com/ccmx200/kernel-lxc-xiaomi_mt6833/raw/resukisu/kvm_manager ghproxy.net=https://ghproxy.net/https://raw.githubusercontent.com/ccmx200/kernel-lxc-xiaomi_mt6833/resukisu/kvm_manager gh-proxy.com=https://gh-proxy.com/https://raw.githubusercontent.com/ccmx200/kernel-lxc-xiaomi_mt6833/resukisu/kvm_manager"
+
+CKVM_REPO=""          # resolved by resolve_repo()
+CKVM_USING_CN=0
+
+resolve_repo() {
+    local accel="${1:-${CKVM_ACCEL:-0}}" pair name url
+    if [ "$accel" = "1" ] || [ "$accel" = "cn" ]; then
+        CKVM_USING_CN=1
+        for pair in $REPO_MIRRORS_CN; do
+            name=${pair%%=*}; url=${pair#*=}
+            if curl -fsSLk --max-time 20 -o /dev/null "$url/kvm-vm.sh" 2>/dev/null; then
+                CKVM_REPO="$url"
+                say "using accelerator: $name"
+                return 0
+            fi
+        done
+        warn "no accelerator reachable; falling back to GitHub"
+    fi
+    CKVM_REPO="$REPO_GITHUB"
+    return 0
+}
+
+# download one file from the resolved repo
 fetch_repo_file() {
-    local rel="$1" out="$2" base
-    [ -n "$REPO_RAW" ] && set -- "$@"
-    for base in ${REPO_RAW:-$REPO_LIST}; do
-        if curl -fSLk --retry 2 --max-time 300 -o "$out.part" "$base/$rel" 2>/dev/null; then
-            mv -f "$out.part" "$out"
-            echo "$base"
-            return 0
-        fi
-        rm -f "$out.part"
-    done
-    return 1
+    local rel="$1" out="$2"
+    [ -n "$CKVM_REPO" ] || resolve_repo
+    curl -fSLk --retry 2 --max-time 300 -o "$out.part" "$CKVM_REPO/$rel" 2>/dev/null || {
+        rm -f "$out.part"; return 1
+    }
+    mv -f "$out.part" "$out"
+    echo "$CKVM_REPO"
 }
 
 cmd_install() {
     need_root
+    local accel=0
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -cn|--cn|--china) accel=1; shift ;;
+            *) shift ;;
+        esac
+    done
     mkdir -p "$CKVM_ROOT" "$CKVM_FWDIR"
+    resolve_repo "$accel"
 
     # when the script was piped in, $0 is not the file we want to install
     if [ -f "$0" ] && [ "$(readlink -f "$0")" != "$CKVM_BINDIR/ckvm" ]; then
@@ -565,6 +828,12 @@ ckvm $CKVM_VERSION - KVM guest manager (MT6833 / everpal)
         --disk GB   disk size           (default $DEF_DISK_GB)
         --rel  V    Ubuntu release      (default $DEF_REL)
         --port N    host ssh port       (default: first free from $DEF_PORT_BASE)
+        --net  M    user | host         (default $DEF_NET_MODE)
+                      user: QEMU NAT, reach it via forwarded ports
+                      host: tap device, guest gets its own IP, runs its own
+                            sshd; nothing is forwarded
+        --fwd  L    ports to forward, e.g. 22,80,443 or 8022:22
+                    default "$DEF_FORWARDS" (guest 22 is published on --port)
 
   ckvm image <name>                (re)download the guest image
   ckvm start <name> [-f]           start (foreground with -f)
@@ -585,7 +854,7 @@ EOF
 }
 
 case "${1:-help}" in
-    install)   cmd_install ;;
+    install)   shift; cmd_install "$@" ;;
     uninstall) cmd_uninstall ;;
     create)    shift; cmd_create "$@" ;;
     image)     shift; cmd_image "$@" ;;
@@ -600,6 +869,7 @@ case "${1:-help}" in
     disable)   shift; cmd_disable "$@" ;;
     config)    shift; cmd_config "$@" ;;
     edit)      shift; cmd_edit "$@" ;;
+    net)       shift; cmd_net "$@" ;;
     help|-h|--help) cmd_help ;;
     *)         cmd_help; exit 1 ;;
 esac
