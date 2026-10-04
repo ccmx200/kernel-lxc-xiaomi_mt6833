@@ -617,6 +617,36 @@ VERDICT: PASS - never exceeded 100%
 
 ---
 
+### 7.2.2 慢步骤的反馈
+
+创建流程里有两类"看起来卡住"的步骤：
+
+| 步骤 | 耗时 | 原来 | 现在 |
+|---|---|---|---|
+| `check_release` | 每个镜像一次 HEAD | 静默 | `spin` 转圈 |
+| `qemu-img convert` | 裸镜像可能几十秒 | **完全静默** | `spin` 转圈 |
+| `qemu-img resize` | 秒级到十几秒 | **完全静默** | `spin` 转圈 |
+| `cloud-localds` | 秒级 | 静默 | `spin` 转圈 |
+| 镜像下载 | 几十秒到几分钟 | 有进度条 | 进度条 + 百分比 + 字节 |
+
+`spin` 是个通用包装：把命令放后台跑，前台画转圈，失败时把输出的最后几行打出来，
+而不是静默失败。
+
+```bash
+spin "扩容到 ${DISK_GB}G" qemu-img resize "$img" "${DISK_GB}G"
+```
+
+非 TTY 环境下自动退化为普通文字输出（`say` + 直接执行），日志保持干净。
+
+`_progress` 内部对 `/dev/null` 做了保护 —— `spin` 用 `/dev/null` 表示"没有可测量
+的进度"，此时只显示转圈和标签，不做 `stat`。
+
+一个测试上的注意点：在脚本里单独验证 `spin` 时，`_progress` 会因为 awk 提取不完整
+而报 `command not found`。实际运行时没有问题 —— `_progress` 定义在
+`download_url` 内部，而下载总是先于这些步骤执行。
+
+---
+
 ### 7.3 镜像源
 
 | 用途 | 源 | 说明 |

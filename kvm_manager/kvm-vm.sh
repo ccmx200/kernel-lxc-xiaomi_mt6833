@@ -75,6 +75,60 @@ fi
 
 # a spinner + progress bar, animated on a terminal and silent when piped
 UI_ACTIVE=0
+# Run a slow command behind a spinner so it does not look hung.  The command's
+# output goes to a temp file; on failure the tail of that file is printed.
+#   spin <label> <command...>
+#   spin_timed <label> <estimated_seconds> <command...>
+spin() {
+    local label="$1"; shift
+    if [ "$IS_TTY" != 1 ]; then
+        say "$label"
+        "$@"
+        return $?
+    fi
+    local out; out=$(mktemp "${TMPDIR:-/tmp}/ckvm-spin.XXXXXX")
+    "$@" >"$out" 2>&1 &
+    local pid=$!
+    _progress "$pid" /dev/null "$label" ""
+    wait "$pid"; local rc=$?
+    ui_stop
+    if [ $rc -ne 0 ]; then
+        warn "$label 失败"
+        tail -5 "$out" 2>/dev/null | sed 's/^/      /' >&2
+    fi
+    rm -f "$out"
+    return $rc
+}
+
+# Same, but shows elapsed against an estimate so a long task feels bounded.
+spin_timed() {
+    local label="$1" est="$2"; shift 2
+    if [ "$IS_TTY" != 1 ]; then
+        say "$label"
+        "$@"
+        return $?
+    fi
+    local out; out=$(mktemp "${TMPDIR:-/tmp}/ckvm-spin.XXXXXX")
+    local t0=$SECONDS
+    "$@" >"$out" 2>&1 &
+    local pid=$! i=0
+    while kill -0 "$pid" 2>/dev/null; do
+        local el=$(( SECONDS - t0 ))
+        local pct=""
+        [ "$est" -gt 0 ] && { pct=$(( el * 100 / est )); [ "$pct" -gt 99 ] && pct=99; }
+        ui_tick $((i++)) "$pct" "$label" "  ${el}s"
+        sleep 0.4
+    done
+    wait "$pid"; local rc=$?
+    ui_stop
+    if [ $rc -ne 0 ]; then
+        warn "$label 失败"
+        tail -5 "$out" 2>/dev/null | sed 's/^/      /' >&2
+    fi
+    rm -f "$out"
+    return $rc
+}
+
 ui_stop() {
     [ "$UI_ACTIVE" = 1 ] || return 0
     printf '\r\033[K' 2>/dev/null
@@ -152,8 +206,11 @@ download_url() {
         # $1 pid, $2 file, $3 label, $4 total (may be empty)
         local pid="$1" file="$2" lbl="$3" tot="$4"
         local i=0 cur pct
+        # /dev/null or a missing path means "no measurable progress"
+        case "$file" in /dev/null|"") file="";; esac
         while kill -0 "$pid" 2>/dev/null; do
-            cur=$(stat -c%s "$file" 2>/dev/null || echo 0)
+            cur=0
+            [ -n "$file" ] && cur=$(stat -c%s "$file" 2>/dev/null || echo 0)
             if [ -n "$tot" ]; then
                 [ "$cur" -gt "$tot" ] && cur="$tot"
                 pct=$(( cur * 100 / tot ))
@@ -718,10 +775,12 @@ ethernets:
     nameservers:
       addresses: [223.5.5.5, 119.29.29.29]
 EOF
-        cloud-localds --network-config="$d/network-config" \
-            "$d/seed.img" "$d/user-data" "$d/meta-data"
+        spin "生成 cloud-init 镜像" cloud-localds \
+             --network-config="$d/network-config" \
+             "$d/seed.img" "$d/user-data" "$d/meta-data"
     else
-        cloud-localds "$d/seed.img" "$d/user-data" "$d/meta-data"
+        spin "生成 cloud-init 镜像" cloud-localds \
+             "$d/seed.img" "$d/user-data" "$d/meta-data"
     fi
     if [ "$VM_USER" = "root" ]; then
         say "seed.img written (root / password $VM_PASS)"
@@ -748,10 +807,11 @@ fetch_image() {
     if [ "$fmt" = "qcow2" ]; then
         mv -f "$d/base.img" "$img"
     else
-        qemu-img convert -f "$fmt" -O qcow2 "$d/base.img" "$img"
+        spin "转换镜像格式 ($fmt -> qcow2)" \
+             qemu-img convert -f "$fmt" -O qcow2 "$d/base.img" "$img"
         rm -f "$d/base.img"
     fi
-    qemu-img resize "$img" "${DISK_GB}G" >/dev/null
+    spin "扩容到 ${DISK_GB}G" qemu-img resize "$img" "${DISK_GB}G"
     say "image ready"
     return 0
 }
@@ -867,13 +927,12 @@ cmd_create() {
     [ "$net_mode" = "host" ] && [ "$fwd_set" = 0 ] && forwards=""
 
     # verify the image is really fetchable before creating anything
-    say "检查镜像可用性..."
     local code lts size human
     code=$(catalogue_field "$rel" 2)
     lts=$(catalogue_field "$rel" 3)
     size=$(catalogue_field "$rel" 4)
-    if ! check_release "$rel"; then
-        say "  目录里没有 $rel 的镜像，可用的源都试过了"
+    if ! spin "检查镜像可用性" check_release "$rel"; then
+        warn "目录里没有 $rel 的镜像，可用的源都试过了"
         return 1
     fi
     human=$(numfmt --to=iec "$CC_LEN" 2>/dev/null || echo "$CC_LEN")
@@ -913,7 +972,7 @@ EOF
 
     if [ -s "$d/disk.qcow2" ] && qemu-img info "$d/disk.qcow2" >/dev/null 2>&1; then
         say "磁盘已存在，跳过下载"
-        qemu-img resize "$d/disk.qcow2" "${disk}G" >/dev/null
+        spin "扩容到 ${disk}G" qemu-img resize "$d/disk.qcow2" "${disk}G"
     else
         fetch_image "$name" || warn "镜像下载失败；稍后可跑 'ckvm image $name'"
     fi
