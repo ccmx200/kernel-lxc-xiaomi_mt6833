@@ -277,8 +277,13 @@ valid_name() { [[ "$1" =~ ^[A-Za-z0-9_.-]+$ ]] || die "invalid name: $1"; }
 exists_vm()  { [ -d "$(vm_dir "$1")" ]; }
 
 load_vm() {
-    local d; d=$(vm_dir "$1")
-    [ -f "$d/vm.conf" ] || die "no such guest: $1  (see: ckvm list)"
+    local n="$1"
+    [ -n "$n" ] || die "a guest name is required (see: ckvm list)"
+    case "$n" in
+        -*) die "'$n' looks like an option, not a guest name (see: ckvm list)" ;;
+    esac
+    local d; d=$(vm_dir "$n")
+    [ -f "$d/vm.conf" ] || die "no such guest: $n  (see: ckvm list)"
     # shellcheck disable=SC1090
     . "$d/vm.conf"
 }
@@ -741,7 +746,16 @@ def sanitize(b):
         pos = m.end()
     out.append(DROP.sub(b"", b[pos:]))
     return b"".join(out)
-sys.stdout.buffer.write(sanitize(sys.stdin.buffer.read()))
+import errno
+data = sys.stdin.buffer.read()
+try:
+    sys.stdout.buffer.write(sanitize(data))
+    sys.stdout.buffer.flush()
+except BrokenPipeError:
+    pass
+except OSError as e:
+    if e.errno != errno.EPIPE:
+        raise
 '
 
 strip_serial() {
@@ -1160,13 +1174,37 @@ ckvm $CKVM_VERSION - KVM guest manager (MT6833 / everpal)
   ckvm enable <name>               enable + start under systemd
   ckvm disable <name>              disable the systemd unit
 
-  ckvm net [name]                  show the container / guest network layout
+  ckvm net <name>                  show a guest's network layout
+  ckvm net                         container network + all guests
   ckvm config [name]               show global or per-guest settings
   ckvm edit <name>                 edit a guest's vm.conf
 
 Files: $CKVM_ROOT/<name>/    firmware: $CKVM_FWDIR
 EOF
 }
+# Every subcommand that needs a guest name should fail clearly instead of
+# treating a flag as a guest.  -h/--help anywhere prints the help.
+case "${1:-help}" in
+    -h|--help|help) cmd_help; exit 0 ;;
+esac
+if [ $# -ge 2 ]; then
+    case "$2" in
+        -h|--help) cmd_help; exit 0 ;;
+    esac
+fi
+
+# commands that operate on a guest need one; say so instead of tripping over
+# `set -u` further down
+case "${1:-help}" in
+    start|stop|restart|status|console|rm|remove|image|enable|disable|config|edit|net)
+        if [ $# -lt 2 ] || [ -z "${2:-}" ]; then
+            printf '  ERROR: %s needs a guest name\n\n' "$1" >&2
+            cmd_help
+            exit 1
+        fi
+        ;;
+esac
+
 case "${1:-help}" in
     install)   shift; cmd_install "$@" ;;
     uninstall) cmd_uninstall ;;
