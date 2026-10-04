@@ -107,6 +107,29 @@ UI_ACTIVE=0
 # output goes to a temp file; on failure the tail of that file is printed.
 #   spin <label> <command...>
 #   spin_timed <label> <estimated_seconds> <command...>
+_progress() {
+    # $1 pid, $2 file, $3 label, $4 total (may be empty)
+    local pid="$1" file="$2" lbl="$3" tot="$4"
+    local i=0 cur pct
+    # /dev/null or a missing path means "no measurable progress"
+    case "$file" in /dev/null|"") file="";; esac
+    while kill -0 "$pid" 2>/dev/null; do
+        cur=0
+        [ -n "$file" ] && cur=$(stat -c%s "$file" 2>/dev/null || echo 0)
+        if [ -n "$tot" ]; then
+            [ "$cur" -gt "$tot" ] && cur="$tot"
+            pct=$(( cur * 100 / tot ))
+            ui_tick $((i++)) "$pct" "$lbl" \
+                    "  $(numfmt --to=iec "$cur" 2>/dev/null || echo "$cur")/$(numfmt --to=iec "$tot" 2>/dev/null || echo "$tot")"
+        else
+            ui_tick $((i++)) "" "$lbl" \
+                    "  $(numfmt --to=iec "$cur" 2>/dev/null || echo "$cur")"
+        fi
+        sleep 0.4
+    done
+}
+
+# Run a slow command behind a spinner 
 spin() {
     local label="$1"; shift
     if [ "$IS_TTY" != 1 ]; then
@@ -230,27 +253,6 @@ download_url() {
         return 0
     fi
 
-    _progress() {
-        # $1 pid, $2 file, $3 label, $4 total (may be empty)
-        local pid="$1" file="$2" lbl="$3" tot="$4"
-        local i=0 cur pct
-        # /dev/null or a missing path means "no measurable progress"
-        case "$file" in /dev/null|"") file="";; esac
-        while kill -0 "$pid" 2>/dev/null; do
-            cur=0
-            [ -n "$file" ] && cur=$(stat -c%s "$file" 2>/dev/null || echo 0)
-            if [ -n "$tot" ]; then
-                [ "$cur" -gt "$tot" ] && cur="$tot"
-                pct=$(( cur * 100 / tot ))
-                ui_tick $((i++)) "$pct" "$lbl" \
-                        "  $(numfmt --to=iec "$cur" 2>/dev/null || echo "$cur")/$(numfmt --to=iec "$tot" 2>/dev/null || echo "$tot")"
-            else
-                ui_tick $((i++)) "" "$lbl" \
-                        "  $(numfmt --to=iec "$cur" 2>/dev/null || echo "$cur")"
-            fi
-            sleep 0.4
-        done
-    }
 
     if [ "$DL_BACKEND" = "aria2c" ]; then
         # aria2 writes straight into $out unless there is a control file to
@@ -1138,9 +1140,74 @@ cmd_start() {
         die "failed to start: $(head -1 "$d/qemu.err")"
     fi
     say "guest '$name' running (pid $p, ${CPUS} vCPU, ${MEM} MiB, cpuset $CPUSET)"
+
+    # Boot takes ~30s, and until sshd is up an immediate `ssh` gets
+    # "Connection reset by peer".  Wait for the banner so start only reports
+    # success when the guest is actually usable.
+    case "${NET_MODE:-user}" in
+        user)
+            if spin_timed "等待启动完成（SSH 就绪）" 45 wait_for_ssh "$PORT" 300; then
+                say "SSH 已就绪"
+            else
+                warn "等待 SSH 超时；guest 可能起得慢： ckvm console $name -n 40"
+            fi
+            ;;
+        host|tap)
+            if spin_timed "等待启动完成（登录提示）" 45 _wait_login_prompt "$name" 300; then
+                say "已出现登录提示"
+            else
+                warn "等待登录提示超时： ckvm console $name -n 40"
+            fi
+            ;;
+    esac
+
     show_access "$name"
 }
 
+# host mode helper: wait for "login:" to appear in the serial log
+_wait_login_prompt() {
+    local name="$1" timeout="${2:-300}" elapsed=0
+    while [ "$elapsed" -lt "$timeout" ]; do
+        grep -aq "login:" "$(vm_log "$name")" 2>/dev/null && return 0
+        sleep 2
+        elapsed=$((elapsed + 2))
+    done
+    return 1
+}
+
+
+# Wait until the guest's sshd actually answers.
+#
+# Without this, `ckvm start` reported success the moment QEMU was alive and
+# an immediate `ssh` failed with "Connection reset by peer" - the port
+# forward existed but nothing was listening behind it yet.
+#
+# $1 = host port to probe, $2 = optional timeout in seconds
+wait_for_ssh() {
+    local port="$1" timeout="${2:-300}" elapsed=0
+    command -v python3 >/dev/null 2>&1 || return 1
+    while [ "$elapsed" -lt "$timeout" ]; do
+        if python3 -c '
+import socket,sys
+for _ in range(3):
+    try:
+        s=socket.socket(); s.settimeout(1)
+        s.connect(("127.0.0.1",int(sys.argv[1])))
+        s.settimeout(2)
+        b=s.recv(64); s.close()
+        if b.startswith(b"SSH-"):
+            sys.exit(0)
+    except Exception:
+        pass
+sys.exit(1)
+' "$port" >/dev/null 2>&1; then
+            return 0
+        fi
+        sleep 2
+        elapsed=$((elapsed + 2))
+    done
+    return 1
+}
 # how to reach this guest
 show_access() {
     local name="$1"; load_vm "$name"
