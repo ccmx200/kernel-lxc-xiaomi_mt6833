@@ -466,7 +466,27 @@ cmd_config() {
 
 cmd_edit() { load_vm "$1"; ${EDITOR:-vi} "$(vm_conf "$1")"; }
 
-REPO_RAW="${REPO_RAW:-https://raw.githubusercontent.com/ccmx200/kernel-lxc-xiaomi_mt6833/resukisu/kvm_manager}"
+# Where to fetch ourselves from.  GitHub is blocked on some networks (raw.
+# githubusercontent.com resets the connection on this device), so we try a
+# list and use whichever answers first.
+REPO_PATH="github.com/ccmx200/kernel-lxc-xiaomi_mt6833/raw/resukisu/kvm_manager"
+REPO_LIST="${REPO_LIST:-https://raw.githubusercontent.com/ccmx200/kernel-lxc-xiaomi_mt6833/resukisu/kvm_manager https://git.yylx.win/github.com/ccmx200/kernel-lxc-xiaomi_mt6833/raw/resukisu/kvm_manager https://ghproxy.net/https://raw.githubusercontent.com/ccmx200/kernel-lxc-xiaomi_mt6833/resukisu/kvm_manager https://gh-proxy.com/https://raw.githubusercontent.com/ccmx200/kernel-lxc-xiaomi_mt6833/resukisu/kvm_manager}"
+REPO_RAW="${REPO_RAW:-}"
+
+# download a repo file, trying every mirror; echoes the base that worked
+fetch_repo_file() {
+    local rel="$1" out="$2" base
+    [ -n "$REPO_RAW" ] && set -- "$@"
+    for base in ${REPO_RAW:-$REPO_LIST}; do
+        if curl -fSLk --retry 2 --max-time 300 -o "$out.part" "$base/$rel" 2>/dev/null; then
+            mv -f "$out.part" "$out"
+            echo "$base"
+            return 0
+        fi
+        rm -f "$out.part"
+    done
+    return 1
+}
 
 cmd_install() {
     need_root
@@ -476,10 +496,14 @@ cmd_install() {
     if [ -f "$0" ] && [ "$(readlink -f "$0")" != "$CKVM_BINDIR/ckvm" ]; then
         install -m 0755 "$0" "$CKVM_BINDIR/ckvm"
     else
-        say "fetching the latest ckvm"
-        curl -fSLk --retry 3 -o "$CKVM_BINDIR/ckvm" "$REPO_RAW/kvm-vm.sh" \
-            || die "download failed: $REPO_RAW/kvm-vm.sh"
-        chmod 0755 "$CKVM_BINDIR/ckvm"
+        say "fetching ckvm"
+        local base
+        if base=$(fetch_repo_file "kvm-vm.sh" "$CKVM_BINDIR/ckvm"); then
+            chmod 0755 "$CKVM_BINDIR/ckvm"
+            say "  from $base"
+        else
+            die "could not download kvm-vm.sh from any mirror"
+        fi
     fi
     say "installed: $CKVM_BINDIR/ckvm"
 
@@ -500,11 +524,10 @@ cmd_install() {
         say "firmware not bundled locally; fetching it from the repo"
         local ok=0 f
         for f in edk2_qemu_aarch64_nonvram.fd edk2_vars.fd; do
-            if curl -fSLk --retry 3 -o "$CKVM_FWDIR/$f.part" "$REPO_RAW/$f"; then
-                mv -f "$CKVM_FWDIR/$f.part" "$CKVM_FWDIR/$f"
+            if fetch_repo_file "$f" "$CKVM_FWDIR/$f" >/dev/null; then
                 ok=1
+                say "  got $f"
             else
-                rm -f "$CKVM_FWDIR/$f.part"
                 warn "could not fetch $f"
             fi
         done
