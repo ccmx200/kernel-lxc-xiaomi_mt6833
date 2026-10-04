@@ -396,6 +396,121 @@ image_urls() {
 }
 
 # --------------------------------------------------------------------------
+# release catalogue ("app store")
+# --------------------------------------------------------------------------
+# version|codename|LTS|size
+CATALOGUE="22.04|jammy|LTS|673M
+22.10|kinetic||716M
+23.04|lunar||688M
+23.10|mantic||684M
+24.04|noble|LTS|592M
+24.10|oracular||584M
+25.04|plucky||680M
+25.10|questing||843M
+26.04|resolute|LTS|902M"
+
+catalogue_versions() { echo "$CATALOGUE" | cut -d'|' -f1; }
+
+catalogue_field() {
+    echo "$CATALOGUE" | awk -F'|' -v v="$1" '$1==v{print $'"$2"'}'
+}
+
+# Is this release actually downloadable from any configured mirror?
+# Sets CC_URL on success.
+check_release() {
+    local rel="$1" url len
+    for url in $(image_urls "$rel"); do
+        len=$(curl -sSLkI --max-time 20 "$url" 2>/dev/null | \
+              awk 'BEGIN{IGNORECASE=1}/^content-length:/{gsub(/\r/,"");print $2}' | tail -1)
+        case "$len" in ''|*[!0-9]*) continue ;; esac
+        CC_URL="$url"
+        CC_LEN="$len"
+        return 0
+    done
+    return 1
+}
+
+# --------------------------------------------------------------------------
+# interactive prompt helpers
+# --------------------------------------------------------------------------
+IS_TTY=0
+[ -t 0 ] && [ -t 1 ] && IS_TTY=1
+
+# ask_with_default <prompt> <default>  -> echoes the answer
+ask_with_default() {
+    local prompt="$1" def="$2" ans=""
+    if [ "$IS_TTY" = 1 ]; then
+        printf '  %s %s[%s]%s: ' "$prompt" "$C_DIM" "$def" "$C_RST" >&2
+        IFS= read -r ans || ans=""
+    fi
+    [ -z "$ans" ] && ans="$def"
+    printf '%s' "$ans"
+}
+
+confirm_yn() {
+    local prompt="$1" def="${2:-n}" ans=""
+    [ "$IS_TTY" = 1 ] || { [ "$def" = y ]; return; }
+    printf '  %s (y/n) [%s]: ' "$prompt" "$def" >&2
+    IFS= read -r ans || ans=""
+    [ -z "$ans" ] && ans="$def"
+    case "$ans" in [yY]*) return 0 ;; *) return 1 ;; esac
+}
+
+# Interactive release picker.  Echoes the chosen version, or nothing if the
+# user cancels.
+pick_release() {
+    local n=0 line ver code lts size mark
+    printf '\n' >&2
+    printf '  %sUbuntu 版本%s\n' "$C_B" "$C_RST" >&2
+    printf '  %s──────  ────────────  ─────  ────────%s\n' "$C_DIM" "$C_RST" >&2
+    while IFS='|' read -r ver code lts size; do
+        [ -n "$ver" ] || continue
+        n=$((n + 1))
+        if [ "$lts" = "LTS" ]; then
+            mark="${C_G}LTS${C_RST}"
+        else
+            mark="${C_DIM}   ${C_RST}"
+        fi
+        printf '  %s%2d)%s %-8s %s%-12s%s %s %8s\n' \
+               "$C_C" "$n" "$C_RST" "$ver" "$C_DIM" "$code" "$C_RST" \
+               "$mark" "$size" >&2
+    done <<EOF
+$CATALOGUE
+EOF
+    printf '  %s 0)%s 取消\n\n' "$C_C" "$C_RST" >&2
+
+    local pick=""
+    while :; do
+        printf '  选择 [1-%d] (默认 %s): ' "$n" "$DEF_REL" >&2
+        IFS= read -r pick || { printf '\n' >&2; return 1; }
+        [ -z "$pick" ] && pick="$DEF_REL"
+        # accept a number
+        case "$pick" in
+            0) return 1 ;;
+            *[!0-9]*) ;;
+            *)
+                if [ "$pick" -ge 1 ] && [ "$pick" -le "$n" ]; then
+                    sed -n "${pick}p" <<EOF
+$CATALOGUE
+EOF
+                    return 0
+                fi
+                printf '  %s请输入 0 到 %d%s\n' "$C_Y" "$n" "$C_RST" >&2
+                continue
+                ;;
+        esac
+        # accept a version string (22.04, 24.04.1, ...)
+        ver=$(echo "$pick" | grep -oE '^[0-9]+\.[0-9]+')
+        if [ -n "$ver" ] && catalogue_field "$ver" 1 >/dev/null 2>&1 \
+           && [ -n "$(catalogue_field "$ver" 1)" ]; then
+            echo "$(catalogue_field "$ver" 1)|$(catalogue_field "$ver" 2)|$(catalogue_field "$ver" 3)|$(catalogue_field "$ver" 4)"
+            return 0
+        fi
+        printf '  %s没有这个版本：%s%s\n' "$C_Y" "$pick" "$C_RST" >&2
+    done
+}
+
+# --------------------------------------------------------------------------
 # create
 # --------------------------------------------------------------------------
 make_seed() {
@@ -456,21 +571,20 @@ ethernets:
 EOF
         cloud-localds --network-config="$d/network-config" \
             "$d/seed.img" "$d/user-data" "$d/meta-data"
-        say "seed.img written (user $VM_USER / password $VM_PASS, static ${TAP_IP_GUEST})"
     else
         cloud-localds "$d/seed.img" "$d/user-data" "$d/meta-data"
-        say "seed.img written (user $VM_USER / password $VM_PASS)"
     fi
+    say "seed.img written (user $VM_USER / password $VM_PASS)"
 }
 
 fetch_image() {
     local name="$1" d img url ok=0 fmt
-    ensure_aria2 >/dev/null 2>&1 || true
     d=$(vm_dir "$name"); img="$d/disk.qcow2"
     load_vm "$name"
+    ensure_aria2 >/dev/null 2>&1 || true
     for url in $(image_urls "$UBUNTU_REL"); do
         say "source: $url"
-        if download_url "$url" "$d/base.img" "Ubuntu ${UBUNTU_REL} arm64"; then
+        if download_url "$url" "$d/base.img" "Ubuntu $UBUNTU_REL arm64"; then
             ok=1; break
         fi
         say "  mirror failed, trying the next one"
@@ -489,11 +603,20 @@ fetch_image() {
     return 0
 }
 
+# ckvm create [name] [options]
+#   no arguments and a terminal -> the interactive store
+#   a name, or any option  -> command mode
 cmd_create() {
     need_root
-    local name="" cpus="$DEF_CPUS" mem="$DEF_MEM" disk="$DEF_DISK_GB"
-    local rel="$DEF_REL" port=""
-    local net_mode="$DEF_NET_MODE" forwards="$DEF_FORWARDS" fwd_set=0
+
+    local name="" cpus="" mem="" disk="" rel="" port=""
+    local net_mode="" forwards="" fwd_set=0
+    local interactive=0
+
+    # decide the mode first: bare "ckvm create" on a TTY is interactive
+    if [ $# -eq 0 ] && [ "$IS_TTY" = 1 ]; then
+        interactive=1
+    fi
 
     while [ $# -gt 0 ]; do
         case "$1" in
@@ -504,26 +627,78 @@ cmd_create() {
             --port) port="$2"; shift 2 ;;
             --net)  net_mode="$2"; shift 2 ;;
             --fwd)  forwards="$2"; fwd_set=1; shift 2 ;;
+            -i|--interactive) interactive=1; shift ;;
             *)      name="$1"; shift ;;
         esac
     done
-    [ -n "$name" ] || die "usage: ckvm create <name> [--cpus N] [--mem MB] [--disk GB] [--rel 26.04] [--port N] [--net user|host] [--fwd 22,80,443]"
+
+    printf '\n'
+    printf '  %sckvm%s  ·  创建 Ubuntu 虚拟机\n' "$C_B" "$C_RST"
+    printf '  %s────────────────────────────%s\n' "$C_DIM" "$C_RST"
+
+    # ---------------- interactive flow ----------------
+    if [ "$interactive" = 1 ]; then
+        local chosen
+        chosen=$(pick_release) || { say "已取消"; return 0; }
+        rel=$(echo "$chosen" | cut -d'|' -f1)
+        local code lts size
+        code=$(echo "$chosen" | cut -d'|' -f2)
+        lts=$(echo "$chosen" | cut -d'|' -f3)
+        size=$(echo "$chosen" | cut -d'|' -f4)
+        say "选择：Ubuntu $rel $code ${lts:+($lts)}  ~$size"
+
+        printf '\n'
+        name=$(ask_with_default "虚拟机名字:" "ubuntu${rel%%.*}$(echo "$rel" | cut -d. -f2)")
+        cpus=$(ask_with_default "vCPU 数量:" "$DEF_CPUS")
+        mem=$(ask_with_default "内存 (MiB):" "$DEF_MEM")
+        disk=$(ask_with_default "磁盘 (GiB):" "$DEF_DISK_GB")
+        net_mode=$(ask_with_default "网络模式 user/host:" "$DEF_NET_MODE")
+        if [ "$net_mode" = "user" ]; then
+            forwards=$(ask_with_default "映射端口 (逗号分隔):" "$DEF_FORWARDS")
+            fwd_set=1
+        fi
+        printf '\n'
+    fi
+
+    # ---------------- defaults / validation ----------------
+    [ -n "$rel" ]       || rel="$DEF_REL"
+    [ -n "$name" ]      || name="ubuntu${rel%%.*}$(echo "$rel" | cut -d. -f2)"
+    [ -n "$cpus" ]      || cpus="$DEF_CPUS"
+    [ -n "$mem" ]       || mem="$DEF_MEM"
+    [ -n "$disk" ]      || disk="$DEF_DISK_GB"
+    [ -n "$net_mode" ]  || net_mode="$DEF_NET_MODE"
+    [ -n "$forwards" ]  || forwards="$DEF_FORWARDS"
+
+    # is this release in the catalogue at all?
+    if [ -z "$(catalogue_field "$rel" 1)" ]; then
+        die "unknown release '$rel'  (available: $(catalogue_versions | tr '\n' ' '))"
+    fi
+    valid_name "$name"
+    if [ -f "$(vm_conf "$name")" ]; then
+        die "guest '$name' already exists (use: ckvm rm $name)"
+    fi
     case "$net_mode" in
         user|host) ;;
         *) die "--net must be 'user' or 'host'" ;;
     esac
-    # host mode needs no port forwards unless asked for extra ones
     [ "$net_mode" = "host" ] && [ "$fwd_set" = 0 ] && forwards=""
-    valid_name "$name"
-    # a directory without vm.conf is a half-finished create, not an existing
-    # guest, so allow it to be resumed
-    if [ -f "$(vm_conf "$name")" ]; then
-        die "guest '$name' already exists (use: ckvm rm $name)"
+
+    # verify the image is really fetchable before creating anything
+    say "检查镜像可用性..."
+    local code lts size human
+    code=$(catalogue_field "$rel" 2)
+    lts=$(catalogue_field "$rel" 3)
+    size=$(catalogue_field "$rel" 4)
+    if ! check_release "$rel"; then
+        say "  目录里没有 $rel 的镜像，可用的源都试过了"
+        return 1
     fi
+    human=$(numfmt --to=iec "$CC_LEN" 2>/dev/null || echo "$CC_LEN")
+    say "  可用：Ubuntu $rel ($code${lts:+, $lts})  $human"
 
     check_firmware || return 1
+    mkdir -p "$(vm_dir "$name")"
     local d; d=$(vm_dir "$name")
-    mkdir -p "$d"
     [ -n "$port" ] || port=$(next_port)
 
     cat > "$d/vm.conf" <<EOF
@@ -540,8 +715,6 @@ CPUSET=$DEF_CPUSET
 VM_USER=$DEF_USER
 VM_PASS=$DEF_PASS
 VM_HOSTNAME=$name
-# user = QEMU NAT with the forwards below (works everywhere, needs no tap)
-# host = tap device, guest gets $TAP_IP_GUEST and runs its own sshd
 NET_MODE=$net_mode
 FORWARDS=$forwards
 EOF
@@ -550,18 +723,34 @@ EOF
     [ -f "$CKVM_FWDIR/edk2_vars.fd" ] || die "missing edk2_vars.fd in $CKVM_FWDIR"
     cp -f "$CKVM_FWDIR/edk2_vars.fd" "$d/uefi-vars.fd"
 
-    say "guest '$name' created (port $port, ${cpus} vCPU, ${mem} MiB, ${disk}G)"
+    printf '\n'
+    say "已创建 '$name'  (Ubuntu $rel, $port 端口, ${cpus} vCPU, ${mem} MiB, ${disk}G)"
     say "network: $net_mode${forwards:+ (forwards: $forwards)}"
     say "download backend: $(download_pick_backend)"
-    if [ -s "$d/disk.qcow2" ]; then
-        say "disk already present; skipping the download"
+
+    if [ -s "$d/disk.qcow2" ] && qemu-img info "$d/disk.qcow2" >/dev/null 2>&1; then
+        say "磁盘已存在，跳过下载"
         qemu-img resize "$d/disk.qcow2" "${disk}G" >/dev/null
     else
-        fetch_image "$name" || warn "image download failed; run 'ckvm image $name' later"
+        fetch_image "$name" || warn "镜像下载失败；稍后可跑 'ckvm image $name'"
     fi
     make_seed "$name"
-    say ""
-    say "start it with:  ckvm start $name"
+    printf '\n'
+    say "启动： ckvm start $name"
+}
+
+cmd_versions() {
+    if [ "$IS_TTY" = 1 ]; then
+        pick_release >/dev/null
+        return 0
+    fi
+    printf '  %-8s %-12s %-5s %s\n' VERSION CODENAME LTS SIZE
+    while IFS='|' read -r ver code lts size; do
+        [ -n "$ver" ] || continue
+        printf '  %-8s %-12s %-5s %s\n' "$ver" "$code" "${lts:-}" "$size"
+    done <<EOF
+$CATALOGUE
+EOF
 }
 
 cmd_image() {
@@ -1173,7 +1362,10 @@ ckvm $CKVM_VERSION - KVM guest manager (MT6833 / everpal)
       --repo <url>        same as -cn <url>
       CKVM_ACCEL=1        environment equivalent of -cn
 
-  ckvm create <name> [options]     create a guest (downloads the image)
+  ckvm create                      interactive store: pick a release and
+                                   answer a few prompts (default on a tty)
+  ckvm create <name> [options]     create a guest non-interactively
+  ckvm versions                    list the releases the store offers
         --cpus N    vCPU count          (default $DEF_CPUS)
         --mem  MB   memory              (default $DEF_MEM)
         --disk GB   disk size           (default $DEF_DISK_GB)
@@ -1233,6 +1425,7 @@ case "${1:-help}" in
     uninstall) cmd_uninstall ;;
     create)    shift; cmd_create "$@" ;;
     image)     shift; cmd_image "$@" ;;
+    versions|list-releases|releases) cmd_versions ;;
     start)     shift; cmd_start "$@" ;;
     stop)      shift; cmd_stop "$@" ;;
     restart)   shift; cmd_restart "$@" ;;

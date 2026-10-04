@@ -816,6 +816,80 @@ DROP = re.compile(
 
 ---
 
+### 8.5 交互式商店与版本目录
+
+`ckvm create` 不带参数并且 stdin/stdout 都是终端时进入交互模式：
+
+```bash
+if [ $# -eq 0 ] && [ "$IS_TTY" = 1 ]; then interactive=1; fi
+IS_TTY=0; [ -t 0 ] && [ -t 1 ] && IS_TTY=1
+```
+
+**给了名字或任何选项就走命令模式**，两条路径共用同一套校验与创建逻辑。
+
+可选的发行版目录内置在脚本里（`CATALOGUE`），格式 `版本|代号|LTS|大小`：
+
+```text
+22.04 jammy LTS 673M      24.04 noble LTS 592M      26.04 resolute LTS 902M
+22.10 kinetic   716M      24.10 oracular  584M
+23.04 lunar     688M      25.04 plucky    680M
+23.10 mantic    684M      25.10 questing  843M
+```
+
+代号与 LTS 状态取自 Ubuntu 官方的
+[meta-release](https://changelogs.ubuntu.com/meta-release)；镜像大小来自各镜像站
+的 `Content-Length`，本机实测：
+
+```text
+22.04 .. 26.04 全部 9 个版本
+  南京大学镜像 mirror.nju.edu.cn     全部可用
+  官方 cloud-images.ubuntu.com       全部可用
+  USTC ubuntu-cloud-images           仅 amd64，arm64 返回 403
+```
+
+**关键实现点：创建前先验证镜像可下。** 用一次 `HEAD` 请求读
+`Content-Length` 判断，而不是假定存在：
+
+```bash
+check_release() {
+    for url in $(image_urls "$rel"); do
+        len=$(curl -sSLkI --max-time 20 "$url" | \
+              awk 'BEGIN{IGNORECASE=1}/^content-length:/{gsub(/\r/,"");print $2}' | tail -1)
+        case "$len" in ''|*[!0-9]*) continue ;; esac   # 404/403 时没有该头
+        CC_URL="$url"; CC_LEN="$len"; return 0
+    done
+    return 1
+}
+```
+
+失败时直接报错并列出可用版本，**不会先建目录再卡在下载上**。
+
+实测（交互选 24.04，PTY 下）：
+
+```text
+选择：Ubuntu 24.04 noble (LTS)  ~592M
+  可用：Ubuntu 24.04 (noble, LTS)  592M
+已创建 'srv24'  (Ubuntu 24.04, 8025 端口, 4 vCPU, 1536 MiB, 30G)
+```
+
+启动后确认是真的 24.04，不是 26.04 换个标签：
+
+```text
+guest 内：  Ubuntu 24.04.5 LTS
+kernel:    6.8.0-142-generic          (26.04 是 7.0.0-38)
+ssh banner: SSH-2.0-OpenSSH_9.6p1 Ubuntu-3ubuntu13.19
+```
+
+**测试提醒**：验证交互模式必须给 stdin 一个真 PTY。`printf ... | cmd` 会让
+`[ -t 0 ]` 为假，脚本正确地走了非交互路径 —— 这曾让我误判"选择没生效"。
+用 `script -q -c 'cmd' /dev/null` 可以模拟真实终端：
+
+```bash
+printf '5\nsrv24\n4\n1536\n30\nuser\n22\n' | script -q -c 'ckvm create' /dev/null
+```
+
+---
+
 ## 9. 实测数据集
 
 ### 9.1 环境

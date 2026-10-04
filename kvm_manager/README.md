@@ -61,28 +61,81 @@ rm -rf /var/lib/ckvm    # 连数据一起删
 ## 快速开始
 
 ```bash
-ckvm create ubuntu26            # 下载镜像、建盘、配置，约 3 分钟
-ckvm start ubuntu26             # 启动，约 30 秒到登录
-ssh u0@127.0.0.1 -p 8023        # 密码 1
+ckvm create
 ```
 
-`create` 会告诉你怎么连：
+**直接跑 `ckvm create` 就是交互式**，像一个应用商店：
 
 ```text
-  guest 'ubuntu26' created (port 8023, 8 vCPU, 2048 MiB, 50G)
-  network: user (forwards: 22)
-  download backend: aria2c
-  source: https://mirror.nju.edu.cn/ubuntu-cloud-images/...
-  image ready
-  seed.img written (user u0 / password 1)
+  ckvm  ·  创建 Ubuntu 虚拟机
+  ────────────────────────────
 
-  start it with:  ckvm start ubuntu26
+  Ubuntu 版本
+  ──────  ────────────  ─────  ────────
+   1) 22.04    jammy        LTS     673M
+   2) 22.10    kinetic              716M
+   3) 23.04    lunar                688M
+   4) 23.10    mantic               684M
+   5) 24.04    noble        LTS     592M
+   6) 24.10    oracular             584M
+   7) 25.04    plucky               680M
+   8) 25.10    questing             843M
+   9) 26.04    resolute     LTS     902M
+   0) 取消
+
+  选择 [1-9] (默认 26.04): 5
+  选择：Ubuntu 24.04 noble (LTS)  ~592M
+  虚拟机名字: [ubuntu2404]: srv24
+  vCPU 数量: [8]: 4
+  内存 (MiB): [2048]: 1536
+  磁盘 (GiB): [50]: 30
+  网络模式 user/host: [user]:
+  映射端口 (逗号分隔): [22]:
+
+  检查镜像可用性...
+    可用：Ubuntu 24.04 (noble, LTS)  592M
+  已创建 'srv24'  (Ubuntu 24.04, 8025 端口, 4 vCPU, 1536 MiB, 30G)
 ```
 
-下载时会有进度条：
+每一步都有默认值，**直接回车就行**。选 `0` 取消。
+
+### 也可以命令式
+
+```bash
+ckvm create ubuntu26                       # 全默认
+ckvm create web --rel 24.04 --cpus 4       # 指定版本和规格
+ckvm create app --rel 22.04 --mem 1024 --disk 20
+```
+
+**只要给了名字或任何选项，就是命令模式**，不会有任何提问。
+
+### 看有哪些版本
+
+```bash
+ckvm versions
+```
 
 ```text
-  ⠼ ██░░░░░░░░░░░░░░░░░░░░░░   8%  76M
+  VERSION  CODENAME     LTS   SIZE
+  22.04    jammy        LTS   673M
+  22.10    kinetic            716M
+  23.04    lunar              688M
+  23.10    mantic             684M
+  24.04    noble        LTS   592M
+  24.10    oracular           584M
+  25.04    plucky             680M
+  25.10    questing           843M
+  26.04    resolute     LTS   902M
+```
+
+创建前会先**验证镜像真的能下**（探测 `Content-Length`），不可用会直接报错，
+不会让你等半天才发现下不了。
+
+### 启动
+
+```bash
+ckvm start srv24
+ssh u0@127.0.0.1 -p 8025        # 密码 1
 ```
 
 ---
@@ -146,7 +199,9 @@ ckvm list
 ckvm install [选项]              # 安装
 ckvm uninstall                   # 卸载
 
-ckvm create <名字> [选项]         # 新建
+ckvm create                      # 交互式（应用商店）
+ckvm create <名字> [选项]         # 命令式
+ckvm versions                    # 列出可选版本
 ckvm image <名字>                # 重新下载镜像
 ckvm start <名字> [-f]           # 启动（-f 前台）
 ckvm stop <名字>
