@@ -1044,9 +1044,9 @@ runcmd:
 ### 9.1 环境
 
 ```text
-设备     小米 MT6833 / everpal
+设备     小米 MT6833 / evergo
 容器     droidspaces Debian 13，systemd 为 PID 1
-内核     4.14.356-Everpal-KVM-CuiCanMX-v1.0
+内核     4.14.356-Evergo-KVM-CuiCanMX-v1.0
 QEMU     /usr/bin/qemu-system-aarch64
 guest    Ubuntu 26.04.1 LTS，kernel 7.0.0-38-generic
 ```
@@ -1433,7 +1433,7 @@ EL2 就重新归内核所有，`CONFIG_ARM64_VHE` 与 KVM 才有落脚点。
 正交，不因 GZ 是否禁用而改变。
 
 > **设备代号的说明**：本节的 `evergo` 指 **Redmi Note 11 5G**。本文第 1 章的
-> 实测数据来自代号 `everpal` 的设备（同为 MT6833）。两者是**不同的机器**，
+> 实测数据来自代号 `evergo` 的设备（同为 MT6833）。两者是**不同的机器**，
 > 第 11 章以外的内容与本节没有直接的设备对应关系，请勿混用。
 
 ### 11.11 致谢（重申）

@@ -1,7 +1,7 @@
 #!/bin/bash
 # =============================================================================
 #  🚀  ReSukiSU Kernel Builder
-#  🎯  Target : kernel-lxc_xiaomi_mtk810_mt6833 (everpal / MT6833)
+#  🎯  Target : kernel-lxc_xiaomi_mtk810_mt6833 (evergo / MT6833)
 #  📖  Usage  : ./build.sh [-cn [URL]] [--no-ccache] [--no-update]
 #                          [--no-menuconfig] [--save-config] [--check]
 # =============================================================================
@@ -40,7 +40,7 @@ usage() {
     printf "${C_BOLD}Environment:${C_RESET}\n"
     printf "  ${C_DIM}CLEAN_BUILD=true${C_RESET}      Full clean build\n"
     printf "  ${C_DIM}ZIP_ANY_KERNEL=false${C_RESET}  Skip AnyKernel3 packaging\n"
-    printf "  ${C_DIM}DEVICE=everpal${C_RESET}        Target device codename\n"
+    printf "  ${C_DIM}DEVICE=evergo${C_RESET}        Target device codename\n"
     printf "  ${C_DIM}TC_DIR=/path/clang${C_RESET}    Custom toolchain directory\n"
     printf "  ${C_DIM}ERROR_CTX=200${C_RESET}         Error context lines\n"
 }
@@ -412,7 +412,7 @@ ZIP_ANY_KERNEL="${ZIP_ANY_KERNEL:-true}"
 
 SECONDS=0
 DATE="$(date '+%Y%m%d-%H%M')"
-DEVICE="${DEVICE:-everpal}"
+DEVICE="${DEVICE:-evergo}"
 DEFCONFIG="${DEVICE}_defconfig"
 ZIPNAME="ReSukiSU-AdrenalinKernel-${DATE}.zip"
 
@@ -434,8 +434,8 @@ echo
 printf "${C_ORANGE}${C_BOLD}"
 cat <<'EOF'
    ╭─────────────────────────────────────────────────────╮
-   │  🚀  ReSukiSU Kernel Builder                        │
-   │  🎯  everpal / MT6833  ·  Android Kernel 4.14      │
+│  🚀  ReSukiSU Kernel Builder                        │
+│  🎯  evergo / MT6833  ·  Android Kernel 4.14        │
    ╰─────────────────────────────────────────────────────╯
 EOF
 printf "${C_RESET}\n"

@@ -1,6 +1,6 @@
 #!/bin/bash
 # =============================================================================
-#  ckvm - KVM guest manager for MT6833 / everpal (nVHE KVM, droidspaces)
+#  ckvm - KVM guest manager for MT6833 / evergo (nVHE KVM, droidspaces)
 #
 #  Install:   ./kvm-vm.sh install          -> /usr/local/bin/ckvm
 #  Then:      ckvm create ubuntu26
@@ -1646,7 +1646,7 @@ cmd_uninstall() {
 
 cmd_help() {
     cat <<EOF
-ckvm $CKVM_VERSION - KVM guest manager (MT6833 / everpal)
+ckvm $CKVM_VERSION - KVM guest manager (MT6833 / evergo)
 
   ckvm install [options]           install to $CKVM_BINDIR/ckvm + systemd unit
   ckvm uninstall                   remove the binary and unit

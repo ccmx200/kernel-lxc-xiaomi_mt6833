@@ -1,19 +1,19 @@
-# Everpal / MT6833 Kernel
+# Evergo / MT6833 Kernel
 
 ReSukiSU + KVM + BBRv2 + zstd/lz4 + Binder 优化内核。
 
 ## 基本信息
 
-- 设备：xiaomi MT6833 / everpal
+- 设备：xiaomi MT6833 / evergo
 - 内核版本：Linux 4.14.356
 - 当前版本号：
   ```text
-  4.14.356-Everpal-KVM-CuiCanMX-v1.0
-  # uname -r -> 4.14.356-Everpal-KVM-CuiCanMX-v1.0
+  4.14.356-Evergo-KVM-CuiCanMX-v1.0
+  # uname -r -> 4.14.356-Evergo-KVM-CuiCanMX-v1.0
   ```
 - 默认 defconfig：
   ```text
-  arch/arm64/configs/everpal_defconfig
+  arch/arm64/configs/evergo_defconfig
   ```
 - 编译脚本：
   ```text

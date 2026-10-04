@@ -1,6 +1,6 @@
 # ckvm — KVM 虚拟机管理器
 
-在 MT6833 / everpal（小米天玑 810 机型）上跑**硬件加速**的 KVM 虚拟机。
+在 MT6833 / evergo（小米天玑 810 机型）上跑**硬件加速**的 KVM 虚拟机。
 装在 droidspaces 容器里，用 systemd 管理，支持多开。
 
 > 想了解**为什么**这么设计、每处改动的依据和实测数据，
@@ -522,9 +522,9 @@ ckvm console <名字> -a       # 显示全部
 ## 环境
 
 ```text
-设备    小米 MT6833 / everpal
+设备    小米 MT6833 / evergo
 容器    droidspaces（Debian 13，systemd 作为 PID 1）
-内核    4.14.356-Everpal-KVM-CuiCanMX-v1.0
+内核    4.14.356-Evergo-KVM-CuiCanMX-v1.0
 guest   Ubuntu 26.04.1 LTS
 ```
 

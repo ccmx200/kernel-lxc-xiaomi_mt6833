@@ -1,4 +1,4 @@
-# KVM on MT6833 / everpal — 技术说明
+# KVM on MT6833 / evergo — 技术说明
 
 面向想搞清楚原理或要改这套东西的人。只想用虚拟机的看根目录 `README.md`。
 
