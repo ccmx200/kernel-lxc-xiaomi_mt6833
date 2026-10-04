@@ -4,20 +4,26 @@
 #
 #  Usage:
 #     ./kvm-vm.sh start     start the guest (default)
-#     ./kvm-vm.sh stop      stop the guest cleanly
-#     ./kvm-vm.sh status    show state, serial tail, ssh banner
+#     ./kvm-vm.sh stop      stop the guest
+#     ./kvm-vm.sh status    show state, serial tail, ssh forward
 #     ./kvm-vm.sh console   follow the serial console
 #
-#  Notes (these are real, measured constraints - do not "clean them up"):
-#   * The firmware must be the NVRAM-free EDK2 build.  A normal EDK2 writes
-#     pflash NVRAM with writeback/exclusive stores, which never set
-#     ESR_EL2.ISV; this KVM cannot decode those, so the vCPU wedges.
-#   * 4 vCPUs is the usable maximum.  8 makes the firmware ASSERT, and
-#     fewer than 4 currently fails vCPU creation with EINVAL.
-#   * KVM vCPU creation right after a guest exits is flaky, hence the
-#     settle delay plus the throwaway warm-up guest.
-#   * The NVRAM variable store is refreshed on every start; a stale one
-#     makes GRUB load and then hang.
+#  Two things matter and are easy to get wrong:
+#
+#  1. taskset -c 6-7  (pin to the Cortex-A76 big cores)
+#     This SoC is big.LITTLE: 6x A55 (0xd05) + 2x A76 (0xd0b) with different
+#     ID register values.  If QEMU is left free to migrate, it may probe the
+#     host CPU on one core type and then have KVM reject the register writes
+#     with EINVAL on the other ->
+#        "Failed to put registers after init: Invalid argument"
+#     Measured: pinned 3/3 starts succeed, unpinned 0/3.
+#
+#  2. The firmware must be the NVRAM-free EDK2 build
+#     A normal EDK2 writes the pflash variable store with writeback/
+#     exclusive stores, which never set ESR_EL2.ISV; this KVM cannot decode
+#     those, so the guest wedges.  uefi-code.fd is the NVRAM-free build.
+#
+#  Everything else is plain QEMU.
 # =============================================================================
 set -u
 
@@ -32,58 +38,38 @@ LOG=/tmp/kvm.log
 ERR=/tmp/kvm.err
 PIDF=/tmp/kvm.pid
 
-SSH_PORT=8023
-CPUS=4
+CPUS=4                      # 4 is the usable maximum; 8 makes the firmware ASSERT
 MEM=2048
+SSH_PORT=8023
+CPUSET="6-7"                # the two Cortex-A76 cores
 
 QEMU=/usr/bin/qemu-system-aarch64
 
 say() { printf '  %s\n' "$*"; }
 
-require_files() {
-    local missing=0
-    for f in "$FIRMWARE" "$VARS_TPL" "$DISK" "$SEED"; do
-        if [ ! -f "$f" ]; then
-            say "MISSING: $f"
-            missing=1
-        fi
-    done
-    [ "$missing" -eq 0 ] || { say "cannot start: files missing"; exit 1; }
-}
-
 stop_guest() {
-    if pgrep -f "qemu-system-aarch64" >/dev/null 2>&1; then
-        say "stopping guest (graceful)..."
-        for p in $(pgrep -f qemu-system-aarch64); do kill -15 "$p" 2>/dev/null; done
-        sleep 5
-        for p in $(pgrep -f qemu-system-aarch64); do kill -9 "$p" 2>/dev/null; done
-        sleep 5
-    fi
+    for p in $(pgrep -f qemu-system-aarch64 2>/dev/null); do
+        kill -15 "$p" 2>/dev/null
+    done
+    sleep 4
+    for p in $(pgrep -f qemu-system-aarch64 2>/dev/null); do
+        kill -9 "$p" 2>/dev/null
+    done
     rm -f "$PIDF"
-    pgrep -f qemu-system-aarch64 >/dev/null 2>&1 \
-        && say "warning: qemu still running" || say "stopped"
-}
-
-warmup() {
-    say "warming up KVM..."
-    "$QEMU" -name warmup -M virt,gic-version=3 -cpu max -accel kvm \
-        -smp 1 -m 512 -display none -serial null >/dev/null 2>&1 &
-    local w=$!
-    sleep 5
-    kill -15 "$w" 2>/dev/null; sleep 4; kill -9 "$w" 2>/dev/null
-    wait "$w" 2>/dev/null
-    sleep 2
+    say "stopped"
 }
 
 start_guest() {
-    require_files
+    for f in "$FIRMWARE" "$VARS_TPL" "$DISK" "$SEED"; do
+        [ -f "$f" ] || { say "MISSING: $f"; exit 1; }
+    done
+
     stop_guest
-    cp -f "$VARS_TPL" "$VARS"
-    say "fresh NVRAM in place"
-    warmup
+    sleep 2
+    cp -f "$VARS_TPL" "$VARS"          # fresh NVRAM each boot
 
     rm -f "$LOG" "$ERR" "$PIDF"
-    nohup "$QEMU" -name ubuntu2604 \
+    nohup taskset -c "$CPUSET" "$QEMU" -name ubuntu2604 \
         -M virt,gic-version=3 -cpu max -accel kvm -smp "$CPUS" -m "$MEM" \
         -drive if=pflash,format=raw,unit=0,file="$FIRMWARE",readonly=on \
         -drive if=pflash,format=raw,unit=1,file="$VARS" \
@@ -94,23 +80,23 @@ start_guest() {
         -display none -serial file:"$LOG" \
         > "$ERR" 2>&1 &
     echo $! > "$PIDF"
-    sleep 8
+    sleep 6
 
     local p; p=$(cat "$PIDF")
     if ! kill -0 "$p" 2>/dev/null; then
         say "FAILED: $(head -1 "$ERR" 2>/dev/null)"
+        say "hint: is '$CPUSET' a valid cpuset on this device?"
         exit 1
     fi
-    say "guest running, pid=$p"
-    say "waiting for the login prompt..."
+    say "guest running (pid $p), waiting for login prompt..."
     for _ in $(seq 1 20); do
         grep -aq "login:" "$LOG" 2>/dev/null && break
         sleep 3
     done
     if grep -aq "login:" "$LOG" 2>/dev/null; then
-        say "ready.  ssh u0_207@127.0.0.1 -p ${SSH_PORT}   (password: 1)"
+        say "ready:  ssh u0_207@127.0.0.1 -p ${SSH_PORT}   (password: 1)"
     else
-        say "not at login yet - check '$0 console'"
+        say "not at login yet; try '$0 console'"
     fi
 }
 
@@ -119,21 +105,17 @@ show_status() {
     [ -f "$PIDF" ] && p=$(cat "$PIDF")
     if [ -n "$p" ] && kill -0 "$p" 2>/dev/null; then
         local ut cs
-        ut=$(awk '{print $14+$15}' /proc/$p/stat 2>/dev/null)
+        ut=$(awk '{print $14+$15}' "/proc/$p/stat" 2>/dev/null)
         cs=$(awk -v t="$ut" -v c="$(getconf CLK_TCK)" 'BEGIN{printf "%.0f", t/c}')
         say "guest: running (pid $p, cpu ${cs}s)"
     else
         say "guest: not running"
     fi
     say "serial: $(wc -c < "$LOG" 2>/dev/null || echo 0) bytes"
-    if grep -aq "login:" "$LOG" 2>/dev/null; then
-        say "login prompt: present"
-    fi
-    if ss -tln 2>/dev/null | grep -q ":${SSH_PORT} "; then
-        say "ssh forward: listening on ${SSH_PORT}"
-    else
-        say "ssh forward: not listening"
-    fi
+    grep -aq "login:" "$LOG" 2>/dev/null && say "login prompt: present"
+    ss -tln 2>/dev/null | grep -q ":${SSH_PORT} " \
+        && say "ssh forward: listening on ${SSH_PORT}" \
+        || say "ssh forward: not listening"
     say "--- serial tail ---"
     tr -d '\000' < "$LOG" 2>/dev/null | tail -8
 }

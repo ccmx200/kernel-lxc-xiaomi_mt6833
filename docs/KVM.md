@@ -168,27 +168,50 @@ edk2_vars.fd                   sha256 b3b855c5a80310168051164986855692d1bdb06e67
 
 ---
 
-## 5. 运行期的三个坑（都已固化进 `kvm-vm.sh`）
+## 5. 运行期的坑（都已固化进 `kvm-vm.sh`）
 
-### 5.1 vCPU 数量只能是 4
+### 5.1 必须绑核：`taskset -c 6-7`（**这是最关键的坑**）
 
-- `-smp 8` → 固件断言失败
-  `ASSERT [ArmPlatformPrePeiCore] .../MainUniCore.c(17)`
-- `-smp 1/2` → vCPU 创建报 `Failed to put registers after init: Invalid argument`
+这颗 SoC 是 big.LITTLE，两种核心的 ID 寄存器值不同：
+
+```text
+CPU part 0xd05 (Cortex-A55) × 6
+CPU part 0xd0b (Cortex-A76) × 2
+```
+
+QEMU 启动时会先建一个临时 vCPU 去**探测宿主 CPU 特性**，然后把这些值
+写到真正的 vCPU 上。如果进程没有绑定核心，可能出现：
+
+- 探测时调度到 A76，拿到一套寄存器值
+- 建 vCPU 时调度到 A55，内核给出**另一套**值
+- QEMU 写入它以为正确的值 → 内核发现"这是常量寄存器但值不一致" → `EINVAL`
+
+QEMU 源码里那句注释正是这个意思：
+
+> We might fail for *"you tried to set a register which is constant with a
+> different value from what it actually contains"*.
+
+实测（各 3 次，配置完全相同）：
+
+```text
+taskset -c 6-7   → 3 成功 / 0 失败
+不绑核            → 0 成功 / 3 失败
+```
+
+**这就是之前所有"时好时坏"假象的来源**：不是间歇性，是调度随机落在大核
+还是小核。绑核后 100% 稳定，不需要任何预热或延迟。
+
+### 5.2 vCPU 数量只能是 4
+
+- `-smp 8` → 固件断言 `ASSERT [ArmPlatformPrePeiCore] .../MainUniCore.c(17)`
+- `-smp 1/2` → 偶发 `Failed to put registers after init: Invalid argument`
 
 Limbo 的 "100% Success Mode" 也是先跑 4 核、进系统后再放开。
 
-### 5.2 KVM vCPU 创建是间歇性的
+### 5.3 NVRAM 变量存储建议每次刷新
 
-每次 guest 退出后紧接着启动，**第一次几乎必失败**（EINVAL）。规避方式：
-
-1. 先 `kill -15` 优雅退出，等 5s，再 `kill -9`，再等 5s
-2. 起一个一次性 1 核小 guest 作预热，退出后再起正式的
-
-### 5.3 NVRAM 变量存储必须每次刷新
-
-反复启动会用旧变量存储，表现为 **GRUB 加载后卡死**（CPU 满载、串口不动）。
-每次启动前从模板 `cp` 一份干净的即可。
+反复启动会沿用旧变量存储。虽然绑核后不再是必现问题，但每次启动从模板
+`cp` 一份干净的仍然更稳。
 
 ---
 
@@ -234,3 +257,7 @@ Memory        1946 MiB
 ```
 
 启动约 30 秒到登录提示。完整参数见 `kvm-vm.sh`。
+
+> 注：vCPU 创建失败那条**属于内核侧问题**（big.LITTLE 下 KVM 不保证
+> ID 寄存器视图一致），但绑核即可完全规避。其余两条是固件问题。
+
