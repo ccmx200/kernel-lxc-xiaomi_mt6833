@@ -712,26 +712,73 @@ REPO_GITHUB_CN="https://git.yylx.win/github.com/ccmx200/kernel-lxc-xiaomi_mt6833
 REPO_MIRRORS_CN="git.yylx.win=https://git.yylx.win/github.com/ccmx200/kernel-lxc-xiaomi_mt6833/raw/resukisu/kvm_manager ghproxy.net=https://ghproxy.net/https://raw.githubusercontent.com/ccmx200/kernel-lxc-xiaomi_mt6833/resukisu/kvm_manager gh-proxy.com=https://gh-proxy.com/https://raw.githubusercontent.com/ccmx200/kernel-lxc-xiaomi_mt6833/resukisu/kvm_manager"
 
 CKVM_REPO=""          # resolved by resolve_repo()
-CKVM_USING_CN=0
+CKVM_USING_CN=0       # 1 when any acceleration is in play
+GH_UPSTREAM="https://raw.githubusercontent.com/ccmx200/kernel-lxc-xiaomi_mt6833/resukisu/kvm_manager"
+GH_UPSTREAM_PATH="github.com/ccmx200/kernel-lxc-xiaomi_mt6833/raw/resukisu/kvm_manager"
 
+# Turn whatever the user typed into a usable "base + file" prefix.
+# Accepted forms:
+#   https://ghproxy.net/https://raw.githubusercontent.com/...   (full prefix)
+#   https://ghproxy.net                                         (we append the upstream path)
+#   ghproxy.net                                                 (scheme assumed https)
+#   https://my.mirror/{url}                                     (placeholder, {url} or %s)
+normalise_mirror() {
+    local m="$1"
+    case "$m" in
+        *'%s'*)  m="${m//\%s/$GH_UPSTREAM}"; echo "$m"; return ;;
+    esac
+    case "$m" in
+        *'{url}'*) m="${m//\{url\}/$GH_UPSTREAM}"; echo "$m"; return ;;
+    esac
+    case "$m" in
+        *'raw.githubusercontent.com'*) echo "$m"; return ;;
+    esac
+    case "$m" in
+        *github.com/ccmx200*) echo "$m"; return ;;
+    esac
+    case "$m" in
+        http://*|https://*) echo "${m%/}/$GH_UPSTREAM_PATH" ;;
+        *)                  echo "https://$m/$GH_UPSTREAM_PATH" ;;
+    esac
+}
+
+# $1 = acceleration request, which may be:
+#      ""       -> plain GitHub
+#      1 / cn   -> probe the built-in accelerator list
+#      <URL>    -> use the user's own mirror, alone
 resolve_repo() {
-    local accel="${1:-${CKVM_ACCEL:-0}}" pair name url
-    if [ "$accel" = "1" ] || [ "$accel" = "cn" ]; then
-        CKVM_USING_CN=1
-        for pair in $REPO_MIRRORS_CN; do
-            name=${pair%%=*}; url=${pair#*=}
-            if curl -fsSLk --max-time 20 -o /dev/null "$url/kvm-vm.sh" 2>/dev/null; then
+    local req="${1:-${CKVM_ACCEL:-0}}" pair name url
+
+    # an explicit URL (a user-supplied accelerator)
+    case "$req" in
+        ""|0|no|off) ;;
+        1|cn|yes)
+            CKVM_USING_CN=1
+            for pair in $REPO_MIRRORS_CN; do
+                name=${pair%%=*}; url=${pair#*=}
+                if curl -fsSLk --max-time 20 -o /dev/null "$url/kvm-vm.sh" 2>/dev/null; then
+                    CKVM_REPO="$url"
+                    say "using accelerator: $name"
+                    return 0
+                fi
+            done
+            warn "no built-in accelerator is reachable; falling back to GitHub"
+            ;;
+        *)
+            CKVM_USING_CN=1
+            url=$(normalise_mirror "$req")
+            if curl -fsSLk --max-time 25 -o /dev/null "$url/kvm-vm.sh" 2>/dev/null; then
                 CKVM_REPO="$url"
-                say "using accelerator: $name"
+                say "using your accelerator: $CKVM_REPO"
                 return 0
             fi
-        done
-        warn "no accelerator reachable; falling back to GitHub"
-    fi
+            warn "your accelerator did not answer: $url"
+            warn "falling back to GitHub"
+            ;;
+    esac
     CKVM_REPO="$REPO_GITHUB"
     return 0
 }
-
 # download one file from the resolved repo
 fetch_repo_file() {
     local rel="$1" out="$2"
@@ -745,19 +792,35 @@ fetch_repo_file() {
 
 cmd_install() {
     need_root
-    local accel=0
+    local accel="${CKVM_ACCEL:-0}"
     while [ $# -gt 0 ]; do
         case "$1" in
-            -cn|--cn|--china) accel=1; shift ;;
+            -cn|--cn|--china)
+                # -cn alone probes the built-in list; -cn <url> uses yours
+                if [ -n "${2:-}" ] && [ "${2#-}" = "$2" ]; then
+                    accel="$2"; shift 2
+                else
+                    accel=1; shift
+                fi
+                ;;
+            --repo|--mirror) accel="$2"; shift 2 ;;
             *) shift ;;
         esac
     done
     mkdir -p "$CKVM_ROOT" "$CKVM_FWDIR"
     resolve_repo "$accel"
 
-    # when the script was piped in, $0 is not the file we want to install
-    if [ -f "$0" ] && [ "$(readlink -f "$0")" != "$CKVM_BINDIR/ckvm" ]; then
-        install -m 0755 "$0" "$CKVM_BINDIR/ckvm"
+    # Where did we come from?  Piped installs ($0 = bash/sh) must refetch;
+    # a real file can just be copied.
+    local self="" source_dir=""
+    if [ -f "$0" ] && [ "$(basename "$0")" != "bash" ] \
+       && [ "$(basename "$0")" != "sh" ]; then
+        self=$(readlink -f "$0")
+        source_dir=$(dirname "$self")
+    fi
+
+    if [ -n "$self" ] && [ "$self" != "$(readlink -f "$CKVM_BINDIR/ckvm" 2>/dev/null)" ]; then
+        install -m 0755 "$self" "$CKVM_BINDIR/ckvm"
     else
         say "fetching ckvm"
         local base
@@ -765,26 +828,23 @@ cmd_install() {
             chmod 0755 "$CKVM_BINDIR/ckvm"
             say "  from $base"
         else
-            die "could not download kvm-vm.sh from any mirror"
+            die "could not download kvm-vm.sh  (try: install -cn <your-mirror>)"
         fi
     fi
     say "installed: $CKVM_BINDIR/ckvm"
 
-    # firmware: prefer the repo copy (it ships next to the script), then
-    # anything already staged on this device
+    # firmware: whatever is already on the device wins; otherwise fetch it
     local src="" cand
     for cand in "$CKVM_FWDIR/edk2_qemu_aarch64_nonvram.fd" \
-                "$(dirname "$0")/edk2_qemu_aarch64_nonvram.fd"; do
-        [ -f "$cand" ] && { src="$cand"; break; }
+                "$source_dir/edk2_qemu_aarch64_nonvram.fd"; do
+        [ -n "$cand" ] && [ -f "$cand" ] && { src="$cand"; break; }
     done
-    if [ -z "$src" ]; then
-        src=$(find_firmware) || src=""
-    fi
+    [ -z "$src" ] && src=$(find_firmware) || true
 
     if [ -n "$src" ]; then
         install_firmware "$src"
     else
-        say "firmware not bundled locally; fetching it from the repo"
+        say "firmware not present; fetching it"
         local ok=0 f
         for f in edk2_qemu_aarch64_nonvram.fd edk2_vars.fd; do
             if fetch_repo_file "$f" "$CKVM_FWDIR/$f" >/dev/null; then
@@ -806,7 +866,6 @@ cmd_install() {
     say ""
     say "try:  ckvm create ubuntu26 && ckvm start ubuntu26 && ckvm list"
 }
-
 cmd_uninstall() {
     need_root
     systemctl disable --now 'ckvm@*' >/dev/null 2>&1 || true
@@ -819,8 +878,20 @@ cmd_help() {
     cat <<EOF
 ckvm $CKVM_VERSION - KVM guest manager (MT6833 / everpal)
 
-  ckvm install                     install to $CKVM_BINDIR/ckvm + systemd unit
+  ckvm install [options]           install to $CKVM_BINDIR/ckvm + systemd unit
   ckvm uninstall                   remove the binary and unit
+
+    download source (default is plain GitHub, nothing is rewritten):
+      (none)              use GitHub directly
+      -cn                 probe the built-in accelerator list, use the first
+                          that answers
+      -cn <url>           use YOUR accelerator; accepts a full prefix, a bare
+                          host, or a template with {url} or %s:
+                            -cn https://your.proxy
+                            -cn your.proxy
+                            -cn "https://your.proxy/{url}"
+      --repo <url>        same as -cn <url>
+      CKVM_ACCEL=1        environment equivalent of -cn
 
   ckvm create <name> [options]     create a guest (downloads the image)
         --cpus N    vCPU count          (default $DEF_CPUS)
@@ -846,13 +917,13 @@ ckvm $CKVM_VERSION - KVM guest manager (MT6833 / everpal)
   ckvm enable <name>               enable + start under systemd
   ckvm disable <name>              disable the systemd unit
 
+  ckvm net [name]                  show the container / guest network layout
   ckvm config [name]               show global or per-guest settings
   ckvm edit <name>                 edit a guest's vm.conf
 
 Files: $CKVM_ROOT/<name>/    firmware: $CKVM_FWDIR
 EOF
 }
-
 case "${1:-help}" in
     install)   shift; cmd_install "$@" ;;
     uninstall) cmd_uninstall ;;

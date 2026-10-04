@@ -13,54 +13,70 @@
 curl -fsSLk https://raw.githubusercontent.com/ccmx200/kernel-lxc-xiaomi_mt6833/resukisu/kvm_manager/kvm-vm.sh | bash -s -- install
 ```
 
-**默认走 GitHub 官方源**，不做任何加速或改写。
+**默认走 GitHub 官方源**，脚本不做任何加速、不改写地址。
 
-### 国内网络：显式加 `-cn`
+---
 
-```bash
-curl -fsSLk https://raw.githubusercontent.com/ccmx200/kernel-lxc-xiaomi_mt6833/resukisu/kvm_manager/kvm-vm.sh | bash -s -- install -cn
-```
+### 用加速：`-cn`
 
-或者用环境变量：
+自己指定加速地址（推荐，你可以填自己惯用的那个）：
 
 ```bash
-CKVM_ACCEL=1 curl -fsSLk <地址> | bash -s -- install
+curl -fsSLk <任意能通的地址抓脚本> -o /tmp/ckvm.sh
+bash /tmp/ckvm.sh install -cn https://你的加速地址
 ```
 
-`-cn` 会按顺序探测这些加速地址，用第一个通的：
+`-cn` 支持三种写法，都会自动补上仓库路径：
+
+```bash
+# 1. 完整前缀
+install -cn https://ghproxy.net/https://raw.githubusercontent.com
+
+# 2. 只给主机名（自动拼 github 路径）
+install -cn https://ghproxy.net
+install -cn ghproxy.net
+
+# 3. 模板，{url} 或 %s 会被替换成真实的 GitHub 地址
+install -cn "https://你的代理/{url}"
+install -cn "https://你的代理/%s"
+```
+
+也可以用 `--repo`，等价：
+
+```bash
+install --repo https://ghproxy.net
+```
+
+或者环境变量：
+
+```bash
+CKVM_ACCEL=https://ghproxy.net bash /tmp/ckvm.sh install
+```
+
+**不传 URL 时**（就是单独的 `-cn`），会按顺序探测内置的三个通用加速：
 
 ```text
-git.yylx.win   →   ghproxy.net   →   gh-proxy.com
+git.yylx.win  →  ghproxy.net  →  gh-proxy.com
 ```
 
-**加速是显式选择，不是默认行为。** 不加 `-cn` 就老老实实走 GitHub；
-加了 `-cn` 但都不通会自动回落到 GitHub，不会静默改源。
+用第一个通的。
 
-### 直接给地址
+> 你自己给的地址如果不通，脚本会明确提示并**回落到 GitHub**，
+> 不会静默换成别的源。
 
-```bash
-curl -fsSLk https://你的镜像/kvm-vm.sh | bash -s -- install
-```
+---
 
-### GitHub 被墙时
+### 为什么要先手动抓脚本
 
-这台设备实测**直连 GitHub 会被重置**（`raw.githubusercontent.com` 和
-`github.com` 都是 `Connection reset by peer`）。
-
-这种情况下的正确做法是**先手动把脚本抓下来再装**（`-cn` 内部也会探测，
-但 curl 自己那一跳已经在墙上了，得先绕过）：
+因为 `curl | bash` 那一跳本身也要过网络。如果 GitHub 被墙，`curl` 就已经
+失败了，根本轮不到 `-cn` 生效。所以正确姿势是：
 
 ```bash
-# 任选一个能通的加速地址去抓脚本本身
-curl -fsSLk https://git.yylx.win/github.com/ccmx200/kernel-lxc-xiaomi_mt6833/raw/resukisu/kvm_manager/kvm-vm.sh -o /tmp/ckvm.sh
-bash /tmp/ckvm.sh install -cn          # 脚本和固件的下载走加速
-```
-
-或者：
-
-```bash
+# 用你能通的任意方式先把脚本拿下来
 curl -fsSLk https://ghproxy.net/https://raw.githubusercontent.com/ccmx200/kernel-lxc-xiaomi_mt6833/resukisu/kvm_manager/kvm-vm.sh -o /tmp/ckvm.sh
-bash /tmp/ckvm.sh install -cn
+
+# 再让 install 去下载脚本自身和固件
+bash /tmp/ckvm.sh install -cn https://ghproxy.net
 ```
 
 ### 想先看脚本内容
@@ -323,7 +339,7 @@ journalctl -u     ckvm@ubuntu26
 | `CKVM_BINDIR` | `/usr/local/bin` | 命令安装位置 |
 | `MIRROR_IMAGE_LIST` | NJU + 官方 | 系统镜像源，按顺序回退 |
 | `MIRROR_APT` | USTC | 写进 cloud-init 的 apt 源 |
-| `CKVM_ACCEL` | `0` | 设 `1` 等价于 `install -cn` |
+| `CKVM_ACCEL` | `0` | `1` = 探测内置加速；也可以直接填一个加速地址 |
 
 ### 单个虚拟机
 
