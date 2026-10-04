@@ -1246,15 +1246,22 @@ cmd_net() {
 # The default is plain GitHub.  Acceleration is opt-in: pass -cn to install,
 # or set CKVM_ACCEL=1, and the well-known GitHub-frontend mirrors are used
 # instead.  Nothing here silently rewrites the source.
-REPO_GITHUB="https://raw.githubusercontent.com/ccmx200/kernel-lxc-xiaomi_mt6833/resukisu/kvm_manager"
-REPO_GITHUB_CN="https://git.yylx.win/github.com/ccmx200/kernel-lxc-xiaomi_mt6833/raw/resukisu/kvm_manager"
+#
+# NOTE: use the full ref path "refs/heads/<branch>", not the bare branch name.
+# The GitHub frontends cache by URL path, and a bare "resukisu" was serving a
+# revision several commits old (observed: x-cache: HIT, x-cache-hits: 24,
+# cache-control: max-age=300) while "refs/heads/resukisu" returned the current
+# file.  The path difference is enough to miss that cache.
+REPO_BRANCH="refs/heads/resukisu"
+REPO_GITHUB="https://raw.githubusercontent.com/ccmx200/kernel-lxc-xiaomi_mt6833/${REPO_BRANCH}/kvm_manager"
+REPO_GITHUB_CN="https://git.yylx.win/github.com/ccmx200/kernel-lxc-xiaomi_mt6833/raw/${REPO_BRANCH}/kvm_manager"
 # name=url pairs so `-cn` can fall through them in order if one is down
-REPO_MIRRORS_CN="git.yylx.win=https://git.yylx.win/github.com/ccmx200/kernel-lxc-xiaomi_mt6833/raw/resukisu/kvm_manager ghproxy.net=https://ghproxy.net/https://raw.githubusercontent.com/ccmx200/kernel-lxc-xiaomi_mt6833/resukisu/kvm_manager gh-proxy.com=https://gh-proxy.com/https://raw.githubusercontent.com/ccmx200/kernel-lxc-xiaomi_mt6833/resukisu/kvm_manager"
+REPO_MIRRORS_CN="git.yylx.win=https://git.yylx.win/raw.githubusercontent.com/ccmx200/kernel-lxc-xiaomi_mt6833/${REPO_BRANCH}/kvm_manager ghproxy.net=https://ghproxy.net/https://raw.githubusercontent.com/ccmx200/kernel-lxc-xiaomi_mt6833/${REPO_BRANCH}/kvm_manager gh-proxy.com=https://gh-proxy.com/https://raw.githubusercontent.com/ccmx200/kernel-lxc-xiaomi_mt6833/${REPO_BRANCH}/kvm_manager"
 
 CKVM_REPO=""          # resolved by resolve_repo()
 CKVM_USING_CN=0       # 1 when any acceleration is in play
 GH_UPSTREAM="https://raw.githubusercontent.com/ccmx200/kernel-lxc-xiaomi_mt6833/resukisu/kvm_manager"
-GH_UPSTREAM_PATH="github.com/ccmx200/kernel-lxc-xiaomi_mt6833/raw/resukisu/kvm_manager"
+GH_UPSTREAM_PATH="github.com/ccmx200/kernel-lxc-xiaomi_mt6833/raw/refs/heads/resukisu/kvm_manager"
 
 # Turn whatever the user typed into a usable "base + file" prefix.
 # Accepted forms:

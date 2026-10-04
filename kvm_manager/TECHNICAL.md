@@ -633,6 +633,27 @@ VERDICT: PASS - never exceeded 100%
 
 **默认是 GitHub 官方地址，不做任何加速或改写。** 加速需显式请求：
 
+#### 为什么 URL 用 `refs/heads/<branch>`
+
+GitHub 的加速镜像按 **URL 路径**缓存。实测同一个仓库、同一份文件：
+
+```text
+.../resukisu/kvm_manager/kvm-vm.sh             51871 bytes   stale
+.../refs/heads/resukisu/kvm_manager/kvm-vm.sh  56456 bytes   FRESH
+```
+
+响应头证实了缓存行为：
+
+```text
+cache-control: max-age=300
+x-cache: HIT
+x-cache-hits: 24
+```
+
+裸分支名命中了缓存条目（`HIT`，已命中 24 次），而完整 ref 路径是新的
+缓存键。两者内容相同，只是路径写法不同 —— 所以脚本统一使用
+`refs/heads/resukisu`。
+
 ```bash
 install -cn                    # 探测内置列表
 install -cn <url>              # 用用户自己的地址
@@ -654,6 +675,31 @@ CKVM_ACCEL=<url>
 本机实测：`raw.githubusercontent.com` 与 `github.com` 均
 `Connection reset by peer`（TLS 被重置）；`git.yylx.win`、`ghproxy.net`、
 `gh-proxy.com` 均返回 200。
+
+### 7.4.1 为什么要校验下载
+
+`install` 之前会把镜像返回的**任何**字节直接写进 `/usr/local/bin/ckvm`。
+两种失败都真实发生过：
+
+| 情况 | 症状 |
+|---|---|
+| 镜像发旧版本 | 缺少新命令（`ckvm versions` 报 usage） |
+| 响应被截断（实测抓到 2993 字节的错误响应） | 脚本解析到一半失败，运行时报 `--fwd: command not found` |
+
+现在下载必须通过全部检查才会替换目标文件：
+
+```bash
+verify_download() {
+    head -1 "$f" | grep -q '^#!/bin/bash'   || return 1
+    grep -q 'CKVM_BUILD=' "$f"              || return 1   # 版本标记
+    grep -q 'cmd_versions()' "$f"           || return 1   # 特征函数
+    bash -n "$f" 2>/dev/null                || return 1   # 能解析
+}
+```
+
+脚本顶部因此有一个 `CKVM_BUILD` 标记，新功能上线时一并更新。
+
+---
 
 ### 7.5 安装的原子性
 

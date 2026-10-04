@@ -12,10 +12,21 @@
 ## 一键安装
 
 ```bash
-curl -fsSLk https://raw.githubusercontent.com/ccmx200/kernel-lxc-xiaomi_mt6833/resukisu/kvm_manager/kvm-vm.sh | bash -s -- install
+curl -fsSLk https://raw.githubusercontent.com/ccmx200/kernel-lxc-xiaomi_mt6833/refs/heads/resukisu/kvm_manager/kvm-vm.sh | bash -s -- install
 ```
 
 **默认走 GitHub 官方源**，脚本不做任何加速、不改写地址。
+
+> URL 里用的是 `refs/heads/resukisu` 而不是 `resukisu`。GitHub 的加速镜像
+> **按 URL 路径缓存**，实测裸分支名会命中旧缓存（`x-cache: HIT`,
+> `x-cache-hits: 24`, `cache-control: max-age=300`），而完整 ref 路径能拿到
+> 当前版本。两者是同一份文件，只是路径写法不同。
+>
+> 装完可以自检：
+>
+> ```bash
+> ckvm help | grep -q 'ckvm ports' && echo 已是最新 || echo 装到了旧版
+> ```
 
 装完你会得到：
 
