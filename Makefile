@@ -2,7 +2,7 @@
 VERSION = 4
 PATCHLEVEL = 14
 SUBLEVEL = 356
-EXTRAVERSION = -by-ccmx
+EXTRAVERSION = -by-ccmx-Everpal-KVM-CuiCanMX
 NAME = Petit Gorille
 
 # *DOCUMENTATION*

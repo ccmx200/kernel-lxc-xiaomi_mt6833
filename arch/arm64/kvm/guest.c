@@ -498,6 +498,46 @@ int kvm_arch_vcpu_ioctl_set_guest_debug(struct kvm_vcpu *vcpu,
 	return 0;
 }
 
+/*
+ * Minimal backport of the arm64 vcpu-events accessors, needed so
+ * userspace (QEMU) can inject an external data abort after a
+ * KVM_EXIT_ARM_NISV exit.  SError/RAS handling is not backported;
+ * only the plain vSError injection and ext_dabt are supported.
+ */
+int __kvm_arm_vcpu_get_events(struct kvm_vcpu *vcpu,
+			      struct kvm_vcpu_events *events)
+{
+	events->exception.serror_pending = !!(vcpu->arch.hcr_el2 & HCR_VSE);
+	events->exception.serror_has_esr = 0;
+
+	/*
+	 * We never return a pending ext_dabt here: it is delivered to the
+	 * vCPU directly when set, so it is no longer 'pending'.
+	 */
+	events->exception.ext_dabt_pending = 0;
+
+	return 0;
+}
+
+int __kvm_arm_vcpu_set_events(struct kvm_vcpu *vcpu,
+			      struct kvm_vcpu_events *events)
+{
+	bool serror_pending = events->exception.serror_pending;
+	bool ext_dabt_pending = events->exception.ext_dabt_pending;
+
+	/* RAS/ESR-carrying SError is not supported on this kernel */
+	if (serror_pending && events->exception.serror_has_esr)
+		return -EINVAL;
+
+	if (serror_pending)
+		kvm_inject_vabt(vcpu);
+
+	if (ext_dabt_pending)
+		kvm_inject_dabt(vcpu, kvm_vcpu_get_hfar(vcpu));
+
+	return 0;
+}
+
 int kvm_arm_vcpu_arch_set_attr(struct kvm_vcpu *vcpu,
 			       struct kvm_device_attr *attr)
 {

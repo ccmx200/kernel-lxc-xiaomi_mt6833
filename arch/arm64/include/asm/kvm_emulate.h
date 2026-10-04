@@ -264,6 +264,16 @@ static inline bool kvm_vcpu_dabt_isextabt(const struct kvm_vcpu *vcpu)
 	}
 }
 
+/*
+ * When reporting an ISV=0 abort to userspace we must not leak host
+ * ESR information: mask the ISS down to the fault status code.
+ */
+static inline u32 kvm_vcpu_dabt_iss_nisv_sanitized(const struct kvm_vcpu *vcpu)
+{
+	return kvm_vcpu_get_hsr(vcpu) & (ESR_ELx_FSC | ESR_ELx_ISV |
+					 ESR_ELx_S1PTW | ESR_ELx_WNR | ESR_ELx_CM);
+}
+
 static inline int kvm_vcpu_sys_get_rt(struct kvm_vcpu *vcpu)
 {
 	u32 esr = kvm_vcpu_get_hsr(vcpu);

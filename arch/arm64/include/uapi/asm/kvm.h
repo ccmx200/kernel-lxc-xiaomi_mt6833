@@ -38,6 +38,7 @@
 
 #define __KVM_HAVE_GUEST_DEBUG
 #define __KVM_HAVE_IRQ_LINE
+#define __KVM_HAVE_VCPU_EVENTS
 #define __KVM_HAVE_READONLY_MEM
 
 #define KVM_COALESCED_MMIO_PAGE_OFFSET 1
@@ -266,8 +267,25 @@ struct kvm_arch_memory_slot {
  * and only here to provide source code level compatibility with older
  * userland. The highest SPI number can be set via KVM_DEV_ARM_VGIC_GRP_NR_IRQS.
  */
+
+/* for KVM_GET/SET_VCPU_EVENTS */
+struct kvm_vcpu_events {
+	struct {
+		__u8 serror_pending;
+		__u8 serror_has_esr;
+		__u8 ext_dabt_pending;
+		/* Align it to 8 bytes */
+		__u8 pad[5];
+		__u64 serror_esr;
+	} exception;
+	__u32 reserved[12];
+};
+
 #ifndef __KERNEL__
 #define KVM_ARM_IRQ_GIC_MAX		127
+
+
+
 #endif
 
 /* One single KVM irqchip, ie. the VGIC */

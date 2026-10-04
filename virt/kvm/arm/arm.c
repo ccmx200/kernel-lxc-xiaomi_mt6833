@@ -984,6 +984,29 @@ static int kvm_arm_vcpu_has_attr(struct kvm_vcpu *vcpu,
 	return ret;
 }
 
+static int kvm_arm_vcpu_get_events(struct kvm_vcpu *vcpu,
+				   struct kvm_vcpu_events *events)
+{
+	memset(events, 0, sizeof(*events));
+	return __kvm_arm_vcpu_get_events(vcpu, events);
+}
+
+static int kvm_arm_vcpu_set_events(struct kvm_vcpu *vcpu,
+				   struct kvm_vcpu_events *events)
+{
+	int i;
+
+	for (i = 0; i < ARRAY_SIZE(events->reserved); i++)
+		if (events->reserved[i])
+			return -EINVAL;
+
+	for (i = 0; i < ARRAY_SIZE(events->exception.pad); i++)
+		if (events->exception.pad[i])
+			return -EINVAL;
+
+	return __kvm_arm_vcpu_set_events(vcpu, events);
+}
+
 long kvm_arch_vcpu_ioctl(struct file *filp,
 			 unsigned int ioctl, unsigned long arg)
 {
@@ -1047,6 +1070,31 @@ long kvm_arch_vcpu_ioctl(struct file *filp,
 			return -EFAULT;
 		return kvm_arm_vcpu_has_attr(vcpu, &attr);
 	}
+	case KVM_GET_VCPU_EVENTS: {
+		struct kvm_vcpu_events events;
+
+		if (!kvm_vcpu_initialized(vcpu))
+			return -ENOEXEC;
+
+		if (kvm_arm_vcpu_get_events(vcpu, &events))
+			return -EINVAL;
+
+		if (copy_to_user(argp, &events, sizeof(events)))
+			return -EFAULT;
+
+		return 0;
+	}
+	case KVM_SET_VCPU_EVENTS: {
+		struct kvm_vcpu_events events;
+
+		if (!kvm_vcpu_initialized(vcpu))
+			return -ENOEXEC;
+
+		if (copy_from_user(&events, argp, sizeof(events)))
+			return -EFAULT;
+
+		return kvm_arm_vcpu_set_events(vcpu, &events);
+	}
 	default:
 		return -EINVAL;
 	}
@@ -1107,6 +1155,28 @@ static int kvm_vm_ioctl_set_device_addr(struct kvm *kvm,
 	}
 }
 
+/*
+ * Enable a capability: currently only KVM_CAP_ARM_NISV_TO_USER, which
+ * makes the kernel report ISV=0 MMIO aborts to userspace instead of
+ * failing the vCPU run with -ENOSYS.
+ */
+static int kvm_arch_vm_ioctl_enable_cap(struct kvm *kvm,
+					struct kvm_enable_cap *cap)
+{
+	if (cap->flags)
+		return -EINVAL;
+
+	switch (cap->cap) {
+	case KVM_CAP_ARM_NISV_TO_USER:
+		kvm->arch.return_nisv_io_abort_to_user = true;
+		break;
+	default:
+		return -EINVAL;
+	}
+
+	return 0;
+}
+
 long kvm_arch_vm_ioctl(struct file *filp,
 		       unsigned int ioctl, unsigned long arg)
 {
@@ -1130,6 +1200,13 @@ long kvm_arch_vm_ioctl(struct file *filp,
 			return -EFAULT;
 		return kvm_vm_ioctl_set_device_addr(kvm, &dev_addr);
 	}
+	case KVM_ENABLE_CAP: {
+		struct kvm_enable_cap cap;
+
+		if (copy_from_user(&cap, argp, sizeof(cap)))
+			return -EFAULT;
+		return kvm_arch_vm_ioctl_enable_cap(kvm, &cap);
+	}
 	case KVM_ARM_PREFERRED_TARGET: {
 		int err;
 		struct kvm_vcpu_init init;
@@ -1147,6 +1224,7 @@ long kvm_arch_vm_ioctl(struct file *filp,
 		return -EINVAL;
 	}
 }
+
 
 static void cpu_init_hyp_mode(void *dummy)
 {

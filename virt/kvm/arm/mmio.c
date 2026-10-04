@@ -180,14 +180,32 @@ int io_mem_abort(struct kvm_vcpu *vcpu, struct kvm_run *run,
 	 * from the CPU. Then try if some in-kernel emulation feels
 	 * responsible, otherwise let user space do its magic.
 	 */
-	if (kvm_vcpu_dabt_isvalid(vcpu)) {
-		ret = decode_hsr(vcpu, &is_write, &len);
-		if (ret)
-			return ret;
-	} else {
+	/*
+	 * When the CPU does not provide a valid syndrome (ISV == 0) we
+	 * cannot decode the faulting instruction in the kernel: the faulting
+	 * PC is a guest VA and kvm_vcpu_read_guest() needs a GPA, so the
+	 * instruction fetch would require a software page-table walk.
+	 *
+	 * Report the abort to userspace instead (KVM_EXIT_ARM_NISV) so that
+	 * the VMM - which does have a full view of guest memory - can decode
+	 * and emulate the access.  This mirrors upstream behaviour.
+	 */
+	if (!kvm_vcpu_dabt_isvalid(vcpu)) {
+		if (vcpu->kvm->arch.return_nisv_io_abort_to_user) {
+			run->exit_reason = KVM_EXIT_ARM_NISV;
+			run->arm_nisv.esr_iss =
+				kvm_vcpu_dabt_iss_nisv_sanitized(vcpu);
+			run->arm_nisv.fault_ipa = fault_ipa;
+			return 0;
+		}
+
 		kvm_err("load/store instruction decoding not implemented\n");
 		return -ENOSYS;
 	}
+
+	ret = decode_hsr(vcpu, &is_write, &len);
+	if (ret)
+		return ret;
 
 	rt = vcpu->arch.mmio_decode.rt;
 
