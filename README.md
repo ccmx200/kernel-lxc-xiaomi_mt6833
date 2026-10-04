@@ -8,8 +8,8 @@ ReSukiSU + KVM + BBRv2 + zstd/lz4 + Binder 优化内核。
 - 内核版本：Linux 4.14.356
 - 当前版本号：
   ```text
-  4.14.356-by-ccmx-Everpal-KVM-CuiCanMX-v1.0
-  # uname -r -> 4.14.356-by-ccmx-Everpal-KVM-CuiCanMX-v1.0
+  4.14.356-Everpal-KVM-CuiCanMX-v1.0
+  # uname -r -> 4.14.356-Everpal-KVM-CuiCanMX-v1.0
   ```
 - 默认 defconfig：
   ```text
