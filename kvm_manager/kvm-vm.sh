@@ -50,10 +50,157 @@ TAP_IP_HOST="172.28.100.1"   # container side of the tap (host mode)
 TAP_IP_GUEST="172.28.100.2"  # guest address (host mode)
 TAP_NETMASK="24"
 
+# --------------------------------------------------------------------------
+# output helpers
+# --------------------------------------------------------------------------
 say()  { printf '  %s\n' "$*"; }
 warn() { printf '  ! %s\n' "$*" >&2; }
 die()  { printf '  ERROR: %s\n' "$*" >&2; exit 1; }
 need_root() { [ "$(id -u)" = 0 ] || die "run as root"; }
+
+# colour only when it makes sense
+if [ -t 1 ] && [ "${TERM:-dumb}" != "dumb" ] && [ -z "${NO_COLOR:-}" ]; then
+    C_RST=$'\033[0m'; C_B=$'\033[1m'; C_DIM=$'\033[2m'
+    C_G=$'\033[32m'; C_Y=$'\033[33m'; C_R=$'\033[31m'; C_C=$'\033[36m'
+else
+    C_RST=''; C_B=''; C_DIM=''; C_G=''; C_Y=''; C_R=''; C_C=''
+fi
+
+# a spinner + progress bar, animated on a terminal and silent when piped
+UI_ACTIVE=0
+ui_stop() {
+    [ "$UI_ACTIVE" = 1 ] || return 0
+    printf '\r\033[K' 2>/dev/null
+    UI_ACTIVE=0
+}
+ui_tick() {
+    # $1 = frame index, $2 = percent (0-100 or empty), $3 = label, $4 = detail
+    local i="$1" pct="$2" label="$3" detail="${4:-}"
+    [ -t 1 ] || return 0
+    local frames=('⠋' '⠙' '⠹' '⠸' '⠼' '⠴' '⠦' '⠧' '⠇' '⠏')
+    local f="${frames[$((i % ${#frames[@]}))]}"
+    local bar=""
+    if [ -n "$pct" ]; then
+        local width=24 filled=$(( pct * 24 / 100 ))
+        local j
+        for ((j=0; j<24; j++)); do
+            if [ "$j" -lt "$filled" ]; then bar+="█"; else bar+="░"; fi
+        done
+        printf '\r\033[K  %s%s%s %s%s%s  %s%3d%%%s  %s%s%s' \
+               "$C_C" "$f" "$C_RST" "$C_G" "$bar" "$C_RST" \
+               "$C_B" "$pct" "$C_RST" "$C_DIM$label" "$detail" "$C_RST"
+    else
+        printf '\r\033[K  %s%s%s %s%s%s' \
+               "$C_C" "$f" "$C_RST" "$C_B" "$label" "$C_RST"
+    fi
+    UI_ACTIVE=1
+}
+
+# --------------------------------------------------------------------------
+# download engine: aria2c when available (multi-connection), else curl
+# --------------------------------------------------------------------------
+DL_BACKEND=""
+download_pick_backend() {
+    if command -v aria2c >/dev/null 2>&1; then
+        DL_BACKEND="aria2c"
+    else
+        DL_BACKEND="curl"
+    fi
+    echo "$DL_BACKEND"
+}
+
+# aria2c is strongly preferred: several connections, resumable
+ensure_aria2() {
+    command -v aria2c >/dev/null 2>&1 && return 0
+    [ "${CKVM_NO_APT:-0}" = 1 ] && return 1
+    command -v apt-get >/dev/null 2>&1 || return 1
+    say "installing aria2 (multi-connection downloads)..."
+    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq aria2 >/dev/null 2>&1
+    command -v aria2c >/dev/null 2>&1
+}
+
+# download_url <url> <outfile> <label>
+download_url() {
+    local url="$1" out="$2" label="${3:-downloading}"
+    download_pick_backend >/dev/null
+
+    if [ "$DL_BACKEND" = "aria2c" ]; then
+        # -x16 -s16 is aria2's recommended shape for a single large file.
+        # --console-log-level=warn keeps aria2 quiet so our own bar shows.
+        if [ -t 1 ]; then
+            aria2c -x16 -s16 -k1M -c \
+                   --console-log-level=warn --summary-interval=0 \
+                   --show-console-readout=false --allow-overwrite=true \
+                   --file-allocation=none \
+                   -d "$(dirname "$out")" -o "$(basename "$out")" "$url" \
+                   >/tmp/ckvm-aria2.log 2>&1 &
+            local pid=$! i=0
+            local total
+            total=$(stat -c%s "$out" 2>/dev/null || echo 0)
+            while kill -0 "$pid" 2>/dev/null; do
+                local cur pct=""
+                cur=$(stat -c%s "$out" 2>/dev/null || echo 0)
+                if [ "$total" -le 0 ] && [ -f "$out.aria2" ]; then
+                    total=$(du -b "$out" 2>/dev/null | cut -f1)
+                fi
+                pct=$(awk -v c="$cur" -v t="$total" \
+                      'BEGIN{ if (t>0) printf "%d", c*100/t; else print "" }')
+                ui_tick $((i++)) "$pct" "$label" \
+                        "  $(numfmt --to=iec "$cur" 2>/dev/null || echo "$cur")"
+                sleep 0.4
+            done
+            wait "$pid"; local rc=$?
+            ui_stop
+            if [ $rc -ne 0 ] || [ ! -s "$out" ]; then
+                warn "aria2c failed for $url"
+                tail -2 /tmp/ckvm-aria2.log 2>/dev/null | sed 's/^/      /' >&2
+                rm -f "$out" "$out.aria2"
+                return 1
+            fi
+            rm -f "$out.aria2"
+            return 0
+        fi
+        aria2c -x16 -s16 -k1M -c --console-log-level=warn \
+               --summary-interval=0 --file-allocation=none \
+               -d "$(dirname "$out")" -o "$(basename "$out")" "$url" \
+               >/dev/null 2>&1 && rm -f "$out.aria2" && return 0
+        rm -f "$out" "$out.aria2"
+        return 1
+    fi
+
+    # curl fallback, with the same animated bar
+    if [ -t 1 ]; then
+        curl -fSLk --retry 3 -o "$out.part" "$url" 2>/dev/null &
+        local pid=$! i=0
+        local total
+        total=$(curl -sSLkI "$url" 2>/dev/null | \
+                awk 'BEGIN{IGNORECASE=1}/^content-length:/{gsub(/\r/,"");print $2}' | tail -1)
+        while kill -0 "$pid" 2>/dev/null; do
+            local cur pct=""
+            cur=$(stat -c%s "$out.part" 2>/dev/null || echo 0)
+            [ -n "$total" ] && pct=$(awk -v c="$cur" -v t="$total" \
+                'BEGIN{ if (t>0) printf "%d", c*100/t; else print "" }')
+            ui_tick $((i++)) "$pct" "$label" \
+                    "  $(numfmt --to=iec "$cur" 2>/dev/null || echo "$cur")"
+            sleep 0.4
+        done
+        wait "$pid"; local rc=$?
+        ui_stop
+        [ $rc -eq 0 ] && [ -s "$out.part" ] && { mv -f "$out.part" "$out"; return 0; }
+        rm -f "$out.part"
+        return 1
+    fi
+    curl -fSLk --retry 3 -o "$out.part" "$url" 2>/dev/null && \
+        mv -f "$out.part" "$out" && return 0
+    rm -f "$out.part"
+    return 1
+}
+
+# small wrapper used by the installer for script + firmware
+download_file() {
+    local url="$1" out="$2" label="${3:-downloading}"
+    download_url "$url" "$out" "$label"
+}
 
 # --------------------------------------------------------------------------
 # the NVRAM-free EDK2 ships inside Limbo's APK, so it cannot be downloaded;
@@ -290,17 +437,17 @@ EOF
 
 fetch_image() {
     local name="$1" d img url ok=0 fmt
+    ensure_aria2 >/dev/null 2>&1 || true
     d=$(vm_dir "$name"); img="$d/disk.qcow2"
     load_vm "$name"
     for url in $(image_urls "$UBUNTU_REL"); do
-        say "downloading $url"
-        if curl -fSLk --retry 2 --progress-bar -o "$d/base.img.part" "$url"; then
+        say "source: $url"
+        if download_url "$url" "$d/base.img" "Ubuntu ${UBUNTU_REL} arm64"; then
             ok=1; break
         fi
         say "  mirror failed, trying the next one"
     done
     [ "$ok" = 1 ] || return 1
-    mv -f "$d/base.img.part" "$d/base.img"
     fmt=$(qemu-img info --output=json "$d/base.img" | \
           python3 -c "import sys,json;print(json.load(sys.stdin)['format'])" 2>/dev/null || echo raw)
     if [ "$fmt" = "qcow2" ]; then
@@ -377,6 +524,7 @@ EOF
 
     say "guest '$name' created (port $port, ${cpus} vCPU, ${mem} MiB, ${disk}G)"
     say "network: $net_mode${forwards:+ (forwards: $forwards)}"
+    say "download backend: $(download_pick_backend)"
     if [ -s "$d/disk.qcow2" ]; then
         say "disk already present; skipping the download"
         qemu-img resize "$d/disk.qcow2" "${disk}G" >/dev/null
@@ -779,15 +927,15 @@ resolve_repo() {
     CKVM_REPO="$REPO_GITHUB"
     return 0
 }
-# download one file from the resolved repo
+# download one file from the resolved repo, through the download engine
 fetch_repo_file() {
     local rel="$1" out="$2"
     [ -n "$CKVM_REPO" ] || resolve_repo
-    curl -fSLk --retry 2 --max-time 300 -o "$out.part" "$CKVM_REPO/$rel" 2>/dev/null || {
-        rm -f "$out.part"; return 1
-    }
-    mv -f "$out.part" "$out"
-    echo "$CKVM_REPO"
+    if download_url "$CKVM_REPO/$rel" "$out" "$rel"; then
+        echo "$CKVM_REPO"
+        return 0
+    fi
+    return 1
 }
 
 cmd_install() {
@@ -809,6 +957,8 @@ cmd_install() {
     done
     mkdir -p "$CKVM_ROOT" "$CKVM_FWDIR"
     resolve_repo "$accel"
+    ensure_aria2 || say "aria2 not available; falling back to curl"
+    say "download backend: $(download_pick_backend)"
 
     # Where did we come from?  Piped installs ($0 = bash/sh) must refetch;
     # a real file can just be copied.
@@ -822,13 +972,21 @@ cmd_install() {
     if [ -n "$self" ] && [ "$self" != "$(readlink -f "$CKVM_BINDIR/ckvm" 2>/dev/null)" ]; then
         install -m 0755 "$self" "$CKVM_BINDIR/ckvm"
     else
+        # download to a temporary file first: a failed install must never
+        # leave the machine without a working ckvm
         say "fetching ckvm"
-        local base
-        if base=$(fetch_repo_file "kvm-vm.sh" "$CKVM_BINDIR/ckvm"); then
+        local base tmp
+        # NOTE: use cat, not mv - /tmp can be a separate mount with its own
+        # SELinux label and mv would fail on the security.selinux attribute
+        tmp=$(mktemp "${TMPDIR:-/tmp}/ckvm.XXXXXX")
+        if base=$(fetch_repo_file "kvm-vm.sh" "$tmp"); then
+            cat "$tmp" > "$CKVM_BINDIR/ckvm"
             chmod 0755 "$CKVM_BINDIR/ckvm"
+            rm -f "$tmp"
             say "  from $base"
         else
-            die "could not download kvm-vm.sh  (try: install -cn <your-mirror>)"
+            rm -f "$tmp"
+            die "could not download kvm-vm.sh  (try: 'install -cn <your-mirror>')"
         fi
     fi
     say "installed: $CKVM_BINDIR/ckvm"
@@ -847,6 +1005,11 @@ cmd_install() {
         say "firmware not present; fetching it"
         local ok=0 f
         for f in edk2_qemu_aarch64_nonvram.fd edk2_vars.fd; do
+            if [ -f "$CKVM_FWDIR/$f" ]; then
+                say "  $f already present"
+                ok=1
+                continue
+            fi
             if fetch_repo_file "$f" "$CKVM_FWDIR/$f" >/dev/null; then
                 ok=1
                 say "  got $f"

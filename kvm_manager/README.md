@@ -3,7 +3,9 @@
 在 MT6833 / everpal（小米天玑 810 机型）上跑**硬件加速**的 KVM 虚拟机。
 装在 droidspaces 容器里，用 systemd 管理，支持多开。
 
-> 这是 [`docs/KVM.md`](../docs/KVM.md) 里那套方案的成品化工具。
+> 想了解**为什么**这么设计、每处改动的依据和实测数据，
+> 看 **[TECHNICAL.md](TECHNICAL.md)**。
+> 本文只讲怎么用。
 
 ---
 
@@ -15,92 +17,44 @@ curl -fsSLk https://raw.githubusercontent.com/ccmx200/kernel-lxc-xiaomi_mt6833/r
 
 **默认走 GitHub 官方源**，脚本不做任何加速、不改写地址。
 
----
+装完你会得到：
 
-### 用加速：`-cn`
+1. `/usr/local/bin/ckvm` —— 命令
+2. `/usr/local/share/ckvm/firmware/` —— UEFI 固件
+3. `/etc/systemd/system/ckvm@.service` —— systemd 模板单元
 
-自己指定加速地址（推荐，你可以填自己惯用的那个）：
-
-```bash
-curl -fsSLk <任意能通的地址抓脚本> -o /tmp/ckvm.sh
-bash /tmp/ckvm.sh install -cn https://你的加速地址
-```
-
-`-cn` 支持三种写法，都会自动补上仓库路径：
+### 用加速
 
 ```bash
-# 1. 完整前缀
-install -cn https://ghproxy.net/https://raw.githubusercontent.com
+# 用你自己的加速地址（推荐）
+install -cn https://你的加速地址
 
-# 2. 只给主机名（自动拼 github 路径）
-install -cn https://ghproxy.net
+# 只给主机名也行，会自动补上仓库路径
 install -cn ghproxy.net
 
-# 3. 模板，{url} 或 %s 会被替换成真实的 GitHub 地址
+# 模板形式
 install -cn "https://你的代理/{url}"
-install -cn "https://你的代理/%s"
+
+# 不带参数：探测内置列表
+install -cn
 ```
 
-也可以用 `--repo`，等价：
+`--repo <url>` 是等价写法，`CKVM_ACCEL=<url>` 也行。
 
-```bash
-install --repo https://ghproxy.net
-```
-
-或者环境变量：
-
-```bash
-CKVM_ACCEL=https://ghproxy.net bash /tmp/ckvm.sh install
-```
-
-**不传 URL 时**（就是单独的 `-cn`），会按顺序探测内置的三个通用加速：
-
-```text
-git.yylx.win  →  ghproxy.net  →  gh-proxy.com
-```
-
-用第一个通的。
-
-> 你自己给的地址如果不通，脚本会明确提示并**回落到 GitHub**，
-> 不会静默换成别的源。
-
----
-
-### 为什么要先手动抓脚本
-
-因为 `curl | bash` 那一跳本身也要过网络。如果 GitHub 被墙，`curl` 就已经
-失败了，根本轮不到 `-cn` 生效。所以正确姿势是：
-
-```bash
-# 用你能通的任意方式先把脚本拿下来
-curl -fsSLk https://ghproxy.net/https://raw.githubusercontent.com/ccmx200/kernel-lxc-xiaomi_mt6833/resukisu/kvm_manager/kvm-vm.sh -o /tmp/ckvm.sh
-
-# 再让 install 去下载脚本自身和固件
-bash /tmp/ckvm.sh install -cn https://ghproxy.net
-```
-
-### 想先看脚本内容
-
-```bash
-curl -fsSLk <地址> -o /tmp/ckvm.sh
-less /tmp/ckvm.sh
-bash /tmp/ckvm.sh install
-```
+> 为什么建议**先手动抓脚本再 install**：`curl | bash` 那一跳本身也要过网络。
+> GitHub 不通时 `curl` 就已经失败，轮不到 `-cn` 生效。
+>
+> ```bash
+> curl -fsSLk <能通的地址>/kvm-vm.sh -o /tmp/ckvm.sh
+> bash /tmp/ckvm.sh install -cn https://你的加速地址
+> ```
 
 ### 卸载
 
 ```bash
-ckvm uninstall          # 只删脚本和服务，虚拟机数据保留
+ckvm uninstall          # 只删命令和服务，虚拟机数据保留
 rm -rf /var/lib/ckvm    # 连数据一起删
 ```
-
----
-
-## 一键安装做了什么
-
-1. 把脚本装到 `/usr/local/bin/ckvm`
-2. 下载固件到 `/usr/local/share/ckvm/firmware/`
-3. 注册 systemd 模板服务 `/etc/systemd/system/ckvm@.service`
 
 ---
 
@@ -112,15 +66,23 @@ ckvm start ubuntu26             # 启动，约 30 秒到登录
 ssh u0@127.0.0.1 -p 8023        # 密码 1
 ```
 
-`create` 成功后会告诉你怎么连：
+`create` 会告诉你怎么连：
 
 ```text
   guest 'ubuntu26' created (port 8023, 8 vCPU, 2048 MiB, 50G)
-  downloading https://mirror.nju.edu.cn/...
+  network: user (forwards: 22)
+  download backend: aria2c
+  source: https://mirror.nju.edu.cn/ubuntu-cloud-images/...
   image ready
   seed.img written (user u0 / password 1)
 
   start it with:  ckvm start ubuntu26
+```
+
+下载时会有进度条：
+
+```text
+  ⠼ ██░░░░░░░░░░░░░░░░░░░░░░   8%  76M
 ```
 
 ---
@@ -141,18 +103,25 @@ ckvm create <名字> [选项]
 | `--net M` | 网络模式 `user` / `host` | `user` |
 | `--fwd L` | 要映射的 guest 端口 | `22` |
 
-例如装一个 24.04 的小机器：
+例子：
 
 ```bash
+# 小机器
 ckvm create small --cpus 2 --mem 1024 --disk 20 --rel 24.04
+
+# 多开两个端口映射
+ckvm create web --fwd 22,80,443
+
+# guest 80 映射到宿主机 8080
+ckvm create app --fwd 22,8080:80
 ```
 
 ---
 
 ## 多开
 
-每个虚拟机是 `/var/lib/ckvm/<名字>/` 下的独立目录，有自己的磁盘、固件副本、
-cloud-init 和端口，互不干扰。
+每台虚拟机是 `/var/lib/ckvm/<名字>/` 下的独立目录，有自己的磁盘、固件副本、
+cloud-init 和端口。
 
 ```bash
 ckvm create a
@@ -167,19 +136,19 @@ ckvm list
   b                running  8      2048     50G     8024   ssh u0@127.0.0.1 -p 8024
 ```
 
-端口自动分配，不用自己记，`ckvm list` 里能看到每台的连接方式。
+端口自动分配，不用自己记。
 
 ---
 
 ## 命令一览
 
 ```bash
-ckvm install                     # 安装
+ckvm install [选项]              # 安装
 ckvm uninstall                   # 卸载
 
 ckvm create <名字> [选项]         # 新建
 ckvm image <名字>                # 重新下载镜像
-ckvm start <名字> [-f]           # 启动（-f 前台运行）
+ckvm start <名字> [-f]           # 启动（-f 前台）
 ckvm stop <名字>
 ckvm restart <名字>
 ckvm rm <名字> [-f]              # 删除（-f 可删运行中的）
@@ -191,47 +160,38 @@ ckvm console <名字>              # 实时看串口，Ctrl-C 退出
 ckvm enable <名字>               # systemd 启用 + 启动 + 开机自启
 ckvm disable <名字>
 
-ckvm net [名字]                  # 看容器/虚拟机的网络情况
-ckvm config [名字]               # 看全局或单个配置
-ckvm edit <名字>                 # 编辑单个配置
+ckvm net [名字]                  # 看网络情况
+ckvm config [名字]               # 看配置
+ckvm edit <名字>                 # 改配置
 ```
 
 ---
 
 ## 网络
 
-有两种模式，创建时用 `--net` 选。
-
 ### user 模式（默认）
 
-QEMU 自己做 NAT，用**端口映射**访问。不需要 tap、不需要额外权限，
-任何环境都能用。
+QEMU 自己做 NAT，用端口映射访问。任何环境都能用。
 
 ```bash
-ckvm create web --fwd 22,80,443           # 22 映射到 --port，80/443 同号
-ckvm create app --fwd 22,8080:80          # guest 80 映射到宿主机 8080
+ckvm create web --fwd 22,80,443
+ckvm start web
 ```
 
-规则：
-
-- guest 的 **22** 会映射到该虚拟机的 `PORT`（默认从 8023 起自动分配），
-  这样多开时不会互相抢端口
-- 其他端口默认**同号映射**，也可以写 `宿主机端口:guest端口`
-- 启动时会检查端口占用，被占了会提示
-
 ```text
-$ ckvm start web
-  guest 'web' running (pid 11506, 4 vCPU, 1536 MiB, cpuset 6-7)
   network: user-mode NAT
     ssh u0@127.0.0.1 -p 8023   (password: 1)
     port 80 -> 127.0.0.1:80
     port 443 -> 127.0.0.1:443
 ```
 
+规则：guest 的 `22` 映射到该机的 `PORT`（多开不抢端口）；其他端口默认同号，
+也可写 `宿主机端口:guest端口`。启动前会检查端口占用。
+
 ### host 模式（tap）
 
-给 guest 一块 tap 网卡，它在**容器的网段**里拿到自己的 IP，自己跑 sshd，
-**完全不需要端口映射**。
+guest 拿到自己的 IP，**自己跑 sshd**，不需要端口映射，也不经过 droidspaces
+的转发，和容器自身的 22 不冲突。
 
 ```bash
 ckvm create srv --net host
@@ -239,90 +199,38 @@ ckvm start srv
 ```
 
 ```text
-$ ckvm start srv
-  tap ckvm-srv up: host 172.28.100.1 / guest 172.28.100.2
-  guest 'srv' running (pid 9978, 2 vCPU, 1024 MiB, cpuset 6-7)
   network: tap, the guest is on this container's network
     guest ip : 172.28.100.2/24   gateway 172.28.100.1
     ssh      : u0@172.28.100.2   (password: 1)
-    from the container, no port forward needed.
 ```
 
-脚本会自动：
+脚本自动建 tap、配 IP、开转发和 NAT，`stop`/`rm` 自动清理。
 
-- 建 tap 设备 `ckvm-<名字>`，配好 `172.28.100.1/24`
-- 开 `ip_forward`，加 MASQUERADE 和 FORWARD 规则，让 guest 能上网
-- 通过 cloud-init 给 guest 配静态 IP 和网关
-- `stop` / `rm` 时自动拆掉 tap 和 iptables 规则
+### ⚠️ 局域网访问
 
-`ckvm list` 会直接显示该连哪个地址：
+**host 模式的 `172.28.100.x` 是容器内部网段，不是手机在局域网上的地址。**
+局域网里其他电脑直连不到。
 
-```text
-  NAME             STATE    CPUS   MEM      DISK    PORT   SSH
-  srv              running  2      1024     50G     8031   ssh u0@172.28.100.2
-  web              running  4      1536     50G     8023   ssh u0@127.0.0.1 -p 8023
-```
+想真正暴露到局域网：
 
-### ⚠️ 关于「直接上局域网」
+- **简单**：用 user 模式，在 Android 宿主侧把端口转进容器
+- **彻底**：在 Android 宿主侧建网桥（见 [TECHNICAL.md](TECHNICAL.md) 第 6.4 节）
 
-**host 模式拿到的 `172.28.100.x` 是容器内部网段的地址，不是手机在局域网上
-的地址。** 从局域网里另一台电脑是直连不到的，因为 droidspaces 容器有自己的
-网络命名空间。
-
-想让 guest 真正出现在局域网上，只有两条路：
-
-**a) 用 user 模式 + 从 Android 侧转发（推荐，最简单）**
-
-guest 的端口映射在容器里。要让局域网能访问，需要在 Android 宿主机上把端口
-转进容器。`ckvm net <名字>` 会打印具体命令。
-
-**b) 在 Android 侧做桥接**
-
-需要 Android 宿主机的 root shell：
-
-```bash
-# 在手机上，root 身份
-ip link add br-ckvm type bridge
-ip link set eth0 master br-ckvm        # 容器的 veth 对端
-ip link set br-ckvm up
-```
-
-这样 guest 就出现在手机所在的网段里了。
-
-### 查看网络情况
-
-```bash
-ckvm net            # 容器网卡、路由、所有虚拟机的网络模式
-ckvm net <名字>     # 单个虚拟机的 tap、NAT 规则、访问方式和下一步提示
-```
-
-### 避开 droidspaces 的 SSH
-
-容器自己的 sshd 在 **22**，Android 宿主机的 sshd 在 `172.28.0.1:22`。
-host 模式下 guest **自己跑 sshd**（在 `172.28.100.2:22`），和上面两个都不冲突，
-也不会经过 droidspaces 的端口转发。
-
-user 模式下 guest 的 22 会被映射到 `8023+`，同样不碰容器的 22。
-
+`ckvm net <名字>` 会打印当前布局和下一步提示。
 
 ---
 
-## systemd 管理
+## systemd
 
 ```bash
 ckvm enable ubuntu26
-```
-
-之后用标准 systemd 命令：
-
-```bash
 systemctl status  ckvm@ubuntu26
 systemctl stop    ckvm@ubuntu26
 systemctl restart ckvm@ubuntu26
 journalctl -u     ckvm@ubuntu26
 ```
 
-`enable` 同时设置开机自启，容器重启后虚拟机自动起来。
+`enable` 同时设置开机自启。
 
 ---
 
@@ -330,16 +238,16 @@ journalctl -u     ckvm@ubuntu26
 
 ### 全局
 
-脚本顶部，也可以用环境变量覆盖：
-
 | 变量 | 默认 | 说明 |
 |---|---|---|
-| `CKVM_ROOT` | `/var/lib/ckvm` | 虚拟机数据目录 |
+| `CKVM_ROOT` | `/var/lib/ckvm` | 数据目录 |
 | `CKVM_FWDIR` | `/usr/local/share/ckvm/firmware` | 固件目录 |
 | `CKVM_BINDIR` | `/usr/local/bin` | 命令安装位置 |
 | `MIRROR_IMAGE_LIST` | NJU + 官方 | 系统镜像源，按顺序回退 |
 | `MIRROR_APT` | USTC | 写进 cloud-init 的 apt 源 |
-| `CKVM_ACCEL` | `0` | `1` = 探测内置加速；也可以直接填一个加速地址 |
+| `CKVM_ACCEL` | `0` | 加速地址，或 `1` 表示探测内置列表 |
+| `CKVM_NO_APT` | `0` | 设 `1` 禁止自动 apt 安装 aria2 |
+| `NO_COLOR` | — | 设置后关闭颜色 |
 
 ### 单个虚拟机
 
@@ -348,11 +256,13 @@ journalctl -u     ckvm@ubuntu26
 ```ini
 NAME=ubuntu26
 UBUNTU_REL=26.04
-CPUS=8              # vCPU 数
-MEM=2048            # 内存 MiB
+CPUS=8
+MEM=2048
 DISK_GB=50
 PORT=8023
-CPUSET=6-7          # 绑定的物理核，别乱改，见下
+CPUSET=6-7          # 绑定的物理核，别乱改
+NET_MODE=user
+FORWARDS=22
 VM_USER=u0
 VM_PASS=1
 VM_HOSTNAME=ubuntu26
@@ -360,9 +270,9 @@ VM_HOSTNAME=ubuntu26
 
 ---
 
-## 镜像源（国内加速）
+## 镜像源
 
-默认已配好：
+默认：
 
 ```text
 系统镜像：https://mirror.nju.edu.cn/ubuntu-cloud-images
@@ -380,86 +290,68 @@ export MIRROR_APT="https://mirrors.aliyun.com/ubuntu-ports"
 curl -fsSLk <地址> | bash -s -- install
 ```
 
-> 注意区分两类源：`MIRROR_IMAGE_LIST` / `MIRROR_APT` 是**装进 guest 的**
-> 系统镜像和 apt 源；`-cn` 只影响 **ckvm 自己从哪下载**（脚本和固件）。
-> 两者互不相关。
-
-> **实测提醒**：USTC 的 `ubuntu-cloud-images` 目录**只镜像了 amd64**，
-> arm64 请求返回 403，所以镜像默认走 NJU。USTC 的 apt 源是正常的。
+> 实测提醒：USTC 的 `ubuntu-cloud-images` **只镜像了 amd64**，arm64 返回
+> 403，所以镜像默认走 NJU。
 
 ---
 
-## 四个必须知道的坑
+## 三个别踩的坑
 
-脚本都已处理，但理解它们能省很多时间。
+### 1. 别去掉 `taskset` 绑核
 
-### 1. 必须绑核（big.LITTLE）
-
-这颗 SoC 是 6 个 Cortex-A55 + 2 个 Cortex-A76，**两种核心的 ID 寄存器值
-不同**。不绑核时 QEMU 可能在一类核上探测 CPU 特性、在另一类核上写回，
-内核发现"常量寄存器值不一致"就返回 `EINVAL`：
+这台机器是 big.LITTLE（6 个 A55 + 2 个 A76），寄存器值不同。不绑核会随机
+启动失败：
 
 ```text
 Failed to put registers after init: Invalid argument
 ```
 
-实测（各 3 次）：绑核 `3/3` 成功，不绑核 `0/3`。
+脚本固定 `taskset -c 6-7`，**这就是 `CPUSET`，别乱改**。
 
-脚本固定 `taskset -c 6-7` 绑到两个大核，**这就是 `CPUSET`，别乱改。**
-
-> 绑核之后 **8 核也能用**（guest 内 `SMP: Total of 8 processors activated`）。
-> 8 个 vCPU 跑在 2 个物理核上属于超卖，吞吐好但单核延迟一般。
+> 绑核之后 **8 核也能用**。
 
 ### 2. 固件必须是不写 NVRAM 的那份
 
-ARM 规定：带 writeback 的 load/store（以及 `LDXR/STXR`）**永不置
-`ESR_EL2.ISV` 位**，而 KVM 无法解码 ISV=0 的 MMIO。标准 EDK2 写 pflash
-变量存储时恰好用这类指令，于是虚拟机直接卡死。
+普通 EDK2 一写变量存储就会让虚拟机卡死（ARM 架构限制，详见
+[TECHNICAL.md](TECHNICAL.md) 第 2、4 节）。`kvm_manager/` 里附带的就是正确
+的那份，`install` 会自动放好。
 
-解法是用不写 NVRAM 的 EDK2（本目录的 `edk2_qemu_aarch64_nonvram.fd`）。
+### 3. 不能用 `-kernel` 直接引导 Ubuntu 内核
 
-### 3. NVRAM 每次要刷新
-
-留着旧变量存储会让 GRUB 加载后卡住不动。脚本每次 `start` 都从模板拷一份
-干净的 `edk2_vars.fd`。
-
-### 4. 不能用 `-kernel` 直接引导 Ubuntu 内核
-
-26.04 的 `/boot/vmlinuz-*` 是 **PE32+ EFI 应用**，QEMU 的 arm64 加载器只
-接受 gzip 或裸 `Image`。所以必须走 UEFI，也就是上面这套。
+26.04 的 `/boot/vmlinuz-*` 是 PE32+ EFI 应用，QEMU 的 arm64 加载器只接受
+gzip 或裸 `Image`。必须走 UEFI。
 
 ---
 
-## 自测环境
+## 自查
 
-```text
-设备    小米 MT6833 / everpal
-容器    droidspaces（Debian 13，systemd 作为 PID 1）
-内核    4.14.356-Everpal-KVM-CuiCanMX-v1.0
-guest   Ubuntu 26.04.1 LTS，kernel 7.0.0-38，50G 磁盘自动扩容
+```bash
+ckvm net                 # 容器网卡、路由、各虚拟机网络模式
+ckvm net <名字>          # 单机的 tap、NAT 规则、访问方式
+ckvm status <名字>       # 状态 + 串口末尾
+ckvm config <名字>       # 该机配置
 ```
-
-已验证：单机启动、双机同时运行（8023 + 8024）、`ckvm enable` 后 systemd
-单元 `active` 且 `enabled`、干净环境下一键安装（自动取脚本 + 自动取固件）。
 
 ---
 
 ## 常见问题
 
 **`Failed to put registers after init`**
-绑核没生效。确认 `vm.conf` 里 `CPUSET` 是 `6-7`，且脚本用的是
-`taskset -c "$CPUSET"`。
+绑核没生效。确认 `vm.conf` 里 `CPUSET=6-7`。
 
 **GRUB 加载后卡住不动**
-NVRAM 被污染。停掉虚拟机，删掉 `uefi-vars.fd`，再 `start`（会从模板重建）。
+NVRAM 被污染。`ckvm stop <名字>`，删掉该目录下的 `uefi-vars.fd`，再
+`ckvm start`（会从模板重建）。
 
-**curl 安装时 Connection reset**
-GitHub 被墙。换用本文档「GitHub 被墙时」里的镜像地址，或直接给
-`REPO_LIST` 指定一个可达的源。
+**curl 报 `Connection reset by peer`**
+GitHub 被墙。换用加速地址，或先手动抓脚本再用 `install -cn`。
+
+**`ckvm install` 报 `could not download kvm-vm.sh`**
+你的加速地址不通，或没给 `-cn`。失败**不会**破坏已装好的 ckvm。
 
 **找不到固件**
 ```bash
-ckvm install        # 会从仓库（或其镜像）下载
+ckvm install            # 会从仓库（或其加速地址）下载
 ```
 或从设备上拷：
 ```bash
@@ -468,9 +360,29 @@ su -c 'cp /sdcard/limbo_fw/edk2_*.fd /usr/local/share/ckvm/firmware/'
 ```
 
 **想换用户名密码**
-改 `vm.conf` 里的 `VM_USER` / `VM_PASS`，然后 `ckvm rm` 重建
-（cloud-init 只在首次启动生效），或者进系统直接 `passwd`。
+改 `vm.conf` 的 `VM_USER`/`VM_PASS` 后 `ckvm rm` 重建（cloud-init 只在首次
+启动生效），或进系统 `passwd`。
 
 **想要图形界面**
-脚本只给了串口。自己加 `-device virtio-gpu-pci` 配 VNC，或在 `ckvm start`
-的 QEMU 参数里追加。
+默认只有串口。自己在 QEMU 参数里加 `-device virtio-gpu-pci` 配 VNC。
+
+---
+
+## 环境
+
+```text
+设备    小米 MT6833 / everpal
+容器    droidspaces（Debian 13，systemd 作为 PID 1）
+内核    4.14.356-Everpal-KVM-CuiCanMX-v1.0
+guest   Ubuntu 26.04.1 LTS
+```
+
+---
+
+## 文档
+
+- **[TECHNICAL.md](TECHNICAL.md)** —— 技术文档。包含硬件与特权模型、
+  `ESR_EL2.ISV == 0` 的架构根因、内核回移的 ABI 细节、固件选择的依据、
+  big.LITTLE 绑核分析、网络模式原理、systemd 设计、完整实测数据集，
+  以及**每一处结论的出处**。
+- **[../docs/KVM.md](../docs/KVM.md)** —— 最初的内核侧调研记录。
