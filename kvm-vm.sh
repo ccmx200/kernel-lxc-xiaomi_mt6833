@@ -25,15 +25,15 @@ say() { printf '  %s\n' "$*"; }
 die() { printf '  ERROR: %s\n' "$*" >&2; exit 1; }
 
 # ------------------------------------------------------------------ defaults
-REL="${REL:-26.04}"
+UBUNTU_REL="${UBUNTU_REL:-26.04}"
 CPUS="${CPUS:-8}"
 MEM="${MEM:-2048}"
 DISK_GB="${DISK_GB:-50}"
 SSH_PORT="${SSH_PORT:-8023}"
 CPUSET="${CPUSET:-6-7}"
-USERNAME="${USERNAME:-u0_207}"
-PASSWORD="${PASSWORD:-1}"
-HOSTNAME="${HOSTNAME:-ubuntu}"
+VM_USER="${VM_USER:-u0_207}"
+VM_PASS="${VM_PASS:-1}"
+VM_HOSTNAME="${VM_HOSTNAME:-ubuntu}"
 
 load_conf() {
     # create the settings file on first use so it is always editable
@@ -45,7 +45,7 @@ save_conf() {
     mkdir -p "$VMDIR"
     cat > "$CONF" <<EOF
 # kvm-vm settings - edit freely, or run: $0 edit
-REL=$REL
+UBUNTU_REL=$UBUNTU_REL
 CPUS=$CPUS
 MEM=$MEM
 DISK_GB=$DISK_GB
@@ -55,9 +55,9 @@ SSH_PORT=$SSH_PORT
 # leaving it unpinned makes vCPU creation fail with EINVAL.  Cores 6,7 are
 # the two Cortex-A76 big cores.
 CPUSET=$CPUSET
-USERNAME=$USERNAME
-PASSWORD=$PASSWORD
-HOSTNAME=$HOSTNAME
+VM_USER=$VM_USER
+VM_PASS=$VM_PASS
+VM_HOSTNAME=$VM_HOSTNAME
 EOF
     say "wrote $CONF"
 }
@@ -66,8 +66,8 @@ EOF
 download_image() {
     local img="$VMDIR/disk.qcow2"
     [ -f "$img" ] && { say "image already present"; return 0; }
-    local url="https://cloud-images.ubuntu.com/releases/${REL}/release/ubuntu-${REL}-server-cloudimg-arm64.img"
-    say "downloading Ubuntu ${REL} arm64 cloud image"
+    local url="https://cloud-images.ubuntu.com/releases/${UBUNTU_REL}/release/ubuntu-${UBUNTU_REL}-server-cloudimg-arm64.img"
+    say "downloading Ubuntu ${UBUNTU_REL} arm64 cloud image"
     say "  $url"
     mkdir -p "$VMDIR"
     curl -fSLk --retry 3 --progress-bar -o "$VMDIR/base.img.part" "$url" \
@@ -132,14 +132,14 @@ download_firmware() {
 
 make_seed() {
     local hash
-    hash=$(openssl passwd -6 "$PASSWORD")
+    hash=$(openssl passwd -6 "$VM_PASS")
     cat > "$VMDIR/user-data" <<EOF
 #cloud-config
-hostname: $HOSTNAME
+hostname: $VM_HOSTNAME
 manage_etc_hosts: true
 users:
-  - name: $USERNAME
-    gecos: $USERNAME
+  - name: $VM_USER
+    gecos: $VM_USER
     groups: [sudo, adm]
     shell: /bin/bash
     sudo: ALL=(ALL) NOPASSWD:ALL
@@ -158,10 +158,10 @@ package_upgrade: false
 EOF
     cat > "$VMDIR/meta-data" <<EOF
 instance-id: kvm-${HOSTNAME}
-local-hostname: $HOSTNAME
+local-hostname: $VM_HOSTNAME
 EOF
     cloud-localds "$VMDIR/seed.img" "$VMDIR/user-data" "$VMDIR/meta-data"
-    say "seed.img written (user $USERNAME)"
+    say "seed.img written (user $VM_USER)"
 }
 
 # ------------------------------------------------------------------- actions
@@ -200,7 +200,7 @@ start_guest() {
     [ -f "$VARS_TPL" ] && cp -f "$VARS_TPL" "$VMDIR/uefi-vars.fd"
 
     rm -f /tmp/kvm.log /tmp/kvm.err /tmp/kvm.pid
-    nohup taskset -c "$CPUSET" "$QEMU" -name "$HOSTNAME" \
+    nohup taskset -c "$CPUSET" "$QEMU" -name "$VM_HOSTNAME" \
         -M virt,gic-version=3 -cpu max -accel kvm -smp "$CPUS" -m "$MEM" \
         -drive if=pflash,format=raw,unit=0,file="$VMDIR/uefi-code.fd",readonly=on \
         -drive if=pflash,format=raw,unit=1,file="$VMDIR/uefi-vars.fd" \
@@ -221,7 +221,7 @@ start_guest() {
         sleep 3
     done
     if grep -aq "login:" /tmp/kvm.log 2>/dev/null; then
-        say "ready:  ssh ${USERNAME}@127.0.0.1 -p ${SSH_PORT}   (password: ${PASSWORD})"
+        say "ready:  ssh ${VM_USER}@127.0.0.1 -p ${SSH_PORT}   (password: ${VM_PASS})"
     else
         say "not at login yet; try '$0 console'"
     fi
