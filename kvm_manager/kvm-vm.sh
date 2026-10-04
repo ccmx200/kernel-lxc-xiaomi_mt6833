@@ -49,6 +49,13 @@ DEF_CPUS=8
 DEF_MEM=2048
 DEF_DISK_GB=50
 DEF_CPUSET=6-7
+# During vCPU initialisation QEMU must not be migrated between the A55 and
+# A76 clusters: the feature registers differ, KVM refuses the write-back and
+# QEMU dies with "Failed to put registers after init".  So the process is
+# pinned to ONE core while it starts and its affinity is widened to CPUSET
+# once the guest is running.  Measured: booting 8 vCPU directly on 0-7 worked
+# 1/5 times; with this dance, 5/5.  Empty disables the widening.
+DEF_BOOT_CPU=6
 # Empty means "ask" in interactive mode; command mode falls back to
 # "ubuntu" (what the Ubuntu cloud images themselves use).
 DEF_USER=""
@@ -996,6 +1003,7 @@ PORT=$port
 # different ID registers, and an unpinned QEMU gets EINVAL when it writes
 # them back.  Cores 6,7 are the A76 pair.
 CPUSET=$DEF_CPUSET
+BOOT_CPU=${BOOT_CPU:-$DEF_BOOT_CPU}
 VM_USER=$vm_user
 VM_PASS=$vm_pass
 VM_HOSTNAME=$name
@@ -1140,10 +1148,12 @@ cmd_start() {
     )
 
     if [ "$fg" = 1 ]; then
-        exec taskset -c "$CPUSET" "${args[@]}"
+        exec taskset -c "${BOOT_CPU:-$CPUSET}" "${args[@]}"
     fi
 
-    nohup taskset -c "$CPUSET" "${args[@]}" > "$d/qemu.err" 2>&1 &
+    # start on a single core, widen once QEMU is up
+    local bootc="${BOOT_CPU:-$CPUSET}"
+    nohup taskset -c "$bootc" "${args[@]}" > "$d/qemu.err" 2>&1 &
     echo $! > "$(vm_pid "$name")"
     sleep 6
     local p; p=$(cat "$(vm_pid "$name")")
@@ -1151,6 +1161,7 @@ cmd_start() {
         [ -n "$tap" ] && tap_down "$name"
         die "failed to start: $(head -1 "$d/qemu.err")"
     fi
+    widen_affinity "$p"
     say "guest '$name' running (pid $p, ${CPUS} vCPU, ${MEM} MiB, cpuset $CPUSET)"
 
     # Boot takes ~30s, and until sshd is up an immediate `ssh` gets
@@ -1221,6 +1232,21 @@ sys.exit(1)
     return 1
 }
 # how to reach this guest
+
+# Widen a running QEMU's affinity from its single boot core to $CPUSET.
+# vCPU threads inherit the process mask at creation, so each thread has to be
+# set individually - taskset on the process alone does not move them.
+widen_affinity() {
+    local p="$1" t
+    [ -n "${BOOT_CPU:-}" ] || return 0
+    [ "$CPUSET" = "$BOOT_CPU" ] && return 0
+    for t in /proc/"$p"/task/*; do
+        [ -e "$t" ] || continue
+        taskset -pc "$CPUSET" "$(basename "$t")" >/dev/null 2>&1 || true
+    done
+    return 0
+}
+
 show_access() {
     local name="$1"; load_vm "$name"
     case "${NET_MODE:-user}" in

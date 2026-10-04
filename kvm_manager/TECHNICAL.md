@@ -31,6 +31,7 @@
 9. [实测数据集](#9-实测数据集)
 10. [参考出处](#10-参考出处)
 11. [在红米 Note 11 5G（MT6833）上禁用 GenieZone 并释放 EL2](#11-在红米-note-11-5gmt6833上禁用-geniezone-并释放-el2)
+12. [vCPU 数量与物理核绑定](#12-vcpu-数量与物理核绑定)
 
 ---
 
@@ -1455,6 +1456,138 @@ EL2 就重新归内核所有，`CONFIG_ARM64_VHE` 与 KVM 才有落脚点。
 preloader 代码、不破坏签名验证的前提下，成功禁用 GenieZone 并释放 EL2。
 
 ---
+
+---
+
+## 12. vCPU 数量与物理核绑定
+
+第 5 节记录了「QEMU 必须绑核，否则 `Failed to put registers after init:
+Invalid argument`」。本节是那次结论的完整展开：**到底能开多少 vCPU、能用到
+几个物理核、以及怎么绕过启动失败**。全部数据为本机实测。
+
+### 12.1 硬件拓扑
+
+`/proc/device-tree/cpus/` 与 `cpu_capacity` 确认是两颗不同的核：
+
+```text
+cpu0-cpu5   arm,cortex-a55   capacity 367    max 2.00 GHz   小核
+cpu6-cpu7   arm,cortex-a76   capacity 1024   max 2.40 GHz   大核
+```
+
+注意 `lscpu` 只报告 A55 簇（显示 `CPU(s): 8` 但 `Model name` 是 A55、
+`Core(s) per socket: 6`），容易误判整机核数，设备树才是准的。
+
+### 12.2 失败现象与真实原因
+
+失败时 QEMU 立刻退出：
+
+```text
+qemu-system-aarch64: Failed to put registers after init: Invalid argument
+```
+
+这段来自 `kvm_arch_put_registers()`：KVM 用 `KVM_SET_ONE_REG` 写通用寄存器
+失败时打印。**它发生在 vCPU 初始化早期**，因此与 vCPU *数量*无关（12.3 的
+数据可以证明）。
+
+根因是 big.LITTLE：QEMU 在一个线程上探测宿主 CPU 特性（`KVM_GET_ONE_REG`
+等），随后该线程被调度到**另一种微架构**的核上写回，两组核的 `ID_AA64*`
+特性寄存器不同，KVM 返回 `EINVAL`。推论：
+
+* 只要允许 vCPU 线程在**两个簇之间迁移**，就有概率失败；
+* 绑到**单一簇内**（`6-7` 或 `0-5`）完全稳定。
+
+### 12.3 成功率实测（每组重复 6 次）
+
+```text
+-smp 1              mask 0-7     4/6
+-smp 2              mask 0-7     1/6
+-smp 4              mask 0-7     2/6
+-smp 8              mask 0-7     2/6
+-smp 2,maxcpus=8    mask 0-7     2/6
+-smp 8              mask 6-7     6/6     <- 同一簇内
+-smp 1              mask 6       6/6
+-smp 1              mask 0       6/6
+-smp 4              mask 0-5     6/6
+```
+
+**要点：**
+
+1. 失败是**不确定的** —— 同一命令 6 次里成功次数不同。所以「`-smp 2 / 4 / 6 / 8`
+   全部启动，assert=0」这种结论只有在**受限掩码**下才成立，跨簇时是运气。
+2. `-smp 1` 失败 2/6 而 `-smp 2` 只成功 1/6，说明它**不是**「核数越多越容易挂」，
+   是纯粹的调度竞态。
+3. 固件断言 `ASSERT [ArmPlatformPrePeiCore]` 是同一竞态更早触发的表现 ——
+   固件先死，还轮不到 KVM 报错。两者同源。
+
+### 12.4 解决方案：启动时单核，起来后放开
+
+这是 Limbo 的「100% Success Mode」同一思路，本机实测有效。
+
+**做法：** 让 QEMU 进程在 vCPU 初始化期间只允许在**一个核**上运行，等 guest
+起来后再把亲和性放开到全部 8 个核。vCPU 线程创建时继承进程亲和性，之后对每个
+线程单独放开即可。
+
+```sh
+# 启动阶段：钉在 core 6
+taskset -c 6 qemu-system-aarch64 ... -smp 8 ...
+# guest 起来后，放开每个线程
+for t in /proc/$QPID/task/*; do taskset -pc 0-7 "$(basename $t)"; done
+```
+
+**实测（每种 5 次）：**
+
+```text
+boot@6 -> 扩到 0-7      5/5 全部启动并激活 8 个 vCPU
+直接绑 0-7 启动         1/5（4 次启动即失败，1 次启动后卡住）
+```
+
+guest 内确认：
+
+```text
+smp: Brought up 1 node, 8 CPUs
+SMP: Total of 8 processors activated.
+```
+
+### 12.5 性能：8 个物理核值不值
+
+同一个 guest（8 vCPU），只改物理核范围，guest 内跑
+`openssl speed -multi 8 -evp sha256 -seconds 2`，取 16384 字节块：
+
+```text
+全部 8 物理核 (6×A55 + 2×A76)    7.4-7.7 GB/s    启动 ~42-44s
+仅 6 小核 (A55)                  4.5-4.9 GB/s    启动 ~46s
+仅 2 大核 (A76)                  2.9-3.0 GB/s    启动 ~34s
+```
+
+**全核对双大核是约 2.6 倍吞吐**，代价是启动慢 8-12 秒。对编译、压缩、批量
+计算这类吞吐型负载划算；对延迟敏感的单线程任务，2 个大核更好（A76 的
+capacity 1024 对 A55 的 367，约 2.8 倍）。
+
+### 12.6 vCPU 热插拔：本机不可行
+
+`-smp 2,maxcpus=8` 配合 QMP `device_add` 尝试过，结论是**做不到**：
+
+```text
+QMP device_add driver=host-arm-cpu  ->  Parameter 'driver' expects a pluggable device type
+QMP qom-list /machine/unattached/device[cpu0]  ->  DeviceNotFound
+```
+
+aarch64 的 vCPU 不是可热插拔设备（GIC 的 CPU 接口在机器初始化时就固定了），
+QEMU 也没有为 `virt` 机器暴露 ARM CPU 的 plug 类型。
+
+**但不需要热插拔** —— 12.4 的「启动时限制、之后放开」达到同样效果：8 个
+vCPU 启动时全部创建好，只是初始化期间不允许跨簇迁移。
+
+### 12.7 数据来源
+
+* QEMU `target/arm/kvm64.c` 的 `kvm_arch_put_registers()`，以及内核
+  `arch/arm64/kvm/` 中返回 `EINVAL` 的寄存器访问路径。
+* ARM 架构参考手册 DDI 0487，`ID_AA64ISAR0_EL1` 等特性寄存器定义：
+  <https://developer.arm.com/documentation/ddi0487/latest>
+* Limbo for Tensor 的「100% Success Mode」描述（先在 0-3 核启动 UEFI，
+  加载后再放开全部核）：
+  <https://github.com/wasdwasd0105/limbo_tensor>
+
 
 ## 附：本机原始测量记录
 
