@@ -203,36 +203,43 @@ static const char *default_compressor = "zstd";
   这是硬伤，不是配置问题。脚本里已经帮你换好了。
 - 系统盘：一个 qcow2 文件，里面是 Ubuntu。
 
-### 准备工作（只需做一次）
-
-把两个文件放到一个目录里，比如 `/root/vm26/`：
-
-| 文件 | 是什么 | 从哪来 |
-|---|---|---|
-| `disk.qcow2` | Ubuntu 系统盘 | 官方 cloud image 转成 qcow2，可扩容 |
-| `uefi-code.fd` | 不写 NVRAM 的固件 | Limbo 项目的 `edk2_qemu_aarch64_nonvram.fd` |
-| `seed.img` | 开机自动建账号用 | `cloud-localds` 生成，见下 |
-
-`seed.img` 用来开机自动创建用户名和密码，内容长这样（存成 `user-data`）：
-
-```yaml
-#cloud-config
-hostname: ubuntu2604
-users:
-  - name: u0_207
-    groups: [sudo]
-    shell: /bin/bash
-    sudo: ALL=(ALL) NOPASSWD:ALL
-    lock_passwd: false
-    passwd: <用 openssl passwd -6 '密码' 生成>
-ssh_pwauth: true
-disable_root: false
-```
-
-然后：
+### 准备工作（一键）
 
 ```bash
-cloud-localds seed.img user-data meta-data
+bash /root/kvm-vm.sh setup
+```
+
+它会自动下载 Ubuntu 26.04 的 arm64 镜像、转成 qcow2、扩到你配置的容量、
+生成 cloud-init，然后找 UEFI 固件。
+
+**关于固件**：必须是「不写 NVRAM」的那一份，它不在任何 git 仓库里
+（Limbo 分发在 APK 内），所以没法自动下载。脚本会依次在下面这些位置找：
+
+```text
+/sdcard/limbo_fw/edk2_qemu_aarch64_nonvram.fd
+/root/limbo_fw/edk2_qemu_aarch64_nonvram.fd
+<vmdir>/uefi-code.fd
+```
+
+找不到时它会直接告诉你从 Termux 怎么拷（一条 `su -c` 命令）。
+
+### 配置
+
+设置都在 `<vmdir>/vm.conf`，可以直接编辑：
+
+```bash
+bash /root/kvm-vm.sh config     # 看当前配置
+bash /root/kvm-vm.sh edit       # 改
+```
+
+```ini
+CPUS=8            # vCPU 数（绑核后 8 个可用）
+MEM=2048          # 内存 MiB
+DISK_GB=50        # 磁盘容量
+SSH_PORT=8023
+CPUSET=6-7        # 绑定的物理核（两个大核）
+USERNAME=u0_207
+PASSWORD=1
 ```
 
 ### 日常使用
@@ -240,6 +247,7 @@ cloud-localds seed.img user-data meta-data
 启动脚本已经放在仓库里，也复制到了容器的 `/root/kvm-vm.sh`：
 
 ```bash
+bash /root/kvm-vm.sh setup     # 首次准备（下载镜像等）
 bash /root/kvm-vm.sh start     # 开机
 bash /root/kvm-vm.sh status    # 看状态、看串口
 bash /root/kvm-vm.sh console   # 实时看画面（串口文字）
@@ -265,12 +273,14 @@ ssh u0_207@127.0.0.1 -p 8023
 
 ### 几个必须知道的坑
 
-1. **别开 8 核**。4 核是上限，开 8 个固件会直接崩。脚本里已经固定成 4。
+1. **别去掉 `taskset`**。启动脚本用 `taskset -c 6-7` 把 QEMU 绑到两个
+   大核上。这台机器是大小核（6 个 A55 + 2 个 A76），寄存器值不同；不绑核
+   会随机启动失败，报 `Failed to put registers after init`。
+   **绑了核之后 8 核也能用。**
 2. **别用 `-kernel` 直接引导**。这个镜像的内核是 PE32+ 格式，QEMU 不认。
    必须走 UEFI（也就是上面这套）。
-3. **启动失败报 `Failed to put registers` 时，看绑核**。这台机器是
-   大小核（6 个 A55 + 2 个 A76），QEMU 不绑核会随机失败。脚本里已经用
-   `taskset -c 6-7` 绑到大核上了，**别去掉**。
+3. **配置改 `vm.conf`**。vCPU 数、内存、磁盘、端口、用户名密码都在
+   里面，改完 `start` 生效。
 4. **没有图形界面**，现在只有串口文字。要 VNC 自己加
    `-device virtio-gpu-pci`。
 

@@ -201,12 +201,24 @@ taskset -c 6-7   → 3 成功 / 0 失败
 **这就是之前所有"时好时坏"假象的来源**：不是间歇性，是调度随机落在大核
 还是小核。绑核后 100% 稳定，不需要任何预热或延迟。
 
-### 5.2 vCPU 数量只能是 4
+### 5.2 vCPU 数量（绑核后 8 个可用）
 
-- `-smp 8` → 固件断言 `ASSERT [ArmPlatformPrePeiCore] .../MainUniCore.c(17)`
-- `-smp 1/2` → 偶发 `Failed to put registers after init: Invalid argument`
+绑核之前，`-smp 8` 会看到固件断言
+`ASSERT [ArmPlatformPrePeiCore] .../MainUniCore.c(17)`，很容易误判成
+"固件不支持 8 核"。
 
-Limbo 的 "100% Success Mode" 也是先跑 4 核、进系统后再放开。
+**实际不是。** 绑核后实测：
+
+```text
+-smp 2 / 4 / 6 / 8   全部启动，assert=0
+-smp 8 完整启动到登录提示，guest 内 "SMP: Total of 8 processors activated"
+```
+
+之前的断言是同一个绑定问题的另一种表现。`vm.conf` 里 `CPUS` 默认给 8。
+
+注意 8 个 vCPU 是压在 2 个物理大核上（`CPUSET=6-7`），属于超卖：吞吐好，
+但单核延迟会变差。要低延迟就把 `CPUSET` 放宽到 `0-7`（那样又会有绑定
+不一致的问题）或把 `CPUS` 降到 2。
 
 ### 5.3 NVRAM 变量存储建议每次刷新
 
