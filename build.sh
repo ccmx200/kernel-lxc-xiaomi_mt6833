@@ -701,7 +701,7 @@ if make -j"$(nproc --all)" "${MAKE_COMMON[@]}" \
         spin_start "Packaging AnyKernel3 zip..."
         rm -rf AnyKernel3
 
-        AK_URL="$(gh_url 'https://github.com/weaponmasterjax/AnyKernel3')"
+        AK_URL="$(gh_url 'https://github.com/ccmx200/AnyKernel3')"
         if GIT_SSL_NO_VERIFY=true git clone -q --depth=1 \
             "$AK_URL" AnyKernel3 >/dev/null 2>&1; then
             cp out/arch/arm64/boot/Image.gz AnyKernel3/
