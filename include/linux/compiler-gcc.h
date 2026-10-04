@@ -378,3 +378,7 @@
 #if GCC_VERSION >= 50100
 #define COMPILER_HAS_GENERIC_BUILTIN_OVERFLOW 1
 #endif
+
+#ifndef fallthrough
+# define fallthrough do {} while (0) /* fallthrough */
+#endif

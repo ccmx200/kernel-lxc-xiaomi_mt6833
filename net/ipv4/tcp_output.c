@@ -69,6 +69,9 @@ void tcp_mstamp_refresh(struct tcp_sock *tp)
 {
 	u64 val = tcp_clock_ns();
 
+	if (val > tp->tcp_clock_cache)
+		tp->tcp_clock_cache = val;
+
 	/* departure time for next data packet */
 	if (val > tp->tcp_wstamp_ns)
 		tp->tcp_wstamp_ns = val;
@@ -1284,7 +1287,7 @@ int tcp_fragment(struct sock *sk, struct sk_buff *skb, u32 len,
 {
 	struct tcp_sock *tp = tcp_sk(sk);
 	struct sk_buff *buff;
-	int nsize, old_factor;
+	int nsize, old_factor, inflight_prev;
 	long limit;
 	int nlen;
 	u8 flags;
@@ -1372,6 +1375,15 @@ int tcp_fragment(struct sock *sk, struct sk_buff *skb, u32 len,
 
 		if (diff)
 			tcp_adjust_pcount(sk, skb, diff);
+
+		/* Set buff tx.in_flight as if buff were sent by itself. */
+		inflight_prev = TCP_SKB_CB(skb)->tx.in_flight - old_factor;
+		if (WARN_ONCE(inflight_prev < 0,
+			      "inconsistent: tx.in_flight: %u old_factor: %d",
+			      TCP_SKB_CB(skb)->tx.in_flight, old_factor))
+			inflight_prev = 0;
+		TCP_SKB_CB(buff)->tx.in_flight = inflight_prev +
+						 tcp_skb_pcount(buff);
 	}
 
 	/* Link BUFF into the send queue. */
@@ -1724,7 +1736,7 @@ u32 tcp_tso_autosize(const struct sock *sk, unsigned int mss_now,
 {
 	u32 bytes, segs;
 
-	bytes = min(sk->sk_pacing_rate >> 10,
+	bytes = min(sk->sk_pacing_rate >> sk->sk_pacing_shift,
 		    sk->sk_gso_max_size - 1 - MAX_TCP_HEADER);
 
 	/* Goal is to send at least one packet per ms,
@@ -2243,11 +2255,11 @@ static bool tcp_small_queue_check(struct sock *sk, const struct sk_buff *skb,
 	unsigned int limit;
 
 	/* rollback to kernel 3.18 */
-	//limit = max(2 * skb->truesize, sk->sk_pacing_rate >> 10);
+	//limit = max(2 * skb->truesize, sk->sk_pacing_rate >> sk->sk_pacing_shift);
 	//limit = min_t(u32, limit, sysctl_tcp_limit_output_bytes);
 	//limit <<= factor;
 	limit = max_t(u32, sysctl_tcp_limit_output_bytes,
-		      sk->sk_pacing_rate >> 10);
+		      sk->sk_pacing_rate >> sk->sk_pacing_shift);
 
 	if (refcount_read(&sk->sk_wmem_alloc) > limit) {
 		/* Always send the 1st or 2nd skb in write queue.
