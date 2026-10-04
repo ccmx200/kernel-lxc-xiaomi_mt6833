@@ -1444,9 +1444,13 @@ EL2 就重新归内核所有，`CONFIG_ARM64_VHE` 与 KVM 才有落脚点。
 两条路径的其余部分（`ESR_EL2.ISV == 0`、NISV 回移、绑核、固件选择）与本节
 正交，不因 GZ 是否禁用而改变。
 
-> **设备代号的说明**：本节的 `evergo` 指 **Redmi Note 11 5G**。本文第 1 章的
-> 实测数据来自代号 `evergo` 的设备（同为 MT6833）。两者是**不同的机器**，
-> 第 11 章以外的内容与本节没有直接的设备对应关系，请勿混用。
+> **设备代号的说明**：本文全文的实测数据都来自**同一台设备** ——
+> Redmi Note 11 5G（MT6833），内核代号 `evergo`。文中出现的所有设备
+> 描述（第 1 章的环境、第 9 章的测量、第 11 章的 GenieZone、第 12 章的
+> 拓扑）指的都是这一台。
+>
+> 构建配置与版本号里曾短暂用过 `everpal` 这个名字，现已全部改名，
+> `everpal` 与 `evergo` **指同一台机器**，不是两台。
 
 ### 11.11 致谢（重申）
 
@@ -1587,6 +1591,92 @@ vCPU 启动时全部创建好，只是初始化期间不允许跨簇迁移。
 * Limbo for Tensor 的「100% Success Mode」描述（先在 0-3 核启动 UEFI，
   加载后再放开全部核）：
   <https://github.com/wasdwasd0105/limbo_tensor>
+
+
+### 12.8 这一节改动带来的性能差异
+
+第 12.4 节的「先钉单核再放开」不只是把启动从"大概率失败"变成"每次都成功"，
+它还解锁了此前用不到的**全部 8 个物理核**。下面是这次改动前后的完整对照。
+
+#### 启动可靠性
+
+| 启动方式 | 物理核 | 成功率 | 说明 |
+|---|---|---|---|
+| 直接绑 `0-7` | 8 | **1/5** | 4 次 QEMU 启动即退出，1 次启动后卡住 |
+| **先绑单核 → 扩到 `0-7`** | 8 | **5/5** | 全部启动，guest 内 8 CPU 激活 |
+| 直接绑 `6-7`（旧默认） | 2 | 6/6 | 本来就稳，所以之前没人发现问题 |
+
+#### guest 内实测吞吐
+
+同一 guest（8 vCPU），只改物理核范围，guest 内跑
+`openssl speed -multi 8 -evp sha256 -seconds 2`，取 16384 字节块，
+每档 3 次：
+
+| 物理核范围 | 核构成 | sha256 吞吐 | 相对大核 | 启动耗时 |
+|---|---|---|---|---|
+| `0-7` | 6×A55 + 2×A76 | **7.4 – 7.7 GB/s** | **2.6×** | ~42–44 s |
+| `0-5` | 6×A55 | 4.5 – 4.9 GB/s | 1.7× | ~46 s |
+| `6-7` | 2×A76 | 2.9 – 3.0 GB/s | 1.0×（基准） | ~34 s |
+
+**读法：**
+
+* 从默认的 2 个大核换到全部 8 核，**吞吐提升约 2.6 倍**，代价是启动多 8–12 秒；
+* 8 个 vCPU 压在 2 个大核上属于**超卖** —— 吞吐靠时间片轮转堆出来，单核
+  延迟会明显变差。要低延迟就用 `CPUSET=6-7`，要高吞吐才用 `CPUSET=0-7`；
+* A76 单核性能约是 A55 的 2.8 倍（`cpu_capacity` 1024 对 367），所以
+  "6 个小核" 只比 "2 个大核" 快 1.7 倍，而不是 3 倍。
+
+#### 怎么用上
+
+`ckvm` 的默认仍是 `CPUSET=6-7`（稳定优先，向后兼容）。要跑满全部物理核：
+
+```sh
+ckvm create myvm --cpus 8 --mem 3072 ...
+sed -i 's/^CPUSET=.*/CPUSET=0-7/' /var/lib/ckvm/myvm/vm.conf
+ckvm start myvm
+```
+
+`ckvm` 会自己先钉在 `BOOT_CPU`（默认 6）上完成 vCPU 初始化，等 guest 起来
+再把所有线程放开到 `CPUSET`，无需手工干预。
+
+### 12.9 思路来源
+
+这一节的做法不是原创，是把两处已有经验用在了 MTK 平台上。
+
+**1. Limbo for Tensor 的「100% Success Mode」**
+
+Limbo 在 Pixel 设备上的原始描述是：
+
+> **100% Success Mode:**
+> Enable: Will run Qemu only on CPU 0-3 to avoid boot failure. You can click
+> 🚀 icon after UEFI loaded to enable all CPU cores
+> Disable: Use all cores on Qemu start. May have stack overflow error on UEFI
+> firmware
+
+也就是说：**先在少数核上启动以避免失败，等 UEFI 加载完成后再放开全部核**。
+本节把同样的"启动期限制、运行期放开"思路用到了 MTK 的 big.LITTLE 上，区别
+只在于失败原因不同 —— Pixel 那边是固件栈溢出，MTK 这边是跨簇特性寄存器不
+一致导致的 `EINVAL`。
+
+来源：<https://github.com/wasdwasd0105/limbo_tensor>（README 的 Features 一节）
+
+**2. `taskset` 与线程亲和性继承**
+
+"进程绑核"和"每个线程绑核"的区别来自 Linux 的亲和性语义：`sched_setaffinity`
+是**按线程**生效的，子线程在创建时继承父线程的掩码。所以想让已经在跑的 QEMU
+换核，必须遍历 `/proc/<pid>/task/*` 逐个设置，只对进程调一次 `taskset` 不会
+移动已有线程。这一点决定了实现方式（见 `widen_affinity()`）。
+
+来源：`man 2 sched_setaffinity`、`man 1 taskset`
+
+**3. 失败原因的诊断**
+
+"跨簇特性寄存器不一致"这个判断来自两条线索：错误发生在 vCPU 初始化早期
+（`kvm_arch_put_registers()` 写通用寄存器时），以及 `-smp 1` 也会失败 ——
+单核配置排除了"核数太多"这一解释，只剩调度迁移。ARM 架构参考手册
+DDI 0487 对 `ID_AA64*` 系列寄存器的定义支持了这个推断。
+
+来源：<https://developer.arm.com/documentation/ddi0487/latest>
 
 
 ## 附：本机原始测量记录

@@ -410,6 +410,52 @@ VM_HOSTNAME=ubuntu26
 
 ---
 
+## 用满全部 CPU 核心
+
+`ckvm` 默认把 QEMU 绑在 **2 个大核**（`CPUSET=6-7`）上 —— 这是最稳的配置。
+但它也能用上**全部 8 个物理核**，吞吐差很多：
+
+| 绑定的物理核 | 核构成 | sha256 吞吐 | 启动 |
+|---|---|---|---|
+| `6-7`（默认） | 2×A76 | 2.9–3.0 GB/s | ~34 s |
+| `0-5` | 6×A55 | 4.5–4.9 GB/s | ~46 s |
+| **`0-7`** | **6×A55 + 2×A76** | **7.4–7.7 GB/s** | ~42–44 s |
+
+**全核比默认快约 2.6 倍**，代价是启动多 8–12 秒。
+
+```sh
+ckvm create myvm --cpus 8 --mem 3072 ...
+sed -i 's/^CPUSET=.*/CPUSET=0-7/' /var/lib/ckvm/myvm/vm.conf
+ckvm start myvm
+```
+
+### 为什么不是开箱即用
+
+直接让 QEMU 在 `0-7` 上启动，**5 次里有 4 次会直接失败**：
+
+```text
+qemu-system-aarch64: Failed to put registers after init: Invalid argument
+```
+
+原因是 big.LITTLE：vCPU 初始化期间如果线程在两个簇之间迁移，A55 和 A76 的
+CPU 特性寄存器不同，KVM 会拒绝写入。
+
+**从 v1.1 起脚本自己处理了这件事** —— 先把 QEMU 钉在**一个核**上完成初始化，
+等 guest 起来再把所有线程放开到你设的 `CPUSET`：
+
+```text
+CPUSET=0-7 时：
+  启动阶段     钉在 BOOT_CPU（默认 6）
+  guest 起来后  所有线程放开到 0-7
+```
+
+实测这样之后 `CPUSET=0-7` **5/5 成功**，guest 内出现
+`SMP: Total of 8 processors activated`。
+
+> **低延迟场景建议保持 `CPUSET=6-7`。** 8 个 vCPU 压在 2 个大核上属于超卖，
+> 吞吐靠时间片堆出来，单核延迟会变差。真实用满 8 个物理核则两者都好，只是
+> 启动慢一点。
+
 ## 镜像源
 
 默认：

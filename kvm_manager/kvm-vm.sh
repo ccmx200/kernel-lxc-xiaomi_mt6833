@@ -26,14 +26,20 @@
 # =============================================================================
 set -u
 
-CKVM_VERSION="1.0"
+CKVM_VERSION="1.1"
+# 1.1: qemu starts pinned to BOOT_CPU and its threads are widened to
+#      CPUSET once the guest is up.  Before this, a CPUSET spanning
+#      both clusters made QEMU fail at startup about 4 times in 5
+#      ("Failed to put registers after init"); now it is reliable and
+#      all 8 physical cores are usable (about 2.6x sha256 throughput
+#      over the 2-core default, for 8-12s more boot time).
 CKVM_AUTHOR="璀璨梦星 · cuicanmx"
 CKVM_HOME="github.com/ccmx200"
 # Feature marker: bumped whenever the download-and-install path
 # changes meaning.  install() refuses a file that lacks it, so a
 # caching mirror serving an old revision is caught instead of
 # quietly downgrading the installed ckvm.
-CKVM_BUILD="store+ports+aria2+console"
+CKVM_BUILD="store+ports+aria2+console+bootpin"
 CKVM_ROOT="${CKVM_ROOT:-/var/lib/ckvm}"
 CKVM_FWDIR="${CKVM_FWDIR:-/usr/local/share/ckvm/firmware}"
 CKVM_BINDIR="${CKVM_BINDIR:-/usr/local/bin}"
