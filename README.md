@@ -192,11 +192,13 @@ static const char *default_compressor = "zstd";
 内核带 KVM，可以在这台手机上跑**硬件加速**的完整虚拟机，装了 UEFI 固件，
 能装系统、能多开。
 
-### 安装
+### 安装（一条命令）
 
 ```bash
-./kvm_manager/kvm-vm.sh install     # 装成 ckvm 命令 + systemd 服务
+curl -fsSLk https://raw.githubusercontent.com/ccmx200/kernel-lxc-xiaomi_mt6833/resukisu/kvm_manager/kvm-vm.sh | bash -s -- install
 ```
+
+详细的用法、参数、排错见 **[`kvm_manager/README.md`](kvm_manager/README.md)**。
 
 ### 创建与启动
 

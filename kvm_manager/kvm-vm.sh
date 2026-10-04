@@ -466,19 +466,57 @@ cmd_config() {
 
 cmd_edit() { load_vm "$1"; ${EDITOR:-vi} "$(vm_conf "$1")"; }
 
+REPO_RAW="${REPO_RAW:-https://raw.githubusercontent.com/ccmx200/kernel-lxc-xiaomi_mt6833/resukisu/kvm_manager}"
+
 cmd_install() {
     need_root
-    install -m 0755 "$0" "$CKVM_BINDIR/ckvm"
     mkdir -p "$CKVM_ROOT" "$CKVM_FWDIR"
-    write_unit
-    systemctl daemon-reload
+
+    # when the script was piped in, $0 is not the file we want to install
+    if [ -f "$0" ] && [ "$(readlink -f "$0")" != "$CKVM_BINDIR/ckvm" ]; then
+        install -m 0755 "$0" "$CKVM_BINDIR/ckvm"
+    else
+        say "fetching the latest ckvm"
+        curl -fSLk --retry 3 -o "$CKVM_BINDIR/ckvm" "$REPO_RAW/kvm-vm.sh" \
+            || die "download failed: $REPO_RAW/kvm-vm.sh"
+        chmod 0755 "$CKVM_BINDIR/ckvm"
+    fi
     say "installed: $CKVM_BINDIR/ckvm"
-    local src
-    if src=$(find_firmware); then
+
+    # firmware: prefer the repo copy (it ships next to the script), then
+    # anything already staged on this device
+    local src="" cand
+    for cand in "$CKVM_FWDIR/edk2_qemu_aarch64_nonvram.fd" \
+                "$(dirname "$0")/edk2_qemu_aarch64_nonvram.fd"; do
+        [ -f "$cand" ] && { src="$cand"; break; }
+    done
+    if [ -z "$src" ]; then
+        src=$(find_firmware) || src=""
+    fi
+
+    if [ -n "$src" ]; then
         install_firmware "$src"
     else
-        warn "firmware not found - 'ckvm create' will show how to stage it"
+        say "firmware not bundled locally; fetching it from the repo"
+        local ok=0 f
+        for f in edk2_qemu_aarch64_nonvram.fd edk2_vars.fd; do
+            if curl -fSLk --retry 3 -o "$CKVM_FWDIR/$f.part" "$REPO_RAW/$f"; then
+                mv -f "$CKVM_FWDIR/$f.part" "$CKVM_FWDIR/$f"
+                ok=1
+            else
+                rm -f "$CKVM_FWDIR/$f.part"
+                warn "could not fetch $f"
+            fi
+        done
+        if [ "$ok" = 1 ]; then
+            say "firmware downloaded into $CKVM_FWDIR"
+        else
+            warn "stage the firmware manually - 'ckvm create' will show how"
+        fi
     fi
+
+    write_unit
+    systemctl daemon-reload
     say ""
     say "try:  ckvm create ubuntu26 && ckvm start ubuntu26 && ckvm list"
 }
