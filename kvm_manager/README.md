@@ -538,12 +538,16 @@ guest   Ubuntu 26.04.1 LTS
 | GitHub | <https://github.com/ccmx200> |
 | 仓库 | `ccmx200/kernel-lxc-xiaomi_mt6833` 的 `kvm_manager/` |
 
-ckvm 本身按仓库声明的许可分发。它依赖的外部组件各有其许可：
+**ckvm 本身采用 GPL-2.0**（与所在内核仓库一致，脚本头部有
+`SPDX-License-Identifier: GPL-2.0`）。它下载或调用的外部组件各有其许可，
+使用时请一并遵守：
 
 | 组件 | 来源 | 许可 |
 |---|---|---|
+| ckvm | 本项目 | **GPL-2.0** |
 | UEFI 固件 | Limbo for Tensor（`wasdwasd0105/limbo_tensor`） | 见其项目声明 |
 | Ubuntu cloud image | Canonical | 见 Ubuntu 许可 |
+| 禁用 GenieZone 工具链 | `jsbsbxjxh66/mtk-soc-disable-geniezone` | MIT（其项目声明） |
 | QEMU / aria2 / cloud-init 等 | 各自上游 | 各自上游许可 |
 
 **免责声明**：本工具按原样提供，不附带任何形式的担保。刷写内核、修改分区表

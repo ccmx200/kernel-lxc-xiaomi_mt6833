@@ -421,3 +421,6 @@ ReSukiSU、Linux 内核回移代码、zstd、lz4、EDK2 固件、
 使用、修改或再分发这些部分时，请一并遵守其许可条款。
 
 `mtk-soc-disable-geniezone` 为 MIT；Limbo 的固件请遵循其项目声明。
+
+本仓库自有的脚本（`kvm_manager/kvm-vm.sh`，即 `ckvm`）采用 **GPL-2.0**，
+与内核部分一致。

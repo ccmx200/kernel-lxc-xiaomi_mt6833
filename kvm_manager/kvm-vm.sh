@@ -1,6 +1,13 @@
 #!/bin/bash
+# SPDX-License-Identifier: GPL-2.0
 # =============================================================================
 #  ckvm - KVM guest manager for MT6833 / evergo (nVHE KVM, droidspaces)
+#
+#  Copyright (C) 2026 璀璨梦星 (cuicanmx) <https://github.com/ccmx200>
+#
+#  Released under the GNU General Public License v2.0 only, matching the
+#  kernel tree this ships with.  Components it downloads or drives keep
+#  their own licences; see kvm_manager/README.md.
 #
 #  Install:   ./kvm-vm.sh install          -> /usr/local/bin/ckvm
 #  Then:      ckvm create ubuntu26
@@ -1721,7 +1728,7 @@ ckvm $CKVM_VERSION - KVM guest manager (MT6833 / evergo)
 Files: $CKVM_ROOT/<name>/    firmware: $CKVM_FWDIR
 
 作者  $CKVM_AUTHOR    $CKVM_HOME
-      MIT / 见仓库 License；按原样提供，刷机风险自负
+      GPL-2.0 / 见仓库 COPYING；按原样提供，刷机风险自负
 EOF
 }
 # Every subcommand that needs a guest name should fail clearly instead of
