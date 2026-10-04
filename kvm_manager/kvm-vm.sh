@@ -29,7 +29,10 @@
 # =============================================================================
 set -u
 
-CKVM_VERSION="1.4"
+CKVM_VERSION="1.5"
+# 1.5: host/tap mode waits for the SSH banner, not just the serial login
+#      prompt.  sshd accepts connections a few seconds before it can
+#      authenticate, so an immediate ssh got 'Permission denied'.
 # 1.3: 'ckvm selftest' boots a throwaway guest to prove the install works.
 # 1.2: the core choice is explicit and defaults to ALL cores --cores all|big.
 # 1.1: qemu starts pinned to BOOT_CPU and its threads are widened to
@@ -1213,10 +1216,17 @@ cmd_start() {
             fi
             ;;
         host|tap)
-            if spin_timed "等待启动完成（登录提示）" 45 _wait_login_prompt "$name" 300; then
-                say "已出现登录提示"
+            # Waiting for the serial login prompt is not enough: sshd may be
+            # listening without being able to authenticate yet, and an
+            # immediate ssh then fails with "Permission denied".  Probe the
+            # guest's own address for the SSH banner instead.
+            if spin_timed "等待启动完成（SSH 就绪）" 45 \
+                 wait_for_ssh 22 300 "$TAP_IP_GUEST"; then
+                say "SSH 已就绪"
+            elif grep -aq "login:" "$(vm_log "$name")" 2>/dev/null; then
+                say "已出现登录提示（SSH 未确认，可能还要等几秒）"
             else
-                warn "等待登录提示超时： ckvm console $name -n 40"
+                warn "等待启动超时： ckvm console $name -n 40"
             fi
             ;;
     esac
@@ -1244,7 +1254,7 @@ _wait_login_prompt() {
 #
 # $1 = host port to probe, $2 = optional timeout in seconds
 wait_for_ssh() {
-    local port="$1" timeout="${2:-300}" elapsed=0
+    local port="$1" timeout="${2:-300}" probe_host="${3:-127.0.0.1}" elapsed=0
     command -v python3 >/dev/null 2>&1 || return 1
     while [ "$elapsed" -lt "$timeout" ]; do
         if python3 -c '
@@ -1252,7 +1262,7 @@ import socket,sys
 for _ in range(3):
     try:
         s=socket.socket(); s.settimeout(1)
-        s.connect(("127.0.0.1",int(sys.argv[1])))
+        s.connect((sys.argv[2], int(sys.argv[1])))
         s.settimeout(2)
         b=s.recv(64); s.close()
         if b.startswith(b"SSH-"):
@@ -1260,7 +1270,7 @@ for _ in range(3):
     except Exception:
         pass
 sys.exit(1)
-' "$port" >/dev/null 2>&1; then
+' "$port" "$probe_host" >/dev/null 2>&1; then
             return 0
         fi
         sleep 2
