@@ -934,6 +934,78 @@ ssh banner: SSH-2.0-OpenSSH_9.6p1 Ubuntu-3ubuntu13.19
 printf '5\nsrv24\n4\n1536\n30\nuser\n22\n' | script -q -c 'ckvm create' /dev/null
 ```
 
+### 8.6 账号与密码
+
+默认账号不再写死 `u0`。交互模式会问「登录账号」，可以填 `root` 或任意名字；
+命令行用 `--user` / `--pass`。命令模式不给参数时用 `ubuntu`（与 Ubuntu cloud
+image 自带的默认账号一致）。
+
+两种 seed 形态：
+
+| `VM_USER` | user-data |
+|---|---|
+| `root` | 不建额外账号，只给 root 设密码 |
+| 其他 | 建一个带 `sudo: ALL=(ALL) NOPASSWD:ALL` 的账号；**root 同密码**，便于救急 |
+
+#### root 密码登录为什么会失败
+
+在 Ubuntu cloud image 上，只设密码是**不够**的。实测：
+
+```text
+$ sshd -T | grep -i permitroot
+permitrootlogin prohibit-password      <-- 即使设了密码也拒绝
+```
+
+原因在 sshd 的配置包含顺序：
+
+```text
+/etc/ssh/sshd_config              Include /etc/ssh/sshd_config.d/*.conf
+/etc/ssh/sshd_config.d/50-cloud-init.conf        PasswordAuthentication yes   <- cloud-init 写的
+/etc/ssh/sshd_config.d/60-cloudimg-settings.conf PasswordAuthentication no    <- 镜像自带，排后面，赢
+```
+
+后者按字母序在后面，覆盖了 cloud-init 的设置。所以 ckvm 另外写一个
+`99-ckvm-root.conf`：
+
+```text
+PermitRootLogin yes
+PasswordAuthentication yes
+KbdInteractiveAuthentication yes
+```
+
+并删除 `60-cloudimg-settings.conf` 里的 `PasswordAuthentication` 行，最后重启
+sshd。实测（`--user root --pass Secret123`）：
+
+```text
+$ sshpass -p Secret123 ssh -p 8030 root@127.0.0.1 'id'
+uid=0(root) gid=0(root) groups=0(root)
+```
+
+#### 为什么用 write_files 而不是 runcmd
+
+第一版把 shell 命令直接塞进 `runcmd:`，转义在 cloud-init YAML 里被层层吃掉，
+写出来的文件是坏的：
+
+```text
+- [ sh, -c, "printf %s\\n \"PermitRootLogin yes\" ... > ..." ]
+```
+
+现在改成 `write_files` 写一个 `/usr/local/sbin/ckvm-ssh-fix` 脚本，`runcmd`
+只调用它：
+
+```yaml
+write_files:
+  - path: /usr/local/sbin/ckvm-ssh-fix
+    permissions: "0755"
+    content: |
+      #!/bin/sh
+      ...
+runcmd:
+  - [ /usr/local/sbin/ckvm-ssh-fix ]
+```
+
+这样脚本内容原样落到 guest，不需要任何转义。
+
 ---
 
 ## 9. 实测数据集
@@ -954,7 +1026,7 @@ guest    Ubuntu 26.04.1 LTS，kernel 7.0.0-38-generic
 $ ckvm start ubuntu26
   guest 'ubuntu26' running (pid 11506, 8 vCPU, 2048 MiB, cpuset 6-7)
   network: user-mode NAT
-    ssh u0@127.0.0.1 -p 8023
+    ssh ubuntu@127.0.0.1 -p 8023
 
 约 30 秒后串口出现：
 Ubuntu 26.04.1 LTS ubuntu2604 ttyAMA0
@@ -977,7 +1049,7 @@ Memory            1946 MiB
 $ ckvm list
   NAME             STATE    CPUS   MEM      DISK    PORT   SSH
   test2            running  4      1536     50G     8024   ssh u0@127.0.0.1 -p 8024
-  ubuntu26         running  8      2048     50G     8023   ssh u0@127.0.0.1 -p 8023
+  ubuntu26         running  8      2048     50G     8023   ssh ubuntu@127.0.0.1 -p 8023
 ```
 
 ### 9.5 关键对照实验

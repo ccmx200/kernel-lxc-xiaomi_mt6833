@@ -130,6 +130,8 @@ ckvm create app --rel 22.04 --mem 1024 --disk 20
 | `--disk GB` | 磁盘容量 | `50` |
 | `--port N` | 宿主机 SSH 端口 | 从 `8023` 起自动找空位 |
 | `--net M` | 网络模式 `user` / `host` | `user` |
+| `--user U` | 登录账号，或 `root` | `ubuntu` |
+| `--pass P` | 该账号的密码 | `ubuntu` |
 | `--fwd L` | 端口映射（见下） | `22` |
 
 ### 端口映射怎么写
@@ -193,14 +195,39 @@ ckvm versions
 创建前会先**验证镜像真的能下**（探测 `Content-Length`），不可用会直接报错，
 不会让你等半天才发现下不了。
 
-### 启动
+### 登录账号和密码
 
-```bash
-ckvm start srv24
-ssh u0@127.0.0.1 -p 8025        # 密码 1
+交互流程里会问你**用哪个账号登录**：
+
+```text
+  登录账号
+  ────────
+    输入 root       直接用 root 登录（会设置 root 密码）
+    输入其他名字    新建一个带 sudo 的普通用户
+    直接回车        用 ubuntu
+  账号名: [ubuntu]:
+  密码:
+  再输一次:
 ```
 
----
+**密码由你自己定**，输入时不回显，要输两遍确认。
+
+命令行等价参数：
+
+```bash
+ckvm create srv --user root  --pass 'MyPass123'
+ckvm create dev --user alice --pass 'alicepw'
+ckvm create box                      # 默认账号 ubuntu / 密码 ubuntu
+```
+
+> **为什么 root 需要额外处理**：Ubuntu 的 cloud image 自带
+> `/etc/ssh/sshd_config.d/60-cloudimg-settings.conf`，里面写着
+> `PasswordAuthentication no`，而 `sshd_config` 是按字母序 `Include` 该目录的 ——
+> 它排在 cloud-init 写的 `50-cloud-init.conf` **后面**，所以会覆盖。
+> 结果就是密码设上了但 root 仍然登录不了。ckvm 会再写一个排序更后的
+> `99-ckvm-root.conf` 显式打开 root 密码登录，并重启 sshd。
+
+### 启动
 
 ## 多开
 

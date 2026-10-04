@@ -40,8 +40,10 @@ DEF_CPUS=8
 DEF_MEM=2048
 DEF_DISK_GB=50
 DEF_CPUSET=6-7
-DEF_USER=u0
-DEF_PASS=1
+# Empty means "ask" in interactive mode; command mode falls back to
+# "ubuntu" (what the Ubuntu cloud images themselves use).
+DEF_USER=""
+DEF_PASS=""
 DEF_REL=26.04
 DEF_PORT_BASE=8023
 
@@ -478,6 +480,37 @@ ask_with_default() {
     printf '%s' "$ans"
 }
 
+# Ask for a password without echoing.  Empty input keeps the default.
+ask_password() {
+    local prompt="$1" def="$2" ans=""
+    if [ "$IS_TTY" != 1 ]; then
+        printf '%s' "$def"
+        return 0
+    fi
+    if [ -n "$def" ]; then
+        printf '  %s [留空则用 %s]: ' "$prompt" "$def" >&2
+    else
+        printf '  %s: ' "$prompt" >&2
+    fi
+    IFS= read -rs ans 2>/dev/null || ans=""
+    printf '\n' >&2
+    [ -z "$ans" ] && ans="$def"
+    printf '%s' "$ans"
+}
+
+# Ask which account to log in as.  Echoes "root" or the chosen user name.
+ask_account() {
+    [ "$IS_TTY" = 1 ] || { printf '%s' "${DEF_USER:-ubuntu}"; return 0; }
+    printf '\n' >&2
+    printf '  %s登录账号%s\n' "$C_B" "$C_RST" >&2
+    printf '  %s────────%s\n' "$C_DIM" "$C_RST" >&2
+    printf '    输入 %sroot%s   直接用 root 登录（会设置 root 密码）\n' "$C_G" "$C_RST" >&2
+    printf '    输入其他名字    新建一个带 sudo 的普通用户\n' >&2
+    printf '    直接回车        用 %s%s%s\n' "$C_C" "${DEF_USER:-ubuntu}" "$C_RST" >&2
+    printf '\n' >&2
+    ask_with_default "账号名:" "${DEF_USER:-ubuntu}"
+}
+
 confirm_yn() {
     local prompt="$1" def="${2:-n}" ans=""
     [ "$IS_TTY" = 1 ] || { [ "$def" = y ]; return; }
@@ -569,22 +602,50 @@ make_seed() {
     d=$(vm_dir "$name")
     load_vm "$name"
     local hash; hash=$(openssl passwd -6 "$VM_PASS")
-    cat > "$d/user-data" <<EOF
+
+    # Ubuntu's cloud images ship
+    #   /etc/ssh/sshd_config.d/60-cloudimg-settings.conf   (PasswordAuthentication no)
+    # and sshd_config Includes that directory in alphabetical order, so it wins
+    # over cloud-init's own 50-cloud-init.conf and root password login is
+    # refused even when a password is set (verified: `sshd -T` reported
+    # permitrootlogin prohibit-password).
+    #
+    # The fix is written by a script rather than an inline runcmd: quoting a
+    # shell command inside cloud-init YAML mangled the file badly.
+    local sshfix
+    sshfix='write_files:
+  - path: /usr/local/sbin/ckvm-ssh-fix
+    permissions: "0755"
+    content: |
+      #!/bin/sh
+      # Let root log in with a password (Ubuntu cloud images forbid it).
+      sed -i -e "/^PasswordAuthentication/d" \
+             -e "/^KbdInteractiveAuthentication/d" \
+             /etc/ssh/sshd_config.d/60-cloudimg-settings.conf 2>/dev/null || true
+      d=/etc/ssh/sshd_config.d/99-ckvm-root.conf
+      printf "%s\n" "PermitRootLogin yes" > "$d"
+      printf "%s\n" "PasswordAuthentication yes" >> "$d"
+      printf "%s\n" "KbdInteractiveAuthentication yes" >> "$d"
+      systemctl restart ssh 2>/dev/null || systemctl restart sshd 2>/dev/null || true
+runcmd:
+  - [ /usr/local/sbin/ckvm-ssh-fix ]'
+
+    if [ "$VM_USER" = "root" ]; then
+        # root-only guest: no extra account
+        cat > "$d/user-data" <<EOF
 #cloud-config
 hostname: $VM_HOSTNAME
 manage_etc_hosts: true
-users:
-  - name: $VM_USER
-    gecos: $VM_USER
-    groups: [sudo, adm]
-    shell: /bin/bash
-    sudo: ALL=(ALL) NOPASSWD:ALL
-    lock_passwd: false
-    passwd: $hash
 ssh_pwauth: true
 disable_root: false
+ssh:
+  allow-pw: true
+  permit_root_login: true
 chpasswd:
   expire: false
+  users:
+    - {name: root, password: $hash, type: hash}
+$sshfix
 growpart:
   mode: auto
   devices: ['/']
@@ -599,12 +660,49 @@ apt:
 package_update: false
 package_upgrade: false
 EOF
+    else
+        cat > "$d/user-data" <<EOF
+#cloud-config
+hostname: $VM_HOSTNAME
+manage_etc_hosts: true
+users:
+  - name: $VM_USER
+    gecos: $VM_USER
+    groups: [sudo, adm]
+    shell: /bin/bash
+    sudo: ALL=(ALL) NOPASSWD:ALL
+    lock_passwd: false
+    passwd: $hash
+ssh_pwauth: true
+disable_root: false
+ssh:
+  allow-pw: true
+chpasswd:
+  expire: false
+  users:
+    - {name: root, password: $hash, type: hash}
+$sshfix
+growpart:
+  mode: auto
+  devices: ['/']
+resize_rootfs: true
+apt:
+  primary:
+    - arches: [default]
+      uri: "$MIRROR_APT"
+  security:
+    - arches: [default]
+      uri: "$MIRROR_APT"
+package_update: false
+package_upgrade: false
+EOF
+    fi
+
     cat > "$d/meta-data" <<EOF
 instance-id: ckvm-$name
 local-hostname: $VM_HOSTNAME
 EOF
 
-    # host/tap mode: no DHCP server exists, so pin the address in the guest
     if [ "${NET_MODE:-user}" = "host" ] || [ "${NET_MODE:-user}" = "tap" ]; then
         cat > "$d/network-config" <<EOF
 version: 2
@@ -625,7 +723,11 @@ EOF
     else
         cloud-localds "$d/seed.img" "$d/user-data" "$d/meta-data"
     fi
-    say "seed.img written (user $VM_USER / password $VM_PASS)"
+    if [ "$VM_USER" = "root" ]; then
+        say "seed.img written (root / password $VM_PASS)"
+    else
+        say "seed.img written (user $VM_USER / password $VM_PASS, root 同密码)"
+    fi
 }
 
 fetch_image() {
@@ -662,6 +764,7 @@ cmd_create() {
 
     local name="" cpus="" mem="" disk="" rel="" port=""
     local net_mode="" forwards="" fwd_set=0
+    local vm_user="" vm_pass=""
     local interactive=0
 
     # decide the mode first: bare "ckvm create" on a TTY is interactive
@@ -678,6 +781,8 @@ cmd_create() {
             --port) port="$2"; shift 2 ;;
             --net)  net_mode="$2"; shift 2 ;;
             --fwd)  forwards="$2"; fwd_set=1; shift 2 ;;
+            --user) vm_user="$2"; shift 2 ;;
+            --pass) vm_pass="$2"; shift 2 ;;
             -i|--interactive) interactive=1; shift ;;
             *)      name="$1"; shift ;;
         esac
@@ -709,6 +814,25 @@ cmd_create() {
             forwards=$(ask_with_default "映射端口:" "$DEF_FORWARDS")
             fwd_set=1
         fi
+
+        # account: root, or a named sudo user; then the password
+        vm_user=$(ask_account)
+        if [ -z "$vm_pass" ]; then
+            local p1 p2
+            while :; do
+                p1=$(ask_password "密码" "")
+                if [ -z "$p1" ]; then
+                    printf '  %s密码不能为空%s\n' "$C_Y" "$C_RST" >&2
+                    continue
+                fi
+                p2=$(ask_password "再输一次" "")
+                if [ "$p1" = "$p2" ]; then
+                    vm_pass="$p1"
+                    break
+                fi
+                printf '  %s两次不一致，重新输入%s\n' "$C_Y" "$C_RST" >&2
+            done
+        fi
         printf '\n'
     fi
 
@@ -720,6 +844,13 @@ cmd_create() {
     [ -n "$disk" ]      || disk="$DEF_DISK_GB"
     [ -n "$net_mode" ]  || net_mode="$DEF_NET_MODE"
     [ -n "$forwards" ]  || forwards="$DEF_FORWARDS"
+    [ -n "$vm_user" ]   || vm_user="${DEF_USER:-ubuntu}"
+    [ -n "$vm_pass" ]   || vm_pass="${DEF_PASS:-ubuntu}"
+    case "$vm_user" in
+        root) : ;;
+        *[!A-Za-z0-9_.-]*|"") die "invalid user name: '$vm_user'" ;;
+    esac
+    [ -n "$vm_pass" ] || die "password must not be empty"
 
     # is this release in the catalogue at all?
     if [ -z "$(catalogue_field "$rel" 1)" ]; then
@@ -764,8 +895,8 @@ PORT=$port
 # different ID registers, and an unpinned QEMU gets EINVAL when it writes
 # them back.  Cores 6,7 are the A76 pair.
 CPUSET=$DEF_CPUSET
-VM_USER=$DEF_USER
-VM_PASS=$DEF_PASS
+VM_USER=$vm_user
+VM_PASS=$vm_pass
 VM_HOSTNAME=$name
 NET_MODE=$net_mode
 FORWARDS=$forwards
@@ -1488,6 +1619,8 @@ ckvm $CKVM_VERSION - KVM guest manager (MT6833 / everpal)
                       user: QEMU NAT, reach it via forwarded ports
                       host: tap device, guest gets its own IP, runs its own
                             sshd; nothing is forwarded
+        --user U    login account: a name, or 'root'  (default ubuntu)
+        --pass P    password for that account      (default ubuntu)
         --fwd  L    ports to forward, e.g. 22,80,443 or 8022:22
                     default "$DEF_FORWARDS" (guest 22 is published on --port)
 
