@@ -251,8 +251,14 @@ ckvm edit web        # 直接改 vm.conf
 ckvm config web      # 看当前配置
 ```
 
-`CPUS` / `MEM` / `DISK` / `CPUSET` / `PORT` / `FORWARDS` 都可以改，改完
-`ckvm restart web` 生效（磁盘扩容会自动 `qemu-img resize`）。
+`CPUS` / `MEM` / `DISK` / `CPUSET` / `PORT` / `FORWARDS` / `CACHE_MODE` 都可以改，
+改完 `ckvm restart web` 生效（磁盘扩容会自动 `qemu-img resize`）。
+
+`ckvm edit` 默认用 **nano**（找不到才依次退到 micro / vim / vi）。想换：
+
+```bash
+EDITOR=vim ckvm edit web
+```
 
 ---
 
@@ -337,8 +343,40 @@ ckvm create web --fwd 22,80,443
     port 443 -> 127.0.0.1:443
 ```
 
-**规则**：guest 的 `22` 映射到该机的 `PORT`（多开不抢端口）；其他端口默认同号，
-也可写 `宿主机端口:guest端口`。启动前会检查端口占用。
+**交互式创建时是可视化选择**，不用记格式：
+
+```text
+  常用端口  （输入编号，可多选如 1,3,5；回车跳过）
+
+    1) SSH        22 -> 该机 PORT
+    2) HTTP       80
+    3) HTTPS      443
+    4) MySQL      3306
+    5) PostgreSQL 5432
+    6) Redis      6379
+    7) 常用 Web 栈 80,443,8080,3000
+    8) 开发常用   3000,5000,8000,8080
+
+  选择: 1,2
+
+  当前映射
+     1) 宿主机 <该机 PORT>  -> guest 22     22
+     2) 宿主机 80           -> guest 80     80
+
+  还要加自定义映射吗？ （如 8080:80，直接回车结束）
+  >
+```
+
+**命令行写法**（`--fwd`）：
+
+| 写法 | 含义 |
+|---|---|
+| `22` | guest 22 → **该机的 PORT**（多开不抢端口）|
+| `80` | 同号映射 |
+| `8080:80` | 宿主机 8080 → guest 80 |
+| `2222:22` | 额外再把 guest 22 暴露到 2222 |
+
+格式会在添加时校验：`0`、`99999`、非数字都会被拒绝并提示。
 
 ### host 模式（tap）
 
@@ -355,6 +393,31 @@ ckvm create srv --net host
 ```
 
 脚本自动建 tap、配 IP、开转发和 NAT，`stop` / `rm` 自动清理。
+
+
+### 磁盘缓存
+
+对上 PVE 的叫法，创建时可选：
+
+| 模式 | 含义 |
+|---|---|
+| **writeback**（默认）| 宿主页缓存 + 尊重 flush |
+| `none` | 绕过宿主缓存（`O_DIRECT`），最保险但最慢 |
+| `unsafe` | 同 writeback 但**忽略 flush** —— 最快，断电可能损坏 |
+| `writethrough` | 读走缓存，写直通 |
+
+```bash
+ckvm create web --cache unsafe
+ckvm edit web        # 改 CACHE_MODE=x
+ckvm restart web
+```
+
+> **先说清楚**：本机 QEMU 打开 `disk.qcow2` 时**本来就没有** `O_DIRECT`
+> （`/proc/<pid>/fdinfo` 的 flags 是 `02400002`），也就是**它一直在用宿主
+> 页缓存**。所以 `writeback` 是**现状**，不是新增的加速。
+>
+> 实测的磁盘数据：顺序写 776 MB/s、随机读 4K 38.6k IOPS、随机写 4K 9.3k IOPS。
+> 随机写偏弱，但那不是 apt 慢的原因（apt 慢在钩子，见下）。
 
 ### ⚠️ 局域网访问
 

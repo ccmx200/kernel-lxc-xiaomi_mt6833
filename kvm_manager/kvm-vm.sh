@@ -29,7 +29,9 @@
 # =============================================================================
 set -u
 
-CKVM_VERSION="1.12"
+CKVM_VERSION="1.13"
+# 1.13: port-mapping editor with presets, nano by default,
+#       selectable disk cache mode, more feedback.
 # 1.12: shared base-image cache (one download for many guests),
 #       `ckvm cache`, and a UX pass on progress/success output.
 # 1.11: the boot-pin workaround is no longer needed - the kernel
@@ -124,6 +126,7 @@ DEF_PORT_BASE=8023
 #                 network and runs its own sshd, no port forwards needed
 DEF_NET_MODE=user
 DEF_FORWARDS="22"            # guest ports to expose, comma separated
+DEF_CACHE_MODE="writeback"   # qemu disk cache mode (PVE naming)
 TAP_IP_HOST="172.28.100.1"   # container side of the tap (host mode)
 TAP_IP_GUEST="172.28.100.2"  # guest address (host mode)
 TAP_NETMASK="24"
@@ -596,6 +599,153 @@ apt_current_mirror() {
 }
 
 # -cn / --mirror: try the list, keep the fastest that answers.
+# ---------------------------------------------------------------------------
+# 端口映射：可视化编辑
+# ---------------------------------------------------------------------------
+#
+# 原来的交互只给一个逗号分隔的输入框，用户得记住 "8080:80" 这种写法。
+# 这里改成：常用预设一键选择，然后循环追加自定义映射，每次改动都回显当前
+# 完整列表，最后确认。
+
+# 把 "host:guest" / "guest" 列表渲染成人能读的表格
+render_forwards() {
+    local list="$1" item h g n=0
+    [ -n "$list" ] || { printf '    %s（无端口映射）%s\n' "$C_DIM" "$C_RST"; return 0; }
+    local IFS=','
+    for item in $list; do
+        case "$item" in
+            *:*) h="${item%%:*}"; g="${item#*:}" ;;
+            *)   g="$item";       h="$item" ;;
+        esac
+        [ "$g" = "22" ] && h="<该机 PORT>"
+        n=$((n+1))
+        printf '    %s%2d)%s 宿主机 %-14s -> guest %-6s %s\n' \
+               "$C_C" "$n" "$C_RST" "$h" "$g" "$C_DIM$item$C_RST"
+    done
+}
+
+# 磁盘缓存模式。术语沿用 PVE，方便对照。
+#
+# 实测前提：本机 qemu 打开 disk.qcow2 时【没有】O_DIRECT（fdinfo flags 02400002），
+# 也就是说它本来就在用宿主页缓存 —— 等价于 writeback。所以默认值就是现状，
+# 这里提供的是"可选"，不是"从无到有"。
+cache_mode_valid() {
+    case "$1" in
+        writeback|none|unsafe|writethrough) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+ask_cache_mode() {
+    local d="${1:-$DEF_CACHE_MODE}" c
+    printf '\n  %s磁盘缓存%s  %s（对照 PVE 的叫法）%s\n\n'            "$C_B" "$C_RST" "$C_DIM" "$C_RST"
+    printf '    %s1)%s writeback      %s宿主页缓存 + 尊重 flush。默认，也是现状%s\n'            "$C_C" "$C_RST" "$C_DIM" "$C_RST"
+    printf '    %s2)%s none            %s绕过宿主缓存（O_DIRECT），最保险但最慢%s\n'            "$C_C" "$C_RST" "$C_DIM" "$C_RST"
+    printf '    %s3)%s unsafe          %s同 writeback 但忽略 flush，最快、断电可能损坏%s\n'            "$C_C" "$C_RST" "$C_DIM" "$C_RST"
+    printf '    %s4)%s writethrough    %s读走缓存、写直通%s\n'            "$C_C" "$C_RST" "$C_DIM" "$C_RST"
+    printf '\n  选择 [1-4] (%s): ' "$d"
+    read -r c || { echo "$d"; return 0; }
+    case "$c" in
+        1|"") echo writeback ;;
+        2)    echo none ;;
+        3)    echo unsafe ;;
+        4)    echo writethrough ;;
+        *)    cache_mode_valid "$c" && echo "$c" || echo "$d" ;;
+    esac
+}
+
+
+# 校验一个映射项；成功则回显规范形式，失败返回非零
+normalize_forward() {
+    local item="$1" h g
+    case "$item" in
+        *:*) h="${item%%:*}"; g="${item#*:}" ;;
+        *)   g="$item";       h="$item" ;;
+    esac
+    [[ "$h" =~ ^[0-9]+$ ]] || return 1
+    [[ "$g" =~ ^[0-9]+$ ]] || return 1
+    [ "$h" -ge 1 ] && [ "$h" -le 65535 ] || return 1
+    [ "$g" -ge 1 ] && [ "$g" -le 65535 ] || return 1
+    if [ "$h" = "$g" ]; then echo "$g"; else echo "$h:$g"; fi
+}
+
+# 把一个映射加到列表里（去重）
+add_forward() {
+    local list="$1" item="$2" out="" have=0
+    local IFS=','
+    for x in $list; do
+        [ "$x" = "$item" ] && have=1
+        [ -n "$out" ] && out="$out,$x" || out="$x"
+    done
+    if [ "$have" = 0 ]; then
+        [ -n "$out" ] && out="$out,$item" || out="$item"
+    fi
+    echo "$out"
+}
+
+# 常用预设。返回要加入的列表。
+ask_forwards_presets() {
+    local out="22" c
+    printf '\n  %s常用端口%s  %s（输入编号，可多选如 1,3,5；回车跳过）%s\n\n' \
+           "$C_B" "$C_RST" "$C_DIM" "$C_RST"
+    printf '    %s1)%s SSH        %s22 -> 该机 PORT%s\n' "$C_C" "$C_RST" "$C_DIM" "$C_RST"
+    printf '    %s2)%s HTTP       %s80%s\n'             "$C_C" "$C_RST" "$C_DIM" "$C_RST"
+    printf '    %s3)%s HTTPS      %s443%s\n'            "$C_C" "$C_RST" "$C_DIM" "$C_RST"
+    printf '    %s4)%s MySQL      %s3306%s\n'           "$C_C" "$C_RST" "$C_DIM" "$C_RST"
+    printf '    %s5)%s PostgreSQL %s5432%s\n'           "$C_C" "$C_RST" "$C_DIM" "$C_RST"
+    printf '    %s6)%s Redis      %s6379%s\n'           "$C_C" "$C_RST" "$C_DIM" "$C_RST"
+    printf '    %s7)%s 常用 Web 栈 %s80,443,8080,3000%s\n' "$C_C" "$C_RST" "$C_DIM" "$C_RST"
+    printf '    %s8)%s 开发常用   %s3000,5000,8000,8080%s\n' "$C_C" "$C_RST" "$C_DIM" "$C_RST"
+    printf '\n'
+    printf '  选择: '
+    read -r c || return 0
+    [ -n "$c" ] || { echo "$out"; return 0; }
+
+    local IFS=','
+    for x in $c; do
+        case "$x" in
+            1) out=$(add_forward "$out" 22) ;;
+            2) out=$(add_forward "$out" 80) ;;
+            3) out=$(add_forward "$out" 443) ;;
+            4) out=$(add_forward "$out" 3306) ;;
+            5) out=$(add_forward "$out" 5432) ;;
+            6) out=$(add_forward "$out" 6379) ;;
+            7) out=$(add_forward "$out" 80); out=$(add_forward "$out" 443)
+               out=$(add_forward "$out" 8080); out=$(add_forward "$out" 3000) ;;
+            8) out=$(add_forward "$out" 3000); out=$(add_forward "$out" 5000)
+               out=$(add_forward "$out" 8000); out=$(add_forward "$out" 8080) ;;
+        esac
+    done
+    echo "$out"
+}
+
+# 主交互：预设 + 循环添加自定义
+ask_forwards() {
+    local rel="$1" list item norm c
+    list=$(ask_forwards_presets)
+
+    printf '\n  %s当前映射%s\n' "$C_B" "$C_RST"
+    render_forwards "$list"
+
+    while :; do
+        printf '\n  %s还要加自定义映射吗？%s %s（如 8080:80，直接回车结束）%s\n' \
+               "$C_DIM" "$C_RST" "$C_DIM" "$C_RST"
+        printf '  > '
+        read -r item || break
+        [ -n "$item" ] || break
+        if norm=$(normalize_forward "$item"); then
+            list=$(add_forward "$list" "$norm")
+            printf '  %s✓%s 已添加 %s\n' "$C_G" "$C_RST" "$norm"
+            printf '\n  %s当前映射%s\n' "$C_B" "$C_RST"
+            render_forwards "$list"
+        else
+            printf '  %s✗%s 格式不对。用 %s8080%s（同号）或 %s8080:80%s（宿主机:guest）\n' \
+                   "$C_R" "$C_RST" "$C_C" "$C_RST" "$C_C" "$C_RST"
+        fi
+    done
+    echo "$list"
+}
+
 ask_apt_mirror() {
     need_root
     local f base best="" bestt=""
@@ -1290,7 +1440,7 @@ cmd_create() {
     need_root
 
     local name="" cpus="" mem="" disk="" rel="" port=""
-    local net_mode="" forwards="" fwd_set=0
+    local net_mode="" forwards="" fwd_set=0 cache_mode=""
     local vm_user="" vm_pass=""
     local cores=""
     local interactive=0
@@ -1310,6 +1460,7 @@ cmd_create() {
             --port) port="$2"; shift 2 ;;
             --net)  net_mode="$2"; shift 2 ;;
             --fwd)  forwards="$2"; fwd_set=1; shift 2 ;;
+            --cache) cache_mode="$2"; shift 2 ;;
             --user) vm_user="$2"; shift 2 ;;
             --pass) vm_pass="$2"; shift 2 ;;
             -i|--interactive) interactive=1; shift ;;
@@ -1349,7 +1500,8 @@ cmd_create() {
         net_mode=$(ask_with_default "网络模式 user/host:" "$DEF_NET_MODE")
         if [ "$net_mode" = "user" ]; then
             explain_forwards
-            forwards=$(ask_with_default "映射端口:" "$DEF_FORWARDS")
+            forwards=$(ask_forwards "$rel")
+            cache_mode=$(ask_cache_mode)
             fwd_set=1
         fi
 
@@ -1383,6 +1535,8 @@ cmd_create() {
     [ -n "$mem" ]       || mem="$DEF_MEM"
     [ -n "$disk" ]      || disk="$DEF_DISK_GB"
     [ -n "$net_mode" ]  || net_mode="$DEF_NET_MODE"
+    [ -n "$cache_mode" ] || cache_mode="$DEF_CACHE_MODE"   # interactive may have set it above
+    cache_mode_valid "$cache_mode" || cache_mode="$DEF_CACHE_MODE"
     [ -n "$forwards" ]  || forwards="$DEF_FORWARDS"
     [ -n "$vm_user" ]   || vm_user="${DEF_USER:-ubuntu}"
     [ -n "$vm_pass" ]   || vm_pass="${DEF_PASS:-ubuntu}"
@@ -1433,17 +1587,19 @@ CPUS=$cpus
 MEM=$mem
 DISK_GB=$disk
 PORT=$port
-# Pin to one core type.  big.LITTLE: 6x A55 (0xd05) + 2x A76 (0xd0b) expose
-# different ID registers, and an unpinned QEMU gets EINVAL when it writes
-# them back.  Cores 6,7 are the A76 pair.
-# Core choice: all cores (default) or just the big ones.
+# Which physical cores this guest may use.  Anything goes (0-7, 6-7, 0-5,
+# 0-2,6-7 ...) - the kernel snapshots the ID registers per VM, so crossing
+# the A55/A76 boundary is no longer a problem.  See TECHNICAL.md ch.12.
 CPUSET=$cpuset
+# Legacy: only set this on a kernel without the snapshot fix.  Empty means
+# start straight across CPUSET, which is what you want here.
 BOOT_CPU=${BOOT_CPU:-$DEF_BOOT_CPU}
 VM_USER=$vm_user
 VM_PASS=$vm_pass
 VM_HOSTNAME=$name
 NET_MODE=$net_mode
 FORWARDS=$forwards
+CACHE_MODE=$cache_mode
 EOF
 
     cp -f "$CKVM_FWDIR/edk2_qemu_aarch64_nonvram.fd" "$d/uefi-code.fd"
@@ -1453,6 +1609,7 @@ EOF
     printf '\n'
     say "已创建 '$name'  (Ubuntu $rel, $port 端口, ${cpus} vCPU, ${mem} MiB, ${disk}G)"
     say "network: $net_mode${forwards:+ (forwards: $forwards)}"
+    say "disk cache: $cache_mode"
     say "download backend: $(download_pick_backend)"
 
     if [ -s "$d/disk.qcow2" ] && qemu-img info "$d/disk.qcow2" >/dev/null 2>&1; then
@@ -1577,7 +1734,7 @@ cmd_start() {
         -M virt,gic-version=3 -cpu max -accel kvm -smp "$CPUS" -m "$MEM"
         -drive if=pflash,format=raw,unit=0,file="$d/uefi-code.fd",readonly=on
         -drive if=pflash,format=raw,unit=1,file="$d/uefi-vars.fd"
-        -drive if=virtio,format=qcow2,file="$d/disk.qcow2"
+        -drive if=virtio,format=qcow2,cache=${CACHE_MODE:-$DEF_CACHE_MODE},file="$d/disk.qcow2"
         -drive if=virtio,format=raw,readonly=on,file="$d/seed.img"
         "${net_args[@]}"
         -device virtio-rng-pci
@@ -1985,7 +2142,20 @@ cmd_config() {
     cat "$(vm_conf "$1")"
 }
 
-cmd_edit() { load_vm "$1"; ${EDITOR:-vi} "$(vm_conf "$1")"; }
+cmd_edit() {
+    need_root
+    load_vm "$1"
+    local ed="${EDITOR:-}"
+    if [ -z "$ed" ]; then
+        for c in nano micro vim vi; do
+            command -v "$c" >/dev/null 2>&1 && { ed="$c"; break; }
+        done
+    fi
+    [ -n "$ed" ] || die "找不到编辑器；请设置 EDITOR=<你的编辑器>"
+    say "用 $ed 编辑 $(vm_conf "$1")"
+    "$ed" "$(vm_conf "$1")"
+    say "已保存。改动要用 'ckvm restart $1' 生效"
+}
 
 # --------------------------------------------------------------------------
 # network report
@@ -2408,7 +2578,7 @@ EOF
         -smp 2 -m 1024 \
         -drive if=pflash,format=raw,unit=0,file="$d/uefi-code.fd",readonly=on \
         -drive if=pflash,format=raw,unit=1,file="$d/uefi-vars.fd" \
-        -drive if=virtio,format=qcow2,file="$d/disk.qcow2" \
+        -drive if=virtio,format=qcow2,cache=${CACHE_MODE:-$DEF_CACHE_MODE},file="$d/disk.qcow2" \
         -drive if=virtio,format=raw,readonly=on,file="$d/seed.img" \
         -netdev user,id=n0 -device virtio-net-pci,netdev=n0 \
         -device virtio-rng-pci -display none \
@@ -2520,6 +2690,12 @@ ckvm $CKVM_VERSION - KVM guest manager (MT6833 / evergo)
         --user U    login account: a name, or 'root'  (default ubuntu)
         --pass P    password for that account      (default ubuntu)
         --fwd  L    ports to forward, e.g. 22,80,443 or 8022:22
+        --cache M   disk cache mode (PVE naming):
+                      writeback     host page cache - the default, and what
+                                    qemu already does unless told otherwise
+                      none          O_DIRECT, bypass the host cache
+                      unsafe        ignore flushes; fastest, can lose data
+                      writethrough  cache reads, writes go straight through
                     default "$DEF_FORWARDS" (guest 22 is published on --port)
 
   ckvm image <name>                (re)download the guest image
