@@ -29,7 +29,9 @@
 # =============================================================================
 set -u
 
-CKVM_VERSION="1.5"
+CKVM_VERSION="1.6"
+# 1.6: dependencies are checked (and installed) up front, and
+#      'CC_LEN: unbound variable' no longer aborts the interactive create.
 # 1.5: host/tap mode waits for the SSH banner, not just the serial login
 #      prompt.  sshd accepts connections a few seconds before it can
 #      authenticate, so an immediate ssh got 'Permission denied'.
@@ -387,6 +389,60 @@ install_firmware() {
         [ -f "$v" ] && { cp -f "$v" "$CKVM_FWDIR/edk2_vars.fd"; break; }
     done
     say "firmware installed into $CKVM_FWDIR"
+}
+
+
+# Tools ckvm shells out to.  qemu-img and cloud-localds are easy to miss on a
+# minimal container and were previously only discovered mid-create, after the
+# image had already been downloaded.
+# Required: ckvm cannot work without these.
+CKVM_DEPS="qemu-system-aarch64 qemu-img cloud-localds"
+CKVM_APT_DEPS="qemu-system-arm qemu-utils cloud-image-utils"
+# Nice to have; things degrade gracefully without them, so they are only
+# reported, never fatal.
+CKVM_SOFT_DEPS="aria2c openssl python3 numfmt"
+
+# The package names differ between distros; resolve what apt actually has.
+ckvm_apt_packages() {
+    local out="" p
+    for p in $CKVM_APT_DEPS; do
+        out="$out $p"
+    done
+    echo "${out# }"
+}
+
+deps_missing() {
+    local d out=""
+    for d in $CKVM_DEPS; do
+        command -v "$d" >/dev/null 2>&1 || out="$out $d"
+    done
+    echo "${out# }"
+}
+
+ensure_deps() {
+    local missing; missing=$(deps_missing)
+    [ -n "$missing" ] || return 0
+    if command -v apt-get >/dev/null 2>&1; then
+        say "安装缺少的依赖: $missing"
+        DEBIAN_FRONTEND=noninteractive apt-get update -qq >/dev/null 2>&1 || true
+        # shellcheck disable=SC2086
+        DEBIAN_FRONTEND=noninteractive apt-get install -y -qq $CKVM_APT_DEPS \
+            >/dev/null 2>&1 || true
+    fi
+    missing=$(deps_missing)
+    if [ -n "$missing" ]; then
+        printf '  ERROR: 缺少必需依赖: %s\n' "$missing" >&2
+        printf '         装一下: apt-get install -y %s\n' "$(ckvm_apt_packages)" >&2
+        printf '         或者先跑: ckvm selftest  看看环境缺什么\n' >&2
+        return 1
+    fi
+    # soft deps: mention once, do not block
+    local soft="" d
+    for d in $CKVM_SOFT_DEPS; do
+        command -v "$d" >/dev/null 2>&1 || soft="$soft $d"
+    done
+    [ -n "$soft" ] && warn "缺少可选工具:${soft}（功能会降级，不影响创建）"
+    return 0
 }
 
 check_firmware() {
@@ -1014,7 +1070,10 @@ cmd_create() {
     [ "$net_mode" = "host" ] && [ "$fwd_set" = 0 ] && forwards=""
 
     # verify the image is really fetchable before creating anything
-    local code lts size human
+    # $size comes from the catalogue.  Do NOT use CC_LEN here: check_release
+    # sets it, but it runs under `spin` in a subshell so the value never
+    # comes back - reading it tripped `set -u` and aborted the create.
+    local code lts size
     code=$(catalogue_field "$rel" 2)
     lts=$(catalogue_field "$rel" 3)
     size=$(catalogue_field "$rel" 4)
@@ -1022,9 +1081,9 @@ cmd_create() {
         warn "目录里没有 $rel 的镜像，可用的源都试过了"
         return 1
     fi
-    human=$(numfmt --to=iec "$CC_LEN" 2>/dev/null || echo "$CC_LEN")
-    say "  可用：Ubuntu $rel ($code${lts:+, $lts})  $human"
+    say "  可用：Ubuntu $rel ($code${lts:+, $lts})${size:+  $size}"
 
+    ensure_deps || return 1
     check_firmware || return 1
     mkdir -p "$(vm_dir "$name")"
     local d; d=$(vm_dir "$name")
@@ -1061,9 +1120,10 @@ EOF
 
     if [ -s "$d/disk.qcow2" ] && qemu-img info "$d/disk.qcow2" >/dev/null 2>&1; then
         say "磁盘已存在，跳过下载"
-        spin "扩容到 ${disk}G" qemu-img resize "$d/disk.qcow2" "${disk}G"
+        spin "扩容到 ${disk}G" qemu-img resize "$d/disk.qcow2" "${disk}G" \
+            || { warn "扩容失败"; return 1; }
     else
-        fetch_image "$name" || warn "镜像下载失败；稍后可跑 'ckvm image $name'"
+        fetch_image "$name" || { warn "镜像下载失败；稍后可跑 'ckvm image $name'"; return 1; }
     fi
     make_seed "$name"
     say "物理核心: $(cores_to_label "$cpuset")"
@@ -1797,6 +1857,10 @@ cmd_install() {
         fi
     fi
     say "installed: $CKVM_BINDIR/ckvm"
+
+    # Dependencies, checked here so the first create does not fail half way.
+    # shellcheck disable=SC1090
+    ensure_deps || warn "有必需依赖没装上，创建虚拟机前请先补上"
 
     # firmware: whatever is already on the device wins; otherwise fetch it
     local src="" cand
