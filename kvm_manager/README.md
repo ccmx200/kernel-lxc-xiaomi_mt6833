@@ -471,6 +471,60 @@ guest 起来后   所有线程放开到 CPUSET
 
 这样 `0-7` 实测 **5/5 成功**。
 
+## 换 apt 源（容器自己）
+
+容器的 apt 源默认是 Debian/Ubuntu 官方源，在国内很慢。一条命令换掉：
+
+```sh
+ckvm mirror              # 逐个测速，选最快的
+ckvm mirror --restore    # 换回原来的
+```
+
+输出：
+
+```text
+  当前源:    http://deb.debian.org
+  发行版:    debian / trixie
+
+  测速中（下载一个几 MB 的索引，算真实吞吐）...
+    源                                         吞吐     耗时
+  https://mirror.nju.edu.cn                    6.94 MB/s  1.74s
+  https://mirrors.tuna.tsinghua.edu.cn        11.21 MB/s  1.08s
+  https://mirrors.aliyun.com                   5.23 MB/s  2.31s
+
+  已切换到: https://mirrors.tuna.tsinghua.edu.cn  (11.21 MB/s)
+  备份:     /etc/apt/sources.list.d/debian.sources.ckvm.bak
+```
+
+原文件备份为 `<源文件>.ckvm.bak`，`--restore` 原样还原。
+同时支持 Debian 13 的 deb822 格式（`debian.sources`）和老的
+`/etc/apt/sources.list` 一行格式。
+
+### 为什么不是按延迟选
+
+**延迟低不等于下载快。** 第一版用 `curl -w time_total` 测一个 130KB 的
+`Release` 文件，那个数字基本只反映 TCP 往返，不反映带宽。实测结果：
+
+| 镜像 | 延迟（旧方法） | 真实吞吐 |
+|---|---|---|
+| aliyun | **0.271s（最快）** | 5.23 MB/s（**最慢**） |
+| tuna | 0.379s | **11.21 MB/s（最快）** |
+| nju | 0.550s | 6.94 MB/s |
+
+旧方法**选中了最慢的那个**。现在改成下载 13MB 的 `Packages.gz` 算 MB/s，
+并且核对 HTTP 状态码 —— 否则一个返回 403 的镜像也会被当成可用。
+
+### 装依赖时会自动换
+
+`ensure_deps` 在装 `qemu-system-arm` / `qemu-utils` / `cloud-image-utils`
+之前，如果发现源还是官方源，会自动先换到列表里第一个可用镜像。
+想跳过：`CKVM_NO_APT_MIRROR=1`。
+
+> 顺带修了个包名 bug：以前写的是二进制名 `aria2c`，那不是包名（应为
+> `aria2`），也没先跑 `apt-get update`，所以装依赖必然失败。
+
+---
+
 ## 镜像源
 
 默认：

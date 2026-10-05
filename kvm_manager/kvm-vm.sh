@@ -29,7 +29,13 @@
 # =============================================================================
 set -u
 
-CKVM_VERSION="1.6"
+CKVM_VERSION="1.8"
+# 1.8: the mirror picker measures throughput on a 13MB Packages.gz, not
+#      latency on a 130KB Release file.  The latency version picked
+#      aliyun (lowest ping, slowest mirror) over tuna.
+# 1.7: 'ckvm mirror' switches the container's apt sources to the fastest
+#      candidate (each timed first), and ensure_deps does it automatically
+#      before installing.  Also fixes the apt package names.
 # 1.6: dependencies are checked (and installed) up front, and
 #      'CC_LEN: unbound variable' no longer aborts the interactive create.
 # 1.5: host/tap mode waits for the SSH banner, not just the serial login
@@ -49,7 +55,7 @@ CKVM_HOME="github.com/ccmx200"
 # changes meaning.  install() refuses a file that lacks it, so a
 # caching mirror serving an old revision is caught instead of
 # quietly downgrading the installed ckvm.
-CKVM_BUILD="store+ports+aria2+console+bootpin+cores+selftest"
+CKVM_BUILD="store+ports+aria2+console+bootpin+cores+selftest+deps+aptmirror+throughput"
 CKVM_ROOT="${CKVM_ROOT:-/var/lib/ckvm}"
 CKVM_FWDIR="${CKVM_FWDIR:-/usr/local/share/ckvm/firmware}"
 CKVM_BINDIR="${CKVM_BINDIR:-/usr/local/bin}"
@@ -59,6 +65,18 @@ QEMU="${QEMU:-/usr/bin/qemu-system-aarch64}"
 # ---- mirrors: NJU for images, USTC for apt; official as the last resort ----
 MIRROR_IMAGE_LIST="${MIRROR_IMAGE_LIST:-https://mirror.nju.edu.cn/ubuntu-cloud-images https://cloud-images.ubuntu.com}"
 MIRROR_APT="${MIRROR_APT:-https://mirrors.ustc.edu.cn/ubuntu-ports}"
+
+# APT mirrors for the CONTAINER itself (distinct from MIRROR_APT, which goes
+# into the guest's cloud-init).  Ordered; the first that answers wins.
+# Measured on this device, fetching dists/trixie/Release:
+#   deb.debian.org 2.35s   mirror.nju.edu.cn 0.53s   tuna 0.60s
+APT_MIRROR_LIST="${APT_MIRROR_LIST:-
+https://mirror.nju.edu.cn
+https://mirrors.tuna.tsinghua.edu.cn
+https://mirrors.aliyun.com
+}"
+# The package names, not the binary names - `aria2c` is not a package.
+CKVM_APT_DEPS="qemu-system-arm qemu-utils cloud-image-utils"
 
 # ---- defaults for a new guest ---------------------------------------------
 DEF_CPUS=8
@@ -419,11 +437,181 @@ deps_missing() {
     echo "${out# }"
 }
 
+
+# ---------------------------------------------------------------------------
+# apt mirror
+# ---------------------------------------------------------------------------
+
+apt_sources_file() {
+    if [ -f /etc/apt/sources.list.d/debian.sources ]; then
+        echo /etc/apt/sources.list.d/debian.sources; return 0
+    fi
+    if [ -f /etc/apt/sources.list.d/ubuntu.sources ]; then
+        echo /etc/apt/sources.list.d/ubuntu.sources; return 0
+    fi
+    [ -f /etc/apt/sources.list ] && { echo /etc/apt/sources.list; return 0; }
+    return 1
+}
+
+# Download the Release file from a mirror and time it.  Prints "<seconds>"
+# on success; fails otherwise.
+# Measure a mirror by downloading a real index and reporting MB/s.
+#
+# The first version used time_total on the 130KB Release file and so ranked
+# mirrors by latency: aliyun won at 0.27s on a link that was slower than the
+# alternatives.  Fetch something sizeable and divide.
+#
+# $1 = base url.  Echoes "<MB/s> <seconds>".  Fails if the mirror does not
+# actually serve this suite.
+apt_mirror_speed() {
+    local base="$1" suite url
+    suite=$(apt_suite)
+    [ -n "$suite" ] || return 1
+    command -v curl >/dev/null 2>&1 || return 1
+
+    # Sample something apt actually fetches and that is big enough for the
+    # number to mean bandwidth rather than round-trip time.  Packages.gz in
+    # main/binary-<arch> is ~13 MB here.  (Contents-arm64.gz sounded better
+    # but is 146 bytes on these mirrors, so it measured nothing - the same
+    # mistake as timing the 130KB Release file.)
+    local arch; arch=$(dpkg --print-architecture 2>/dev/null || echo arm64)
+    for cand in \
+        "dists/$suite/main/binary-$arch/Packages.gz" \
+        "dists/$suite/main/binary-all/Packages.gz" \
+        "dists/$suite/main/dep11/Components-$arch.yml.gz"
+    do
+        url="$base/debian/$cand"
+        local out
+        out=$(curl -sL -m 30 -o /dev/null \
+                  -w '%{http_code} %{size_download} %{time_total}' "$url" 2>/dev/null) || continue
+        set -- $out
+        [ "${1:-0}" = 200 ] || continue
+        local bytes="${2:-0}" secs="${3:-0}"
+        # below ~1 MB the measurement is noise, not bandwidth
+        [ "$bytes" -gt 1000000 ] 2>/dev/null || continue
+        awk -v b="$bytes" -v t="$secs" \
+            'BEGIN{ if (t > 0) printf "%.2f %.2f\n", (b/1048576)/t, t; else exit 1 }' \
+            || continue
+        return 0
+    done
+    return 1
+}
+
+apt_suite() {
+    local c
+    c=$(sed -n 's/^VERSION_CODENAME=//p' /etc/os-release 2>/dev/null | tr -d '"')
+    [ -n "$c" ] && { echo "$c"; return 0; }
+    # fall back to what the sources already say
+    local f; f=$(apt_sources_file) || return 1
+    sed -n 's/^Suites:[[:space:]]*\([^ ]*\).*/\1/p' "$f" 2>/dev/null | head -1
+}
+
+# Rewrite every URIs: line to point at $1, keeping the rest of each stanza
+# (Suites, Components, Signed-By) untouched.
+apt_apply_mirror() {
+    local base="$1" f
+    f=$(apt_sources_file) || return 1
+    [ -f "$f.ckvm.bak" ] || cp -f "$f" "$f.ckvm.bak" 2>/dev/null
+
+    # One awk pass, because two seds do not work: the first would rewrite
+    # every URIs line to /debian and destroy the "security" token the second
+    # was matching on, leaving "Suites: trixie-security" pointed at /debian.
+    #
+    # Handles both layouts:
+    #   deb822    URIs: http://deb.debian.org/debian-security
+    #   one-line  deb http://deb.debian.org/debian trixie main
+    awk -v base="$base" '
+        /^URIs:/ {
+            if ($0 ~ /security/) print "URIs: " base "/debian-security";
+            else                 print "URIs: " base "/debian";
+            next
+        }
+        /^deb[[:space:]]/ {
+            out = ""
+            for (i = 1; i <= NF; i++) {
+                if ($i ~ /^https?:\/\//) {
+                    if ($i ~ /security/) out = out " " base "/debian-security";
+                    else                 out = out " " base "/debian";
+                } else {
+                    out = out " " $i;
+                }
+            }
+            sub(/^ /, "", out);
+            print out;
+            next
+        }
+        { print }
+    ' "$f" > "$f.ckvm.new" && mv -f "$f.ckvm.new" "$f"
+    return 0
+}
+
+# What the sources point at now.
+apt_current_mirror() {
+    local f; f=$(apt_sources_file) || return 0
+    sed -n 's#^URIs:[[:space:]]*\(https\?://[^/]*\).*#\1#p' "$f" 2>/dev/null | head -1
+}
+
+# -cn / --mirror: try the list, keep the fastest that answers.
+ask_apt_mirror() {
+    need_root
+    local f base best="" bestt=""
+    f=$(apt_sources_file) || die "找不到 apt 源文件"
+    local suite; suite=$(apt_suite)
+    say "apt 源文件: $f"
+    say "当前源:    $(apt_current_mirror)"
+    say "发行版:    $(sed -n 's/^ID=//p' /etc/os-release) / ${suite:-unknown}"
+    echo
+    say "测速中（下载一个几 MB 的索引，算真实吞吐）..."
+    say "  源                                         吞吐     耗时"
+    for base in $APT_MIRROR_LIST; do
+        local res t s_
+        if res=$(apt_mirror_speed "$base"); then
+            t=$(echo "$res" | awk '{print $1}')
+            s_=$(echo "$res" | awk '{print $2}')
+            printf '  %-42s %6s MB/s  %ss\n' "$base" "$t" "$s_"
+            if [ -z "$bestt" ] || awk -v a="$t" -v b="$bestt" 'BEGIN{exit !(a>b)}'; then
+                best="$base"; bestt="$t"
+            fi
+        else
+            printf '  %-42s %s\n' "$base" "不可用（没有该发行版的索引）"
+        fi
+    done
+    echo
+    [ -n "$best" ] || die "没有可用的镜像"
+    apt_apply_mirror "$best" || die "写入失败"
+    say "已切换到: $best  (${bestt} MB/s)"
+    say "备份:     $f.ckvm.bak"
+    echo
+    spin "apt update" apt-get update -qq || warn "apt update 失败"
+    say "完成。恢复原源: ckvm mirror --restore"
+}
+
+ask_apt_mirror_restore() {
+    need_root
+    local f; f=$(apt_sources_file) || die "找不到 apt 源文件"
+    [ -f "$f.ckvm.bak" ] || die "没有备份可恢复 ($f.ckvm.bak)"
+    mv -f "$f.ckvm.bak" "$f"
+    say "已恢复: $f"
+    spin "apt update" apt-get update -qq || warn "apt update 失败"
+}
+
 ensure_deps() {
     local missing; missing=$(deps_missing)
     [ -n "$missing" ] || return 0
     if command -v apt-get >/dev/null 2>&1; then
         say "安装缺少的依赖: $missing"
+        # Switch to a nearby mirror first: the stock deb.debian.org took 2.35s
+        # per index file here versus 0.53s for mirror.nju.edu.cn.
+        if [ "${CKVM_NO_APT_MIRROR:-0}" != 1 ]; then
+            local cur t
+            cur=$(apt_current_mirror)
+            case "$cur" in
+                *deb.debian.org*|*archive.ubuntu.com*|*security.ubuntu.com*|"")
+                    t=$(apt_mirror_speed "$(echo "$APT_MIRROR_LIST" | head -1)" 2>/dev/null) \
+                        && { apt_apply_mirror "$(echo "$APT_MIRROR_LIST" | head -1)"; \
+                             say "已换用更快的 apt 源（原源: ${cur:-未知}）"; } ;;
+            esac
+        fi
         DEBIAN_FRONTEND=noninteractive apt-get update -qq >/dev/null 2>&1 || true
         # shellcheck disable=SC2086
         DEBIAN_FRONTEND=noninteractive apt-get install -y -qq $CKVM_APT_DEPS \
@@ -1960,6 +2148,15 @@ cmd_selftest() {
     trap 'st_cleanup' EXIT INT TERM
     printf '\n  %sckvm selftest%s\n\n' "$C_B" "$C_RST"
 
+    # Try to fix the dependencies before complaining about them: the whole
+    # point of the selftest is to get a working install, not just a verdict.
+    local _missing; _missing=$(deps_missing)
+    if [ -n "$_missing" ]; then
+        say "缺少依赖: $_missing"
+        ensure_deps || true
+        echo
+    fi
+
     # ---------------------------------------------------------- environment
     st_step "root"
     if [ "$(id -u)" = 0 ]; then st_ok; else st_no "not root"; fi
@@ -2238,6 +2435,11 @@ case "${1:-help}" in
     edit)      shift; cmd_edit "$@" ;;
     net)       shift; cmd_net "$@" ;;
     selftest)  shift; cmd_selftest "$@" ;;
+    mirror)    shift
+               case "${1:-}" in
+                   --restore|-r) ask_apt_mirror_restore ;;
+                   *)            ask_apt_mirror ;;
+               esac ;;
     help|-h|--help) cmd_help ;;
     *)         cmd_help; exit 1 ;;
 esac
