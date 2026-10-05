@@ -246,6 +246,7 @@ ckvm console <name>          # 实时看串口
 ckvm stop|restart <name>
 ckvm rm <name> [-f]          # 删除
 ckvm config [name]           # 看配置
+ckvm cache                   # 镜像缓存（多开只下载一次）
 ckvm edit <name>             # 改配置
 ```
 
@@ -281,17 +282,18 @@ CPUS=8            # vCPU 数
 MEM=2048          # 内存 MiB
 DISK_GB=50
 PORT=8023
-CPUSET=6-7        # 绑定的物理核，别乱改（见下）
+CPUSET=0-7        # 可用的物理核，随便配
 VM_USER=u0
 VM_PASS=1
 ```
 
 ### 四个坑（都已在脚本里处理）
 
-1. **必须绑核**。这台机器是 big.LITTLE（6 个 A55 + 2 个 A76），KVM 在不同
-   核上暴露的 ID 寄存器不同。不绑核 QEMU 会随机报
-   `Failed to put registers after init`。脚本固定 `taskset -c 6-7`。
-   **绑核后 8 核也能用。**
+1. ~~必须绑核~~ **已修复，不再需要**。这台机器是 big.LITTLE（6 个 A55 +
+   2 个 A76），KVM 在不同核上暴露的 ID 寄存器不同，早期会随机报
+   `Failed to put registers after init`。内核现在按 VM 快照这些寄存器，
+   跨簇不再失败，CPU 掩码可以随便配。详见
+   [`kvm_manager/TECHNICAL.md`](kvm_manager/TECHNICAL.md) 第 12 章。
 2. **固件必须是不写 NVRAM 的那份**。普通 EDK2 一写变量存储就会让虚拟机
    卡死，这是 ARM 架构限制（写 MMIO 的指令不置 `ISV` 位，KVM 无法解码）。
 3. **NVRAM 每次要刷新**。脚本每次 `start` 都从模板拷一份干净的，

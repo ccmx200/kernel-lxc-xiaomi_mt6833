@@ -29,7 +29,9 @@
 # =============================================================================
 set -u
 
-CKVM_VERSION="1.11"
+CKVM_VERSION="1.12"
+# 1.12: shared base-image cache (one download for many guests),
+#       `ckvm cache`, and a UX pass on progress/success output.
 # 1.11: the boot-pin workaround is no longer needed - the kernel
 #       now snapshots both the invariant sysregs and the demuxed
 #       CCSIDR registers per VM, verified on hardware.
@@ -163,6 +165,40 @@ fi
 
 # a spinner + progress bar, animated on a terminal and silent when piped
 UI_ACTIVE=0
+# A tick that stays on screen briefly.  Actions like "guest removed" otherwise
+# print one dim line and look like nothing happened.
+ok_flash() {
+    [ "$IS_TTY" = 1 ] || { say "$1"; return 0; }
+    printf '  %s✓%s %s%s%s\n' "$C_G" "$C_RST" "$C_B" "$1" "$C_RST"
+}
+
+# Copy a file with a byte progress bar.  Falls back to a plain cp when not on
+# a terminal or when the file is too small for the bar to be worth showing.
+#   copy_with_progress <src> <dst> <label>
+copy_with_progress() {
+    local src="$1" dst="$2" label="$3" total cur pct i=0
+    total=$(stat -c%s "$src" 2>/dev/null || echo 0)
+
+    if [ "$IS_TTY" != 1 ] || [ "$total" -lt $((64 * 1024 * 1024)) ]; then
+        cp --reflink=auto "$src" "$dst" 2>/dev/null || cp -f "$src" "$dst"
+        return $?
+    fi
+
+    ( cp --reflink=auto "$src" "$dst" 2>/dev/null || cp -f "$src" "$dst" ) &
+    local pid=$!
+    while kill -0 "$pid" 2>/dev/null; do
+        cur=$(stat -c%s "$dst" 2>/dev/null || echo 0)
+        [ "$cur" -gt "$total" ] && cur="$total"
+        pct=$(( cur * 100 / total ))
+        ui_tick $((i++)) "$pct" "$label" \
+                "  $(numfmt --to=iec "$cur")/$(numfmt --to=iec "$total")"
+        sleep 0.3
+    done
+    wait "$pid"; local rc=$?
+    ui_stop
+    return $rc
+}
+
 # Run a slow command behind a spinner so it does not look hung.  The command's
 # output goes to a temp file; on failure the tail of that file is printed.
 #   spin <label> <command...>
@@ -1115,19 +1151,68 @@ EOF
     fi
 }
 
-fetch_image() {
-    local name="$1" d img url ok=0 fmt
-    d=$(vm_dir "$name"); img="$d/disk.qcow2"
-    load_vm "$name"
+# Shared download cache.
+#
+# The base image is the expensive part (600-700MB); the per-guest disk is
+# derived from it.  Keeping the download under .cache means the second, third
+# and tenth guest reuse it instead of pulling it again.
+ckvm_cache_dir()  { echo "$CKVM_ROOT/.cache"; }
+cache_base_path() { echo "$(ckvm_cache_dir)/ubuntu-${1}-arm64.img"; }
+
+# Echo the readiness file that records a completed download.
+cache_mark_path() { echo "$(ckvm_cache_dir)/ubuntu-${1}-arm64.ok"; }
+
+# Print the cache entry's size in bytes, or nothing.
+cache_size() {
+    local f; f=$(cache_base_path "$1")
+    [ -f "$f" ] && stat -c%s "$f" 2>/dev/null
+    return 0
+}
+
+# Fetch the base image into the cache once.  Resumable: aria2c continues a
+# partial file, and download_url already re-fetches when the size does not
+# match Content-Length.
+ensure_cached_base() {
+    local rel="$1" base mark url ok=0
+    base=$(cache_base_path "$rel"); mark=$(cache_mark_path "$rel")
+    mkdir -p "$(ckvm_cache_dir)"
+
+    if [ -s "$base" ] && [ -f "$mark" ]; then
+        ok_flash "使用缓存 Ubuntu $rel（$(numfmt --to=iec "$(cache_size "$rel")" 2>/dev/null || echo cached)，跳过下载）"
+        return 0
+    fi
+
     ensure_aria2 >/dev/null 2>&1 || true
-    for url in $(image_urls "$UBUNTU_REL"); do
+    for url in $(image_urls "$rel"); do
         say "source: $url"
-        if download_url "$url" "$d/base.img" "Ubuntu $UBUNTU_REL arm64"; then
+        if download_url "$url" "$base" "Ubuntu $rel arm64"; then
             ok=1; break
         fi
         say "  mirror failed, trying the next one"
     done
     [ "$ok" = 1 ] || return 1
+
+    # record the completed size so a later run can spot truncation
+    printf '%s\n%s\n' "$(cache_size "$rel")" "$(date -Is)" > "$mark"
+    say "cached: $(numfmt --to=iec "$(cache_size "$rel")" 2>/dev/null || echo ok)"
+    return 0
+}
+
+fetch_image() {
+    local name="$1" d img fmt base
+    d=$(vm_dir "$name"); img="$d/disk.qcow2"
+    load_vm "$name"
+
+    # 1. get the base image into the shared cache
+    ensure_cached_base "$UBUNTU_REL" || return 1
+    base=$(cache_base_path "$UBUNTU_REL")
+
+    # 2. give this guest its own copy.  --reflink=auto is free on filesystems
+    #    that support it and a normal copy elsewhere.
+    copy_with_progress "$base" "$d/base.img" "复制基础镜像到 $name" \
+        || die "复制基础镜像失败"
+
+    # 3. convert only if the cached format is not already qcow2
     fmt=$(qemu-img info --output=json "$d/base.img" | \
           python3 -c "import sys,json;print(json.load(sys.stdin)['format'])" 2>/dev/null || echo raw)
     if [ "$fmt" = "qcow2" ]; then
@@ -1138,8 +1223,64 @@ fetch_image() {
         rm -f "$d/base.img"
     fi
     spin "扩容到 ${DISK_GB}G" qemu-img resize "$img" "${DISK_GB}G"
-    say "image ready"
+    ok_flash "镜像就绪"
     return 0
+}
+
+# ckvm cache [--clear [REL]|--path]
+#
+# The base images live in $CKVM_ROOT/.cache and are shared by every guest, so
+# creating the second and later guests does not download 600-700MB again.
+cmd_cache() {
+    local dir total=0 f n sz rel
+    dir="$(ckvm_cache_dir)"
+
+    case "${1:-}" in
+        --path) echo "$dir"; return 0 ;;
+        --clear)
+            need_root
+            if [ -n "${2:-}" ]; then
+                f="$(cache_base_path "$2")"
+                if [ -f "$f" ]; then
+                    rm -f "$f" "$(cache_mark_path "$2")"
+                    say "已删除缓存: Ubuntu $2"
+                else
+                    die "缓存里没有 Ubuntu $2"
+                fi
+            else
+                [ -d "$dir" ] && rm -rf "$dir"
+                say "已清空镜像缓存"
+            fi
+            return 0 ;;
+    esac
+
+    printf '\n  %s%s镜像缓存%s  %s%s%s\n\n' "$C_B" "$C_C" "$C_RST" "$C_DIM" "$dir" "$C_RST"
+
+    if [ ! -d "$dir" ] || [ -z "$(ls -A "$dir" 2>/dev/null)" ]; then
+        printf '  %s（空）— 下一次 ckvm create 会在这里缓存基础镜像%s\n\n' "$C_DIM" "$C_RST"
+        printf '  %s多个客户机共用同一份缓存，只有第一次需要下载。%s\n\n' "$C_DIM" "$C_RST"
+        return 0
+    fi
+
+    printf '  %-10s %10s  %s\n' "版本" "大小" "完成"
+    printf '  %s\n' "────────────────────────────────"
+    for f in "$dir"/ubuntu-*-arm64.img; do
+        [ -e "$f" ] || continue
+        n=$(basename "$f"); rel=${n#ubuntu-}; rel=${rel%-arm64.img}
+        sz=$(stat -c%s "$f" 2>/dev/null || echo 0)
+        total=$(( total + sz ))
+        if [ -f "$(cache_mark_path "$rel")" ]; then
+            printf '  %-10s %10s  %s✓%s\n' "$rel" \
+                   "$(numfmt --to=iec "$sz" 2>/dev/null || echo "$sz")" "$C_G" "$C_RST"
+        else
+            printf '  %-10s %10s  %s未完成（下次续传）%s\n' "$rel" \
+                   "$(numfmt --to=iec "$sz" 2>/dev/null || echo "$sz")" "$C_Y" "$C_RST"
+        fi
+    done
+    printf '  %s\n' "────────────────────────────────"
+    printf '  %-10s %10s\n\n' "合计" "$(numfmt --to=iec "$total" 2>/dev/null || echo "$total")"
+    printf '  %sckvm cache --clear [版本]   删除缓存%s\n' "$C_DIM" "$C_RST"
+    printf '  %sckvm cache --path           显示缓存目录%s\n\n' "$C_DIM" "$C_RST"
 }
 
 # ckvm create [name] [options]
@@ -1783,7 +1924,7 @@ cmd_rm() {
     rm -f "$SYSTEMD_DIR/ckvm@$name.service"
     rm -rf "$(vm_dir "$name")"
     systemctl daemon-reload >/dev/null 2>&1 || true
-    say "guest '$name' removed"
+    ok_flash "guest '$name' 已删除"
 }
 
 # --------------------------------------------------------------------------
@@ -2443,6 +2584,7 @@ case "${1:-help}" in
     uninstall) cmd_uninstall ;;
     create)    shift; cmd_create "$@" ;;
     image)     shift; cmd_image "$@" ;;
+    cache)     shift; cmd_cache "$@" ;;
     versions|list-releases|releases) cmd_versions ;;
     ports|fwd)  cmd_help_ports ;;
     start)     shift; cmd_start "$@" ;;

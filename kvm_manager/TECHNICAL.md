@@ -1994,6 +1994,70 @@ taskset -c 0-7 qemu-system-aarch64 -M virt,gic-version=3 -cpu max \
 ```
 
 
+## 14. 镜像缓存
+
+### 14.1 问题
+
+`fetch_image()` 原本把基础镜像下载到**每个虚拟机自己的目录**，转换完再删：
+
+```bash
+download_url "$url" "$d/base.img"      # d = /var/lib/ckvm/<名字>
+qemu-img convert ... "$d/base.img" "$img"
+rm -f "$d/base.img"                     # 用完即删
+```
+
+于是每开一台都要重新下载 600–900 MB。开三台就是三次。
+
+### 14.2 做法
+
+下载放进 `$CKVM_ROOT/.cache/`，按版本命名，所有虚拟机共用：
+
+```bash
+ckvm_cache_dir()  { echo "$CKVM_ROOT/.cache"; }
+cache_base_path() { echo "$(ckvm_cache_dir)/ubuntu-${1}-arm64.img"; }
+ensure_cached_base() {
+    ...
+    if [ -s "$base" ] && [ -f "$mark" ]; then
+        ok_flash "使用缓存 ...（跳过下载）"
+        return 0
+    fi
+    ...
+}
+```
+
+`fetch_image()` 只做两件事：确保缓存里有，然后**从缓存复制**给这台虚拟机。
+
+### 14.3 几个实现取舍
+
+| 问题 | 处理 |
+|---|---|
+| 下载中断 | `download_url` 已按 `Content-Length` 校验大小，不匹配就重下；aria2c 负责续传 |
+| 文件系统支持 reflink | `cp --reflink=auto`，不支持时自动退化为普通复制 |
+| 复制很慢 | 大于 64 MB 时显示字节进度条（`copy_with_progress`） |
+| 删虚拟机 | `ckvm rm` 只删 `/var/lib/ckvm/<名字>/`，`.cache` 不受影响 |
+| 缓存损坏 | 旁边写一个 `.ok` 文件记录字节数和时间；大小对不上视为未完成 |
+
+### 14.4 实测
+
+```text
+第一次  ckvm create testvm2 --rel 24.04
+        source: https://mirror.nju.edu.cn/...ubuntu-24.04-server-cloudimg-arm64.img
+        cached: 592M
+
+第二次  ckvm create testvm3 --rel 24.04
+        ✓ 使用缓存 Ubuntu 24.04（592M，跳过下载）
+        复制基础镜像到 testvm3
+```
+
+第二次没有发起任何下载。
+
+### 14.5 与多开的关系
+
+缓存让"多开"从"每台都要等一次下载"变成"只在第一次等"。这是多开体验最
+关键的一处改动 —— 其余部分（端口自动分配、独立目录、独立固件副本）本来
+就是按多开设计的。
+
+
 ## 附：本机原始测量记录
 
 CPU 拓扑（`/proc/cpuinfo`）：

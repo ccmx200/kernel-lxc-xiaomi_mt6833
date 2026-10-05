@@ -1,59 +1,106 @@
 # ckvm — KVM 虚拟机管理器
 
-在 MT6833 / evergo（小米天玑 810 机型）上跑**硬件加速**的 KVM 虚拟机。
-装在 droidspaces 容器里，用 systemd 管理，支持多开。
+在 **MT6833 / evergo**（小米天玑 810 机型）上跑**硬件加速**的 KVM 虚拟机。
 
-> 想了解**为什么**这么设计、每处改动的依据和实测数据，
-> 看 **[TECHNICAL.md](TECHNICAL.md)**。
-> 本文只讲怎么用。
+装在 droidspaces 容器里，systemd 管理，**支持多开**，CPU / 内存 / 磁盘像正常
+虚拟机那样随便配。
+
+```
+  ckvm · KVM 虚拟机管理器                              v1.12
+  作者  璀璨梦星 · cuicanmx            github.com/ccmx200
+```
+
+> 想知道**为什么**这么设计、每处改动的实测依据和出处，
+> 看 **[TECHNICAL.md](TECHNICAL.md)**。本文只讲怎么用。
 
 ---
 
-## 一键安装
+## 目录
+
+- [它能做什么](#它能做什么)
+- [安装](#安装)
+- [快速开始](#快速开始)
+- [创建虚拟机](#创建虚拟机)
+- [配置 CPU / 内存 / 磁盘](#配置-cpu--内存--磁盘)
+- [多开](#多开)
+- [镜像缓存](#镜像缓存)
+- [网络](#网络)
+- [命令一览](#命令一览)
+- [常见问题](#常见问题)
+
+---
+
+## 它能做什么
+
+| | |
+|---|---|
+| **硬件加速** | KVM + EL2，不是纯软件模拟 |
+| **完整虚拟机** | UEFI 固件，能装系统、能多开 |
+| **Ubuntu 22.04 – 26.04** | 交互式选版本，像一个应用商店 |
+| **CPU 自由配置** | 6×A55 + 2×A76，`all` / `big` / 任意掩码 |
+| **共享镜像缓存** | 多开只下载一次基础镜像 |
+| **systemd 集成** | 开机自启、一键启停 |
+
+### 性能参考
+
+guest 内 `openssl speed -multi 8 -evp sha256`（16 KB 块，本机实测）：
+
+| 物理核 | 吞吐 | 启动耗时 |
+|---|---|---|
+| 全部 8 核 | **7.4 – 7.7 GB/s** | 42 – 44 s |
+| 仅 2 个大核 | 2.9 – 3.0 GB/s | ~34 s |
+
+全核约为大核专用的 **2.6 倍**，代价是启动慢 8 – 12 秒。
+
+---
+
+## 安装
 
 ```bash
 curl -fsSLk https://raw.githubusercontent.com/ccmx200/kernel-lxc-xiaomi_mt6833/refs/heads/resukisu/kvm_manager/kvm-vm.sh | bash -s -- install
 ```
 
-**默认走 GitHub 官方源**，脚本不做任何加速、不改写地址。
+默认走 GitHub 官方源，脚本**不做任何加速、不改写地址**。
 
-> URL 里用的是 `refs/heads/resukisu` 而不是 `resukisu`。GitHub 的加速镜像
-> **按 URL 路径缓存**，实测裸分支名会命中旧缓存（`x-cache: HIT`,
-> `x-cache-hits: 24`, `cache-control: max-age=300`），而完整 ref 路径能拿到
-> 当前版本。两者是同一份文件，只是路径写法不同。
+> **URL 里为什么是 `refs/heads/resukisu`**
 >
-> 装完可以自检：
+> GitHub 的加速镜像**按 URL 路径缓存**。裸分支名 `resukisu` 实测会命中旧缓存
+> （`x-cache: HIT`、`x-cache-hits: 24`、`max-age=300`），而完整 ref 路径拿到的是
+> 当前版本。同一份文件，只是写法不同。
 >
+> 装完自检：
 > ```bash
-> ckvm help | grep -q 'ckvm ports' && echo 已是最新 || echo 装到了旧版
+> ckvm help | grep -q 'ckvm cache' && echo 已是最新 || echo 装到了旧版
 > ```
 
 装完你会得到：
 
-1. `/usr/local/bin/ckvm` —— 命令
-2. `/usr/local/share/ckvm/firmware/` —— UEFI 固件
-3. `/etc/systemd/system/ckvm@.service` —— systemd 模板单元
-
-### 用加速
-
-```bash
-# 用你自己的加速地址（推荐）
-install -cn https://你的加速地址
-
-# 只给主机名也行，会自动补上仓库路径
-install -cn ghproxy.net
-
-# 模板形式
-install -cn "https://你的代理/{url}"
-
-# 不带参数：探测内置列表
-install -cn
+```
+/usr/local/bin/ckvm                              命令
+/usr/local/share/ckvm/firmware/                  UEFI 固件
+/etc/systemd/system/ckvm@.service                systemd 模板单元
 ```
 
-`--repo <url>` 是等价写法，`CKVM_ACCEL=<url>` 也行。
+### GitHub 不通时
 
-> 为什么建议**先手动抓脚本再 install**：`curl | bash` 那一跳本身也要过网络。
-> GitHub 不通时 `curl` 就已经失败，轮不到 `-cn` 生效。
+```bash
+# 用你自己的加速地址
+bash /tmp/ckvm.sh install -cn https://你的加速地址
+
+# 只给主机名也行，会自动补全仓库路径
+bash /tmp/ckvm.sh install -cn ghproxy.net
+
+# 模板形式
+bash /tmp/ckvm.sh install -cn "https://你的代理/{url}"
+
+# 不带参数：探测内置列表，选第一个能通的
+bash /tmp/ckvm.sh install -cn
+```
+
+`--repo <url>` 等价，`CKVM_ACCEL=<url>` 也行。
+
+> **建议先手动抓脚本再 install**：`curl | bash` 那一跳本身也要过网络。
+> GitHub 不通时 `curl` 就先失败了，轮不到 `-cn` 生效。
 >
 > ```bash
 > curl -fsSLk <能通的地址>/kvm-vm.sh -o /tmp/ckvm.sh
@@ -64,7 +111,7 @@ install -cn
 
 ```bash
 ckvm uninstall          # 只删命令和服务，虚拟机数据保留
-rm -rf /var/lib/ckvm    # 连数据一起删
+rm -rf /var/lib/ckvm    # 连数据一起删（含镜像缓存）
 ```
 
 ---
@@ -100,15 +147,16 @@ ckvm create
   vCPU 数量: [8]: 4
   内存 (MiB): [2048]: 1536
   磁盘 (GiB): [50]: 30
+  物理核心: 全部 8 个物理核（6×A55 + 2×A76）
   网络模式 user/host: [user]:
   映射端口 (逗号分隔): [22]:
 
-  检查镜像可用性...
+  检查镜像可用性
     可用：Ubuntu 24.04 (noble, LTS)  592M
   已创建 'srv24'  (Ubuntu 24.04, 8025 端口, 4 vCPU, 1536 MiB, 30G)
 ```
 
-每一步都有默认值，**直接回车就行**。选 `0` 取消。
+**每一步都有默认值，直接回车就行。** 选 `0` 取消。
 
 ### 也可以命令式
 
@@ -118,142 +166,95 @@ ckvm create web --rel 24.04 --cpus 4       # 指定版本和规格
 ckvm create app --rel 22.04 --mem 1024 --disk 20
 ```
 
-**只要给了名字或任何选项，就是命令模式**，不会有任何提问。
+---
 
-参数：
-
-| 选项 | 含义 | 默认 |
-|---|---|---|
-| `--rel V` | Ubuntu 版本 | `26.04` |
-| `--cpus N` | vCPU 数量 | `8` |
-| `--mem MB` | 内存 | `2048` |
-| `--disk GB` | 磁盘容量 | `50` |
-| `--port N` | 宿主机 SSH 端口 | 从 `8023` 起自动找空位 |
-| `--net M` | 网络模式 `user` / `host` | `user` |
-| `--user U` | 登录账号，或 `root` | `ubuntu` |
-| `--pass P` | 该账号的密码 | `ubuntu` |
-| `--fwd L` | 端口映射（见下） | `22` |
-
-### 端口映射怎么写
-
-交互式流程里问你「映射端口」之前会先把用法打出来。命令行等价的是 `--fwd`。
-
-格式是**逗号分隔**的列表，每一项两种写法：
-
-```text
-<guest端口>                 宿主机同号映射
-<宿主机端口>:<guest端口>     映射到指定端口
-```
-
-| 写法 | 含义 |
-|---|---|
-| `--fwd 22` | 只暴露 ssh。guest 的 22 → 该机的 `--port` |
-| `--fwd 22,80,443` | ssh 加上 web，80/443 同号 |
-| `--fwd 22,8080:80` | guest 的 80 → 宿主机 8080 |
-| `--fwd 22,2222:22` | 额外再把 guest 22 暴露到 2222 |
-| `--fwd 22,3306:3306,6379:6379` | mysql 和 redis |
-
-**两条规则要记住**：
-
-1. **guest 的 22 是特例** —— 它映射到这台虚拟机自己的 `--port`（从 8023 起
-   自动分配），所以多开不会互相抢，也不会占用容器自己的 22。
-2. **宿主机端口不能重复**。启动前会检查并提示是谁占着：
-
-   ```text
-   ! host port 8080 is already in use by ckvm guest 'ubuntu26'
-   !   pick another one, e.g. --fwd 22,18080:80
-   ```
-
-想随时复习：
-
-```bash
-ckvm ports          # 或者 ckvm help ports
-ckvm net <名字>     # 看某台实际生效的映射
-```
-
-> 用 `--net host` 时不需要映射 —— guest 会拿到自己的 IP 并自己跑 sshd。
-
-### 看有哪些版本
-
-```bash
-ckvm versions
-```
-
-```text
-  VERSION  CODENAME     LTS   SIZE
-  22.04    jammy        LTS   673M
-  22.10    kinetic            716M
-  23.04    lunar              688M
-  23.10    mantic             684M
-  24.04    noble        LTS   592M
-  24.10    oracular           584M
-  25.04    plucky             680M
-  25.10    questing           843M
-  26.04    resolute     LTS   902M
-```
-
-创建前会先**验证镜像真的能下**（探测 `Content-Length`），不可用会直接报错，
-不会让你等半天才发现下不了。
+## 创建虚拟机
 
 ### 每一步都有反馈
 
-创建过程会一路显示进度，不会出现"卡住不动"的观感：
+下载有进度条和速度，复制有字节进度，失败会告诉你哪一步、为什么：
 
 ```text
-  检查镜像可用性                     ← 转圈
-  可用：Ubuntu 24.04 (noble, LTS)  592M
-  已创建 'srv24'  (Ubuntu 24.04, 8025 端口, ...)
+  检查镜像可用性
+    可用：Ubuntu 24.04 (noble, LTS)  592M
 
-  ⠼ ██████████████░░░░░░░░░░  58%  Ubuntu 24.04 arm64  345M/592M
-  ⠸ ████████████████████████  100%  Ubuntu 24.04 arm64  592M/592M
-
-  ⠋ 扩容到 30G                       ← 转圈（qemu-img resize）
-  image ready
-  ⠋ 生成 cloud-init 镜像             ← 转圈
-  seed.img written (root / password ...)
-
-  启动： ckvm start srv24
+  ⠹ ████████████░░░░░░░░░░░░  52%  下载中  310M/592M
+  ✓ 使用缓存 Ubuntu 24.04（592M，跳过下载）
+  ✓ 镜像就绪
 ```
 
-慢操作（扩容、格式转换、cloud-init 生成）都有转圈动画；下载有进度条 +
-百分比 + 已下载/总量。失败时会打印出错的最后几行，而不是静默返回。
-
-> 进度条只在终端上显示。用 `cmd > log` 或没有 PTY 的 ssh 会话跑时，会退化成
-> 普通文字输出（避免污染日志）。
+**不会静默卡住** —— 每一步都有动画或明确的完成提示。
 
 ### 登录账号和密码
 
-交互流程里会问你**用哪个账号登录**：
-
-```text
-  登录账号
-  ────────
-    输入 root       直接用 root 登录（会设置 root 密码）
-    输入其他名字    新建一个带 sudo 的普通用户
-    直接回车        用 ubuntu
-  账号名: [ubuntu]:
-  密码:
-  再输一次:
+```bash
+ckvm create web --user root --pass 你的密码    # 直接 root
+ckvm create web --user alice --pass secret     # 普通用户（也能 sudo）
 ```
 
-**密码由你自己定**，输入时不回显，要输两遍确认。
+不指定的话：用户名默认 `ubuntu`，**密码会让你自己输**（不回显）。
 
-命令行等价参数：
+### 启动 / 停止
 
 ```bash
-ckvm create srv --user root  --pass 'MyPass123'
-ckvm create dev --user alice --pass 'alicepw'
-ckvm create box                      # 默认账号 ubuntu / 密码 ubuntu
+ckvm start web          # 后台，等到 SSH 就绪才返回
+ckvm start web -f       # 前台，Ctrl-C 停止
+ckvm stop web
+ckvm restart web
+ckvm status web         # 详细状态 + 串口末尾
+ckvm console web -n 50  # 看串口最后 50 行
 ```
 
-> **为什么 root 需要额外处理**：Ubuntu 的 cloud image 自带
-> `/etc/ssh/sshd_config.d/60-cloudimg-settings.conf`，里面写着
-> `PasswordAuthentication no`，而 `sshd_config` 是按字母序 `Include` 该目录的 ——
-> 它排在 cloud-init 写的 `50-cloud-init.conf` **后面**，所以会覆盖。
-> 结果就是密码设上了但 root 仍然登录不了。ckvm 会再写一个排序更后的
-> `99-ckvm-root.conf` 显式打开 root 密码登录，并重启 sshd。
+---
 
-### 启动
+## 配置 CPU / 内存 / 磁盘
+
+**像正常虚拟机一样配，没有隐藏限制。**
+
+```bash
+ckvm create big --cores big          # 只用 2 个大核（低延迟）
+ckvm create all --cores all          # 全部 8 核（高吞吐，默认）
+ckvm create tiny --cpus 2 --mem 1024 --disk 20
+```
+
+### `--cores` 怎么选
+
+| 值 | 用到的核 | 适合 |
+|---|---|---|
+| `all`（默认）| 全部 8 核（6×A55 + 2×A76）| 吞吐优先、跑编译、多开 |
+| `big` | 仅 2 个大核（A76）| 单核延迟优先、轻负载 |
+
+### 任意掩码都可以
+
+`CPUSET` 支持任意 CPU 掩码，**混合小核大核也没问题**：
+
+```text
+0-7        全核 8 vCPU          ✓
+0-5        全小核 6 vCPU        ✓
+6-7        全大核 2 vCPU        ✓
+0-2,6-7    非对称 3小+2大       ✓
+0,7        极端 1小+1大         ✓
+0-7        16 vCPU 超配 2x      ✓
+```
+
+> **历史说明**：早期内核在 big.LITTLE 上跨簇会随机失败
+> （`Failed to put registers after init`），必须手工绑核。
+> **该问题已在内核侧修复**（见 [TECHNICAL.md](TECHNICAL.md) 12.11–12.13），
+> 现在不需要任何绑核 workaround。
+>
+> 唯一保留的语义是正常的：**你给几个核，虚拟机的 vCPU 就只能用这几个核**。
+
+### 改已有虚拟机的配置
+
+```bash
+ckvm edit web        # 直接改 vm.conf
+ckvm config web      # 看当前配置
+```
+
+`CPUS` / `MEM` / `DISK` / `CPUSET` / `PORT` / `FORWARDS` 都可以改，改完
+`ckvm restart web` 生效（磁盘扩容会自动 `qemu-img resize`）。
+
+---
 
 ## 多开
 
@@ -268,42 +269,54 @@ ckvm list
 ```
 
 ```text
-  NAME             STATE    CPUS   MEM      DISK    PORT   SSH
-  a                running  8      2048     50G     8023   ssh u0@127.0.0.1 -p 8023
-  b                running  8      2048     50G     8024   ssh u0@127.0.0.1 -p 8024
+  NAME        STATE    CPUS  MEM    DISK  PORT  SSH
+  a           running  8     2048   50G   8023  ssh ubuntu@127.0.0.1 -p 8023
+  b           running  8     2048   50G   8024  ssh ubuntu@127.0.0.1 -p 8024
 ```
 
-端口自动分配，不用自己记。
+**端口从 8023 起自动分配，不用自己记。**
+
+> **内存提醒**：这台机器约 5.6 GB 可用，多开时注意 `MEM` 之和。
+> `ckvm list` 能一眼看出每台占多少。
 
 ---
 
-## 命令一览
+## 镜像缓存
+
+**基础镜像只下载一次，所有虚拟机共用。**
 
 ```bash
-ckvm install [选项]              # 安装
-ckvm uninstall                   # 卸载
-
-ckvm create                      # 交互式（应用商店）
-ckvm create <名字> [选项]         # 命令式
-ckvm versions                    # 列出可选版本
-ckvm ports                       # 端口映射怎么写
-ckvm image <名字>                # 重新下载镜像
-ckvm start <名字> [-f]           # 启动（-f 前台）
-ckvm stop <名字>
-ckvm restart <名字>
-ckvm rm <名字> [-f]              # 删除（-f 可删运行中的）
-
-ckvm list                        # 所有虚拟机
-ckvm status <名字>               # 详细状态 + 串口末尾
-ckvm console <名字> [-a|-n N]    # 实时看串口，Ctrl-C 断开
-
-ckvm enable <名字>               # systemd 启用 + 启动 + 开机自启
-ckvm disable <名字>
-
-ckvm net [名字]                  # 看网络情况
-ckvm config [名字]               # 看配置
-ckvm edit <名字>                 # 改配置
+ckvm cache              # 看缓存了什么、占多少
+ckvm cache --path       # 缓存目录
+ckvm cache --clear      # 清空
+ckvm cache --clear 24.04   # 只删某个版本
 ```
+
+```text
+  镜像缓存  /var/lib/ckvm/.cache
+
+  版本         大小  完成
+  ────────────────────────────────
+  24.04            592M  ✓
+  26.04            902M  ✓
+  ────────────────────────────────
+  合计           1.5G
+
+  ckvm cache --clear [版本]   删除缓存
+  ckvm cache --path           显示缓存目录
+```
+
+### 行为
+
+| 什么时候 | 做什么 |
+|---|---|
+| 首次创建某版本 | 下载到缓存（有进度条） |
+| 再次创建同版本 | **直接命中缓存，跳过下载** |
+| 下载中断 | 下次自动续传 |
+| `ckvm rm` 删虚拟机 | **缓存保留**，不影响其它机 |
+| 缓存被清 | 下次创建重新下载 |
+
+**所以开 3 台 24.04 只需要下载 1 次 592M**，其余两台直接从缓存复制。
 
 ---
 
@@ -311,40 +324,37 @@ ckvm edit <名字>                 # 改配置
 
 ### user 模式（默认）
 
-QEMU 自己做 NAT，用端口映射访问。任何环境都能用。
+QEMU 自己做 NAT，用端口映射访问。**任何环境都能用。**
 
 ```bash
 ckvm create web --fwd 22,80,443
-ckvm start web
 ```
 
 ```text
   network: user-mode NAT
-    ssh u0@127.0.0.1 -p 8023   (password: 1)
-    port 80 -> 127.0.0.1:80
+    ssh ubuntu@127.0.0.1 -p 8023   (password: 你设的)
+    port 80  -> 127.0.0.1:80
     port 443 -> 127.0.0.1:443
 ```
 
-规则：guest 的 `22` 映射到该机的 `PORT`（多开不抢端口）；其他端口默认同号，
+**规则**：guest 的 `22` 映射到该机的 `PORT`（多开不抢端口）；其他端口默认同号，
 也可写 `宿主机端口:guest端口`。启动前会检查端口占用。
 
 ### host 模式（tap）
 
-guest 拿到自己的 IP，**自己跑 sshd**，不需要端口映射，也不经过 droidspaces
-的转发，和容器自身的 22 不冲突。
+guest 拿到自己的 IP，**自己跑 sshd**，不需要端口映射。
 
 ```bash
 ckvm create srv --net host
-ckvm start srv
 ```
 
 ```text
   network: tap, the guest is on this container's network
     guest ip : 172.28.100.2/24   gateway 172.28.100.1
-    ssh      : u0@172.28.100.2   (password: 1)
+    ssh      : root@172.28.100.2
 ```
 
-脚本自动建 tap、配 IP、开转发和 NAT，`stop`/`rm` 自动清理。
+脚本自动建 tap、配 IP、开转发和 NAT，`stop` / `rm` 自动清理。
 
 ### ⚠️ 局域网访问
 
@@ -358,285 +368,65 @@ ckvm start srv
 
 `ckvm net <名字>` 会打印当前布局和下一步提示。
 
----
-
-## systemd
+### systemd
 
 ```bash
-ckvm enable ubuntu26
-systemctl status  ckvm@ubuntu26
-systemctl stop    ckvm@ubuntu26
-systemctl restart ckvm@ubuntu26
-journalctl -u     ckvm@ubuntu26
-```
-
-`enable` 同时设置开机自启。
-
----
-
-## 配置
-
-### 全局
-
-| 变量 | 默认 | 说明 |
-|---|---|---|
-| `CKVM_ROOT` | `/var/lib/ckvm` | 数据目录 |
-| `CKVM_FWDIR` | `/usr/local/share/ckvm/firmware` | 固件目录 |
-| `CKVM_BINDIR` | `/usr/local/bin` | 命令安装位置 |
-| `MIRROR_IMAGE_LIST` | NJU + 官方 | 系统镜像源，按顺序回退 |
-| `MIRROR_APT` | USTC | 写进 cloud-init 的 apt 源 |
-| `CKVM_ACCEL` | `0` | 加速地址，或 `1` 表示探测内置列表 |
-| `CKVM_NO_APT` | `0` | 设 `1` 禁止自动 apt 安装 aria2 |
-| `NO_COLOR` | — | 设置后关闭颜色 |
-
-### 单个虚拟机
-
-`/var/lib/ckvm/<名字>/vm.conf`，改完 `ckvm restart <名字>` 生效：
-
-```ini
-NAME=ubuntu26
-UBUNTU_REL=26.04
-CPUS=8
-MEM=2048
-DISK_GB=50
-PORT=8023
-CPUSET=6-7          # 绑定的物理核，别乱改
-NET_MODE=user
-FORWARDS=22
-VM_USER=u0
-VM_PASS=1
-VM_HOSTNAME=ubuntu26
+ckvm enable ubuntu26          # 启用 + 启动 + 开机自启
+systemctl status ckvm@ubuntu26
+journalctl -u    ckvm@ubuntu26
+ckvm disable ubuntu26
 ```
 
 ---
 
-## 物理核心选择
-
-创建虚拟机时要选一处物理核心，**只有两个选项，默认全核**：
-
-| `--cores` | 物理核心 | 构成 | sha256 吞吐 | 启动 |
-|---|---|---|---|---|
-| **`all`（默认）** | `0-7` | 6×A55 + 2×A76 | **7.4–7.7 GB/s** | ~42–44 s |
-| `big` | `6-7` | 2×A76 | 2.9–3.0 GB/s | ~34 s |
-
-* **`all`** —— 吞吐优先，适合编译、压缩、批量计算
-* **`big`** —— 单核延迟优先，适合单线程为主的负载
-
-```sh
-ckvm create myvm --cpus 8 --mem 4096 ...                 # 默认全核
-ckvm create myvm --cpus 8 --mem 4096 --cores big ...     # 只要大核
-```
-
-交互式创建时也会问一次：
-
-```text
-  vCPU 数量: [8]
-  物理核心:  1) 全部 8 核（6×A55 + 2×A76，吞吐优先）
-             2) 仅 2 个大核（A76，单核延迟优先）
-  选择 [1/2]: [1]
-```
-
-创建完成后会打印你选了什么：
-
-```text
-  物理核心: 全部 8 个物理核（6×A55 + 2×A76）
-```
-
-### 为什么全核是默认
-
-全核快约 **2.6 倍**，只多花 8–12 秒启动时间 —— 对绝大多数用途划算。
-
-以前默认是「8 vCPU 绑 2 个大核」，也就是**超卖 4 倍**：吞吐靠时间片堆出来，
-单核延迟差，而且用户完全看不出自己建的是这种配置。现在两个选项都是明确的，
-不再有隐式的超卖。
-
-### 为什么不能直接在 0-7 上启动
-
-big.LITTLE 的坑：vCPU 初始化期间如果 QEMU 线程在两个簇之间迁移，A55 和 A76
-的 CPU 特性寄存器不同，KVM 会拒绝写入，QEMU 直接退出：
-
-```text
-qemu-system-aarch64: Failed to put registers after init: Invalid argument
-```
-
-实测直接绑 `0-7` 启动 **5 次里失败 4 次**。
-
-从 **v1.1** 起脚本自己处理了：先把 QEMU 钉在**一个核**上完成初始化，等 guest
-起来再把所有线程放开到你选的核：
-
-```text
-启动阶段      钉在 BOOT_CPU（默认 6）
-guest 起来后   所有线程放开到 CPUSET
-```
-
-这样 `0-7` 实测 **5/5 成功**。
-
-## 换 apt 源（容器自己）
-
-容器的 apt 源默认是 Debian/Ubuntu 官方源，在国内很慢。一条命令换掉：
-
-```sh
-ckvm mirror              # 逐个测速，选最快的
-ckvm mirror --restore    # 换回原来的
-```
-
-输出：
-
-```text
-  当前源:    http://deb.debian.org
-  发行版:    debian / trixie
-
-  测速中（下载一个几 MB 的索引，算真实吞吐）...
-    源                                         吞吐     耗时
-  https://mirror.nju.edu.cn                    6.94 MB/s  1.74s
-  https://mirrors.tuna.tsinghua.edu.cn        11.21 MB/s  1.08s
-  https://mirrors.aliyun.com                   5.23 MB/s  2.31s
-
-  已切换到: https://mirrors.tuna.tsinghua.edu.cn  (11.21 MB/s)
-  备份:     /etc/apt/sources.list.d/debian.sources.ckvm.bak
-```
-
-原文件备份为 `<源文件>.ckvm.bak`，`--restore` 原样还原。
-同时支持 Debian 13 的 deb822 格式（`debian.sources`）和老的
-`/etc/apt/sources.list` 一行格式。
-
-### 为什么不是按延迟选
-
-**延迟低不等于下载快。** 第一版用 `curl -w time_total` 测一个 130KB 的
-`Release` 文件，那个数字基本只反映 TCP 往返，不反映带宽。实测结果：
-
-| 镜像 | 延迟（旧方法） | 真实吞吐 |
-|---|---|---|
-| aliyun | **0.271s（最快）** | 5.23 MB/s（**最慢**） |
-| tuna | 0.379s | **11.21 MB/s（最快）** |
-| nju | 0.550s | 6.94 MB/s |
-
-旧方法**选中了最慢的那个**。现在改成下载 13MB 的 `Packages.gz` 算 MB/s，
-并且核对 HTTP 状态码 —— 否则一个返回 403 的镜像也会被当成可用。
-
-### 装依赖时会自动换
-
-`ensure_deps` 在装 `qemu-system-arm` / `qemu-utils` / `cloud-image-utils`
-之前，如果发现源还是官方源，会自动先换到列表里第一个可用镜像。
-想跳过：`CKVM_NO_APT_MIRROR=1`。
-
-> 顺带修了个包名 bug：以前写的是二进制名 `aria2c`，那不是包名（应为
-> `aria2`），也没先跑 `apt-get update`，所以装依赖必然失败。
-
----
-
-## 镜像源
-
-默认：
-
-```text
-系统镜像：https://mirror.nju.edu.cn/ubuntu-cloud-images
-         ↓ 失败则
-         https://cloud-images.ubuntu.com
-
-apt 源：  https://mirrors.ustc.edu.cn/ubuntu-ports
-```
-
-换源：
+## 命令一览
 
 ```bash
-export MIRROR_IMAGE_LIST="https://mirrors.tuna.tsinghua.edu.cn/ubuntu-cloud-images"
-export MIRROR_APT="https://mirrors.aliyun.com/ubuntu-ports"
-curl -fsSLk <地址> | bash -s -- install
+# 安装
+ckvm install [选项]              # 安装（-cn 用加速）
+ckvm uninstall                   # 卸载
+
+# 创建与管理
+ckvm create                      # 交互式（应用商店）
+ckvm create <名字> [选项]         # 命令式
+ckvm versions                    # 列出可选版本
+ckvm cache [--clear|--path]      # 镜像缓存
+ckvm image <名字>                # 重新下载镜像
+
+# 运行
+ckvm start <名字> [-f]           # 启动（-f 前台）
+ckvm stop <名字>
+ckvm restart <名字>
+ckvm rm <名字> [-f]              # 删除（-f 可删运行中的）
+
+# 查看
+ckvm list                        # 所有虚拟机
+ckvm status <名字>               # 详细状态 + 串口末尾
+ckvm console <名字> [-a|-n N]    # 实时看串口，Ctrl-C 断开
+ckvm config [名字]               # 看配置
+ckvm edit <名字>                 # 改配置
+ckvm net [名字]                  # 看网络情况
+ckvm ports                       # 端口映射怎么写
+
+# 自检与服务
+ckvm selftest [--keep]           # 真启动一台验证整条链路
+ckvm enable <名字> / disable <名字>
+ckvm mirror                      # 给容器换 apt 源
 ```
 
-> 实测提醒：USTC 的 `ubuntu-cloud-images` **只镜像了 amd64**，arm64 返回
-> 403，所以镜像默认走 NJU。
-
----
-
-## 三个别踩的坑
-
-### 1. 别去掉 `taskset` 绑核
-
-这台机器是 big.LITTLE（6 个 A55 + 2 个 A76），寄存器值不同。不绑核会随机
-启动失败：
+### `ckvm create` 的全部选项
 
 ```text
-Failed to put registers after init: Invalid argument
-```
-
-脚本固定 `taskset -c 6-7`，**这就是 `CPUSET`，别乱改**。
-
-> 绑核之后 **8 核也能用**。
-
-### 2. 固件必须是不写 NVRAM 的那份
-
-普通 EDK2 一写变量存储就会让虚拟机卡死（ARM 架构限制，详见
-[TECHNICAL.md](TECHNICAL.md) 第 2、4 节）。`kvm_manager/` 里附带的就是正确
-的那份，`install` 会自动放好。
-
-### 3. 不能用 `-kernel` 直接引导 Ubuntu 内核
-
-26.04 的 `/boot/vmlinuz-*` 是 PE32+ EFI 应用，QEMU 的 arm64 加载器只接受
-gzip 或裸 `Image`。必须走 UEFI。
-
----
-
-## 装完能不能跑：自检
-
-装完想知道这台机器到底能不能跑，直接：
-
-```sh
-ckvm selftest
-```
-
-它会**真的启一台一次性虚拟机**并验证：
-
-```text
-  ckvm selftest
-
-  root                          ok
-  qemu-system-aarch64           ok
-  /dev/kvm                      ok
-  cloud-localds                 ok
-  firmware                      ok
-  free disk                     ok (87246 MiB)
-
-  启动测试: 2 vCPU / 1024 MiB / 3G, 全核掩码 0-7
-  fetch image (26.04)           ok
-  build seed                    ok
-  qemu starts on cpuset 0-7     ok
-  guest reaches login           ok (56s)
-  guest reports its CPUs        ok (2 CPU)
-  firmware did not wedge        ok
-
-  ✓ 自检通过，这台机器可以跑虚拟机
-```
-
-测完自动删除；加 `--keep` 留下来，可以 `ckvm console` 进去看。
-`ckvm install --selftest` 装完直接跑一次。
-
-### 它比安装时的检查多测了什么
-
-安装时的校验只确认**下载的文件完整**（首行 shebang、`CKVM_BUILD=` 标记、
-`bash -n` 通过）。文件完好 **不等于** 能跑 —— 下面这些它一个都测不出来，
-而这些都是实际遇到过的：
-
-| 故障 | 文件检查 |
-|---|---|
-| 固件写 NVRAM 就卡死，永不进内核 | 通过 ❌ |
-| 核掩码跨簇被 QEMU 拒绝 | 通过 ❌ |
-| guest 起了但 sshd 没起来 | 通过 ❌ |
-| 固件断言 / 异常 | 通过 ❌ |
-
-`ckvm selftest` 把虚拟机真的跑起来，所以上面这些当场暴露。
-
----
-
-## 自查
-
-```bash
-ckvm selftest            # 真的启一台测试机，确认这套能跑
-ckvm net                 # 容器网卡、路由、各虚拟机网络模式
-ckvm net <名字>          # 单机的 tap、NAT 规则、访问方式
-ckvm status <名字>       # 状态 + 串口末尾
-ckvm config <名字>       # 该机配置
+--cpus N    vCPU 数量            默认 8
+--cores C   all | big            默认 all
+--mem MB    内存                 默认 2048
+--disk GB   磁盘                 默认 50
+--rel V     Ubuntu 版本          默认 26.04
+--port N    SSH 端口             默认从 8023 起找空闲
+--net M     user | host          默认 user
+--fwd LIST  端口映射，逗号分隔    默认 22
+--user U    用户名，或 root       默认 ubuntu
+--pass P    密码
 ```
 
 ---
@@ -644,87 +434,108 @@ ckvm config <名字>       # 该机配置
 ## 常见问题
 
 **`Failed to put registers after init`**
-绑核没生效。确认 `vm.conf` 里 `CPUSET=6-7`。
+
+旧内核的 big.LITTLE 跨簇问题，**已在当前内核修复**。
+如果你看到这个错误，说明跑的是旧内核 —— 更新内核，或临时在 `vm.conf` 里
+把 `CPUSET` 设成 `6-7`。
+
+**创建时卡在下载**
+
+看进度条；中断了下次会自动续传。慢的话换镜像源：
+
+```bash
+export MIRROR_IMAGE_LIST="https://mirrors.tuna.tsinghua.edu.cn/ubuntu-cloud-images"
+```
 
 **GRUB 加载后卡住不动**
+
 NVRAM 被污染。`ckvm stop <名字>`，删掉该目录下的 `uefi-vars.fd`，再
 `ckvm start`（会从模板重建）。
 
-**curl 报 `Connection reset by peer`**
-GitHub 被墙。换用加速地址，或先手动抓脚本再用 `install -cn`。
-
-**`ckvm install` 报 `could not download kvm-vm.sh`**
-你的加速地址不通，或没给 `-cn`。失败**不会**破坏已装好的 ckvm。
-
-**找不到固件**
-```bash
-ckvm install            # 会从仓库（或其加速地址）下载
-```
-或从设备上拷：
-```bash
-su -c 'mkdir -p /sdcard/limbo_fw && cp /data/data/com.limbo.emu.main.arm/cache/limbo/edk2/*.fd /sdcard/limbo_fw/'
-su -c 'cp /sdcard/limbo_fw/edk2_*.fd /usr/local/share/ckvm/firmware/'
-```
-
 **想换用户名密码**
-改 `vm.conf` 的 `VM_USER`/`VM_PASS` 后 `ckvm rm` 重建（cloud-init 只在首次
-启动生效），或进系统 `passwd`。
+
+改 `vm.conf` 的 `VM_USER`/`VM_PASS` 后 `ckvm rm` 重建（cloud-init 只在首次启动
+生效），或进系统 `passwd`。
 
 **`ckvm console` 要 Ctrl-C 才能退出，正常吗**
-正常。它默认只显示**新输出**，不会重放开机时的 bootlog。想看历史：
+
+正常。它默认只显示**新输出**，不重放开机 bootlog。想看历史：
 
 ```bash
 ckvm console <名字> -n 50    # 先显示最后 50 行
 ckvm console <名字> -a       # 显示全部
 ```
 
-串口里的终端控制序列（DCS / OSC / 私有模式）会被自动剥掉，颜色保留。
-**要交互登录用 ssh 更方便** —— `ckvm status <名字>` 会告诉你地址。
+串口里的终端控制序列会被自动剥掉，颜色保留。**要交互登录用 ssh 更方便**。
+
+**curl 报 `Connection reset by peer`**
+
+GitHub 被墙。用加速地址，或先手动抓脚本再用 `install -cn`。
+
+**找不到固件**
+
+```bash
+ckvm install            # 会从仓库（或其加速地址）下载
+```
+
+或从设备上拷：
+
+```bash
+su -c 'mkdir -p /sdcard/limbo_fw && cp /data/data/com.limbo.emu.main.arm/cache/limbo/edk2/*.fd /sdcard/limbo_fw/'
+su -c 'cp /sdcard/limbo_fw/edk2_*.fd /usr/local/share/ckvm/firmware/'
+```
 
 **想要图形界面**
+
 默认只有串口。自己在 QEMU 参数里加 `-device virtio-gpu-pci` 配 VNC。
+
+---
+
+## 镜像源
+
+```text
+系统镜像  https://mirror.nju.edu.cn/ubuntu-cloud-images
+          ↓ 失败则
+          https://cloud-images.ubuntu.com
+
+apt 源    https://mirrors.ustc.edu.cn/ubuntu-ports
+```
+
+换源：
+
+```bash
+export MIRROR_IMAGE_LIST="https://mirrors.tuna.tsinghua.edu.cn/ubuntu-cloud-images"
+export MIRROR_APT="https://mirrors.aliyun.com/ubuntu-ports"
+```
+
+> **实测提醒**：USTC 的 `ubuntu-cloud-images` **只镜像了 amd64**，arm64 返回 403，
+> 所以默认走 NJU。
 
 ---
 
 ## 环境
 
 ```text
-设备    小米 MT6833 / evergo
+设备    小米 MT6833 / evergo（天玑 810）
 容器    droidspaces（Debian 13，systemd 作为 PID 1）
 内核    4.14.356-Evergo-KVM-cuicanmx-v1.0
-guest   Ubuntu 26.04.1 LTS
+guest   Ubuntu 22.04 – 26.04
 ```
+
+---
+
+## 文档
+
+- **[TECHNICAL.md](TECHNICAL.md)** —— 技术文档。硬件与特权模型、
+  `ESR_EL2.ISV == 0` 的架构根因、内核回移的 ABI 细节、固件选择依据、
+  big.LITTLE 寄存器快照的完整分析与实测（第 12 章）、网络模式原理、
+  systemd 设计、完整实测数据集，**以及每一处结论的出处**。
+- **[../docs/KVM.md](../docs/KVM.md)** —— 最初的内核侧调研记录。
 
 ---
 
 ## 作者与许可
 
-| 项目 | 内容 |
-|---|---|
-| 作者 | 璀璨梦星 · cuicanmx |
-| GitHub | <https://github.com/ccmx200> |
-| 仓库 | `ccmx200/kernel-lxc-xiaomi_mt6833` 的 `kvm_manager/` |
+**璀璨梦星 · cuicanmx** · <https://github.com/ccmx200>
 
-**ckvm 本身采用 GPL-2.0**（与所在内核仓库一致，脚本头部有
-`SPDX-License-Identifier: GPL-2.0`）。它下载或调用的外部组件各有其许可，
-使用时请一并遵守：
-
-| 组件 | 来源 | 许可 |
-|---|---|---|
-| ckvm | 本项目 | **GPL-2.0** |
-| UEFI 固件 | Limbo for Tensor（`wasdwasd0105/limbo_tensor`） | 见其项目声明 |
-| Ubuntu cloud image | Canonical | 见 Ubuntu 许可 |
-| 禁用 GenieZone 工具链 | `jsbsbxjxh66/mtk-soc-disable-geniezone` | MIT（其项目声明） |
-| QEMU / aria2 / cloud-init 等 | 各自上游 | 各自上游许可 |
-
-**免责声明**：本工具按原样提供，不附带任何形式的担保。刷写内核、修改分区表
-等操作可能导致设备变砖或数据丢失，**风险自负**，作者不承担责任。完整条款见
-仓库根目录 [README](../README.md) 的「免责声明」一节。
-
-## 文档
-
-- **[TECHNICAL.md](TECHNICAL.md)** —— 技术文档。包含硬件与特权模型、
-  `ESR_EL2.ISV == 0` 的架构根因、内核回移的 ABI 细节、固件选择的依据、
-  big.LITTLE 绑核分析、网络模式原理、systemd 设计、完整实测数据集，
-  以及**每一处结论的出处**。
-- **[../docs/KVM.md](../docs/KVM.md)** —— 最初的内核侧调研记录。
+`ckvm` 以 **GPL-2.0** 发布，与内核树保持一致。
