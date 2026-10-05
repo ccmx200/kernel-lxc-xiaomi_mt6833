@@ -52,6 +52,14 @@ struct kvm_one_reg;
 int kvm_arm_copy_sys_reg_indices(struct kvm_vcpu *vcpu, u64 __user *uindices);
 int kvm_arm_sys_reg_get_reg(struct kvm_vcpu *vcpu, const struct kvm_one_reg *);
 int kvm_arm_sys_reg_set_reg(struct kvm_vcpu *vcpu, const struct kvm_one_reg *);
+
+/*
+ * Per-VM snapshot of the invariant ID registers.  Taken in
+ * kvm_arch_init_vm() so the whole VM sees one coherent CPU model regardless
+ * of which big.LITTLE cluster a vCPU thread happens to run on.
+ */
+int kvm_arm_id_reg_snapshot(struct kvm *kvm);
+void kvm_arm_id_reg_snapshot_free(struct kvm *kvm);
 unsigned long kvm_arm_num_sys_reg_descs(struct kvm_vcpu *vcpu);
 
 #endif /* __ARM64_KVM_COPROC_H__ */

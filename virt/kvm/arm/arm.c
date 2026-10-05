@@ -135,6 +135,17 @@ int kvm_arch_init_vm(struct kvm *kvm, unsigned long type)
 
 	kvm_vgic_early_init(kvm);
 
+	/*
+	 * Freeze the invariant ID register values for this VM.  Doing it here,
+	 * before any vCPU exists, means it happens on one core and the guest
+	 * gets a single coherent CPU model; it also stops QEMU's
+	 * read-then-write-back of the host CPU model from failing when the
+	 * thread moves between the A55 and A76 clusters.
+	 */
+	ret = kvm_arm_id_reg_snapshot(kvm);
+	if (ret)
+		goto out_free_stage2_pgd;
+
 	/* Mark the initial VMID generation invalid */
 	kvm->arch.vmid_gen = 0;
 
@@ -174,6 +185,8 @@ int kvm_arch_vcpu_fault(struct kvm_vcpu *vcpu, struct vm_fault *vmf)
 void kvm_arch_destroy_vm(struct kvm *kvm)
 {
 	int i;
+
+	kvm_arm_id_reg_snapshot_free(kvm);
 
 	free_percpu(kvm->arch.last_vcpu_ran);
 	kvm->arch.last_vcpu_ran = NULL;

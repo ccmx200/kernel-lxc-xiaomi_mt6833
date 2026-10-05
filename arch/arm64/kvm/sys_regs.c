@@ -1877,20 +1877,105 @@ static int reg_to_user(void __user *uaddr, const u64 *val, u64 id)
 	return 0;
 }
 
-static int get_invariant_sys_reg(u64 id, void __user *uaddr)
+/*
+ * Take the per-VM snapshot of the invariant ID registers.
+ *
+ * Called from kvm_arch_init_vm(), i.e. before any vCPU exists, so this runs
+ * on exactly one core: the VM therefore gets one coherent CPU model no matter
+ * which cluster its vCPU threads later land on.
+ *
+ * The values are re-read here rather than copied from invariant_sys_regs[].
+ * That table was filled once at boot by kvm_sys_reg_table_init(), on whatever
+ * core happened to run it, so copying it would hand every VM that cluster's
+ * feature set - a VM running entirely on A76 cores could still be told it is
+ * an A55.  Re-reading at VM creation keeps the snapshot consistent (it is
+ * taken once and every read and write below goes through it) while reflecting
+ * the core the work actually starts on.
+ *
+ * The reset() callbacks ignore their vcpu argument - kvm_sys_reg_table_init()
+ * calls them with NULL too - so NULL is correct here.
+ */
+int kvm_arm_id_reg_snapshot(struct kvm *kvm)
+{
+	unsigned int i;
+
+	if (kvm->arch.id_regs_snapshot)
+		return 0;
+
+	kvm->arch.id_regs_snapshot = kcalloc(ARRAY_SIZE(invariant_sys_regs),
+					     sizeof(u64), GFP_KERNEL);
+	if (!kvm->arch.id_regs_snapshot)
+		return -ENOMEM;
+
+	for (i = 0; i < ARRAY_SIZE(invariant_sys_regs); i++) {
+		const struct sys_reg_desc *r = &invariant_sys_regs[i];
+
+		if (r->reset) {
+			r->reset(NULL, r);
+			kvm->arch.id_regs_snapshot[i] = r->val;
+		} else {
+			kvm->arch.id_regs_snapshot[i] = r->val;
+		}
+	}
+
+	kvm->arch.id_regs_snapshot_valid = true;
+	return 0;
+}
+
+void kvm_arm_id_reg_snapshot_free(struct kvm *kvm)
+{
+	kfree(kvm->arch.id_regs_snapshot);
+	kvm->arch.id_regs_snapshot = NULL;
+	kvm->arch.id_regs_snapshot_valid = false;
+}
+
+/*
+ * Index of @r within invariant_sys_regs[], or -1.  The table is small and
+ * this is not a hot path, so a linear scan is fine and avoids depending on
+ * the table staying ordered.
+ */
+static int invariant_reg_index(const struct sys_reg_desc *r)
+{
+	unsigned int i;
+
+	for (i = 0; i < ARRAY_SIZE(invariant_sys_regs); i++)
+		if (&invariant_sys_regs[i] == r)
+			return (int)i;
+	return -1;
+}
+
+/* Value this VM reports for @r, falling back to the global table. */
+static u64 invariant_reg_value(struct kvm *kvm, const struct sys_reg_desc *r)
+{
+	int i;
+
+	if (!kvm || !kvm->arch.id_regs_snapshot_valid ||
+	    !kvm->arch.id_regs_snapshot)
+		return r->val;
+
+	i = invariant_reg_index(r);
+	if (i < 0)
+		return r->val;
+
+	return kvm->arch.id_regs_snapshot[i];
+}
+
+static int get_invariant_sys_reg(struct kvm *kvm, u64 id, void __user *uaddr)
 {
 	struct sys_reg_params params;
 	const struct sys_reg_desc *r;
+	u64 val;
 
 	r = find_reg_by_id(id, &params, invariant_sys_regs,
 			   ARRAY_SIZE(invariant_sys_regs));
 	if (!r)
 		return -ENOENT;
 
-	return reg_to_user(uaddr, &r->val, id);
+	val = invariant_reg_value(kvm, r);
+	return reg_to_user(uaddr, &val, id);
 }
 
-static int set_invariant_sys_reg(u64 id, void __user *uaddr)
+static int set_invariant_sys_reg(struct kvm *kvm, u64 id, void __user *uaddr)
 {
 	struct sys_reg_params params;
 	const struct sys_reg_desc *r;
@@ -1906,8 +1991,14 @@ static int set_invariant_sys_reg(u64 id, void __user *uaddr)
 	if (err)
 		return err;
 
-	/* This is what we mean by invariant: you can't change it. */
-	if (r->val != val)
+	/*
+	 * Compare against this VM's snapshot rather than the global table.
+	 * The global value was captured on whichever core ran
+	 * kvm_sys_reg_table_init(); on big.LITTLE that need not be the core
+	 * QEMU read the value on, and the mismatch is what produced
+	 * "Failed to put registers after init: Invalid argument".
+	 */
+	if (invariant_reg_value(kvm, r) != val)
 		return -EINVAL;
 
 	return 0;
@@ -2008,7 +2099,7 @@ int kvm_arm_sys_reg_get_reg(struct kvm_vcpu *vcpu, const struct kvm_one_reg *reg
 
 	r = index_to_sys_reg_desc(vcpu, reg->id);
 	if (!r)
-		return get_invariant_sys_reg(reg->id, uaddr);
+		return get_invariant_sys_reg(vcpu->kvm, reg->id, uaddr);
 
 	if (r->get_user)
 		return (r->get_user)(vcpu, r, reg, uaddr);
@@ -2029,7 +2120,7 @@ int kvm_arm_sys_reg_set_reg(struct kvm_vcpu *vcpu, const struct kvm_one_reg *reg
 
 	r = index_to_sys_reg_desc(vcpu, reg->id);
 	if (!r)
-		return set_invariant_sys_reg(reg->id, uaddr);
+		return set_invariant_sys_reg(vcpu->kvm, reg->id, uaddr);
 
 	if (r->set_user)
 		return (r->set_user)(vcpu, r, reg, uaddr);

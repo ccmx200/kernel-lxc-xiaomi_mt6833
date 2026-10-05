@@ -81,6 +81,19 @@ struct kvm_arch {
 
 	/* Set to true when userspace wants ISV=0 aborts reported to it */
 	bool return_nisv_io_abort_to_user;
+
+	/*
+	 * Per-VM snapshot of the invariant ID registers, taken once in
+	 * kvm_arch_init_vm().
+	 *
+	 * On big.LITTLE these registers differ between clusters, but a guest
+	 * must see one coherent CPU model, and QEMU's read-then-write-back of
+	 * the host CPU model fails if the value differs between the core it
+	 * read on and the core it writes on.  Freezing the values once removes
+	 * both problems.  Index matches invariant_sys_regs[].
+	 */
+	u64 *id_regs_snapshot;
+	bool id_regs_snapshot_valid;
 };
 
 #define KVM_NR_MEM_OBJS     40
