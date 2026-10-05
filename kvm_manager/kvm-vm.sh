@@ -29,7 +29,10 @@
 # =============================================================================
 set -u
 
-CKVM_VERSION="1.10"
+CKVM_VERSION="1.11"
+# 1.11: the boot-pin workaround is no longer needed - the kernel
+#       now snapshots both the invariant sysregs and the demuxed
+#       CCSIDR registers per VM, verified on hardware.
 # 1.10: documentation - the device note is settled: everpal is another
 #       name for the same evergo device, not a second machine.
 # 1.9: documentation only - the device note said evergo and everpal were

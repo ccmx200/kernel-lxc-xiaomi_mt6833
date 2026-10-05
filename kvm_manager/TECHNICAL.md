@@ -1916,9 +1916,7 @@ A55 与 A76 的缓存不同，CCSIDR 必然不同，于是跨簇的读-写回和
 对 16 个 `CSSELR` 槽位同样在 `kvm_arch_init_vm()` 里取快照，
 `demux_c15_get()` / `demux_c15_set()` 都走快照。
 
-> **状态**：寄存器层面的成因**已实测定位**（上面 3 个 EINVAL 是实测值），
-> 修复**已实现并通过编译**，但**尚未刷入实测**。
-> 端到端的 8 vCPU 启动验证仍待完成。
+> **状态**：**已刷入实测通过**，见 12.13。
 
 #### 复现脚本
 
@@ -1934,6 +1932,67 @@ kvm_manager/tools/kvm_exhaustive.c    穷举全部寄存器，定位到 demux
 gcc -D_GNU_SOURCE -O0 -o kvm_exh kvm_exhaustive.c -lpthread
 ./kvm_exh
 ```
+
+### 12.13 demux 修复实测通过：不再需要绑核
+
+刷入含 demux 快照的内核（`4.14.356-Evergo-KVM-cuicanmx-v1.0`，
+`/proc/kallsyms` 可见 `kvm_arm_id_demux_snapshot`）后的实测结果。
+
+#### 1. 穷举寄存器扫描：3 个失败 -> 0 个失败
+
+同一个测试（`KVM_GET_REG_LIST` 枚举全部寄存器，逐个在 `cpu0` 读、
+在 `cpu6` 写回同值）：
+
+```text
+修复前:  checked 230 writable registers, 3 failed the cross-cluster write-back
+修复后:  checked 230 writable registers, 0 failed the cross-cluster write-back
+```
+
+之前失败的那 3 个正是 `KVM_REG_ARM_DEMUX`（CCSIDR）寄存器。
+
+#### 2. 不绑核启动 QEMU：从稳定失败变成稳定成功
+
+```text
+修复前  不绑核 -smp 1                0 / 5 成功
+修复后  不绑核 -smp 1                5 / 5 成功
+
+修复后  不绑核 -smp 8  2048MB       3 / 3 成功   ★
+修复后  绑 cpu6 -smp 8  2048MB      2 / 2 成功（对照）
+```
+
+`-smp 8` 跨 `0-7` 全核且**不绑核**能起来，是本项工作的原始目标。
+修复前同样配置的成功率是 6 次里 1~2 次（见 12.3）。
+
+#### 3. 结论
+
+`Failed to put registers after init: Invalid argument` 在本机上已消除。
+成因是**两处**核心依赖的比较：
+
+| 位置 | 比较对象 | 修复 |
+|---|---|---|
+| `set_invariant_sys_reg()` | `invariant_sys_regs[].val`（开机时某核） | 12.11 / `a76c36485` |
+| `demux_c15_set()` | `get_ccsidr()` → `read_sysreg(ccsidr_el1)`（当前核） | 12.12 / demux 快照 |
+
+只修前者不够 —— 这正是 12.12 纠正过的结论。
+
+#### 4. 对 ckvm 的影响
+
+`BOOT_CPU`（启动时钉单核、起来后再 `widen_affinity` 放开）这一整套
+workaround 在本内核上**已无必要**。
+不绑核直接以目标 `CPUSET` 启动即可。
+
+#### 5. 复现
+
+```bash
+# 设备上，需 root 与 /dev/kvm
+gcc -D_GNU_SOURCE -O0 -o kvm_exh kvm_exhaustive.c -lpthread
+./kvm_exh                       # 应输出 0 failed
+
+# 不绑核起 8 vCPU
+taskset -c 0-7 qemu-system-aarch64 -M virt,gic-version=3 -cpu max \
+    -accel kvm -smp 8 -m 2048 -display none
+```
+
 
 ## 附：本机原始测量记录
 
