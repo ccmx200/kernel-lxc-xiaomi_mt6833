@@ -29,7 +29,10 @@
 # =============================================================================
 set -u
 
-CKVM_VERSION="1.8"
+CKVM_VERSION="1.9"
+# 1.9: documentation only - the device note said evergo and everpal were
+#      the same machine; they are the Redmi Note 11T 5G and the Redmi
+#      Note 11 5G, two different devices.
 # 1.8: the mirror picker measures throughput on a 13MB Packages.gz, not
 #      latency on a 130KB Release file.  The latency version picked
 #      aliyun (lowest ping, slowest mirror) over tuna.
