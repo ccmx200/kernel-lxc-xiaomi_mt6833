@@ -59,6 +59,7 @@ int kvm_arm_sys_reg_set_reg(struct kvm_vcpu *vcpu, const struct kvm_one_reg *);
  * of which big.LITTLE cluster a vCPU thread happens to run on.
  */
 int kvm_arm_id_reg_snapshot(struct kvm *kvm);
+int kvm_arm_id_demux_snapshot(struct kvm *kvm);
 void kvm_arm_id_reg_snapshot_free(struct kvm *kvm);
 unsigned long kvm_arm_num_sys_reg_descs(struct kvm_vcpu *vcpu);
 

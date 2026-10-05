@@ -94,6 +94,14 @@ struct kvm_arch {
 	 */
 	u64 *id_regs_snapshot;
 	bool id_regs_snapshot_valid;
+
+	/*
+	 * Same idea for the demuxed AArch32 cache registers
+	 * (KVM_REG_ARM_DEMUX / CCSIDR).  Indexed by CSSELR: bit 0 is the
+	 * instruction/data selector, bits 1..3 the cache level.
+	 */
+	u32 id_demux_snapshot[16];
+	bool id_demux_snapshot_valid;
 };
 
 #define KVM_NR_MEM_OBJS     40

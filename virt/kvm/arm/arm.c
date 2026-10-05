@@ -146,6 +146,11 @@ int kvm_arch_init_vm(struct kvm *kvm, unsigned long type)
 	if (ret)
 		goto out_free_stage2_pgd;
 
+	/* Same for the demuxed AArch32 cache registers. */
+	ret = kvm_arm_id_demux_snapshot(kvm);
+	if (ret)
+		goto out_free_stage2_pgd;
+
 	/* Mark the initial VMID generation invalid */
 	kvm->arch.vmid_gen = 0;
 

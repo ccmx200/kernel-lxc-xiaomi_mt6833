@@ -1851,16 +1851,14 @@ qemu-system-aarch64: Failed to put registers after init: Invalid argument
 > **已刷入实测**，见 12.12 节。
 
 
-### 12.12 修复实测：跨簇读写不再失败
+### 12.12 第一版修复：必要但不充分
 
-12.11 证明了失败机制。这一节是刷入带修复内核后的**实测结果**，
-内核版本 `4.14.356-Evergo-KVM-cuicanmx-v1.0 #5`，
-`/proc/kallsyms` 里可见 `kvm_arm_id_reg_snapshot`。
+第一版修复（`a76c36485`）只处理了 sysreg 那一半（`invariant_sys_regs[]`）。
+刷入后实测，**它并不足以让 QEMU 跑起来**。
 
-#### 方法一：同一个 VM 跨核读，值应当一致
+#### 它确实修好了 sysreg 那一半
 
-创建一个 VM，然后起两个线程分别绑到 `cpu0`（A55）和 `cpu6`（A76），
-从**同一个 VM** 读同一批寄存器：
+同一个 VM 内，两个线程分别绑 `cpu0`（A55）和 `cpu6`（A76）读同一批寄存器：
 
 ```text
 register       read on cpu0         read on cpu6         same?
@@ -1870,60 +1868,72 @@ ID_ISAR0_EL1   0x0000000002101110   0x0000000002101110   YES
 CTR_EL0        0x000000009444c004   0x000000009444c004   YES
 ```
 
-修复前该测试必然出现两个不同的值（见 12.11）。
+并且「在 `cpu0` 读、把同一个值在 `cpu6` 写回」也全部成功。
 
-> **一个容易犯的测试错误**：如果在**两次独立运行**中分别绑不同的核，
-> 每次都会新建一个 VM，因而得到各自的快照值，看起来「没生效」。
-> 每个 VM 有独立快照是**正确**行为。
-> 必须**在同一个 VM 内**跨核读，才能验证这一点。
+> **踩过的坑**：如果在**两次独立运行**里分别绑核，每次都会新建 VM，
+> 因而各拿到自己的快照值，看起来像「没生效」。每个 VM 有独立快照是
+> **正确**行为 —— 验证必须在**同一个 VM 内**跨核进行。
 
-#### 方法二：复现 QEMU 的读-写回，但跨簇
+#### 但 QEMU 依然起不来
 
-这是决定性的一项。QEMU 的行为是「读宿主 CPU 模型，再原值写回」。
-下面在 `cpu0` 读一个值，然后把这个**一模一样的值**在 `cpu6` 上写回：
+对这个探测命令（`-M virt -cpu max -accel kvm -smp 1`）做 A/B 各 5 次：
 
 ```text
-register       read on                value              write back
-MIDR_EL1       cpu0 -> write cpu6     0x00000000412fd050 OK
-ID_PFR0_EL1    cpu0 -> write cpu6     0x0000000010000131 OK
-ID_PFR1_EL1    cpu0 -> write cpu6     0x0000000010011011 OK
-ID_ISAR0_EL1   cpu0 -> write cpu6     0x0000000002101110 OK
-CLIDR_EL1      cpu0 -> write cpu6     0x00000000c3000123 OK
-CTR_EL0        cpu0 -> write cpu6     0x0000000084448004 OK
+taskset -c 6    x5   全部启动成功
+taskset -c 0    x5   全部启动成功
+taskset -c 0-7  x5   Failed to put registers after init: Invalid argument  x5
 ```
 
-**修补前，`cpu6` 上的这一次写回必然 `EINVAL`**（12.11 已实测），
-因为内核拿它跟「开机那个核」的快照比对。
-现在六项全部 `OK`。
+**所以第一版修复不充分，12.12 最初的结论是错的。**
 
-`REVIDR_EL1` 在 `ID_PFR0_EL1` 之前一项返回 `ENOENT` ——
-该寄存器在这个内核上没有通过 `KVM_SET_ONE_REG` 暴露，与本次修复无关。
+#### 用穷举定位剩下的元凶
 
-#### 结论
+用 `KVM_GET_REG_LIST` 枚举该 vCPU 暴露的 **262 个寄存器**，
+对每一个做「`cpu0` 读、`cpu6` 写回同值」。结果只有 **3 个**失败：
 
-`Failed to put registers after init: Invalid argument` 的根因是
-「读依赖调用方所在核，写回比对的是开机那个核的记录」。
-修复让整个 VM 共用一份快照后，**该失败模式在寄存器操作层面已消失**。
+```text
+u32 proc=0x110000 0x110000   0x700fe01a   Invalid argument
+u32 proc=0x110000 0x110001   0x200fe01a   Invalid argument
+u32 proc=0x110000 0x110002   0x703fe01a   Invalid argument
+```
+
+`proc=0x110000` 是 **`KVM_REG_ARM_DEMUX`**，不是 sysreg（sysreg 是 `0x600000`），
+所以第一版的 sysreg 快照**从来没有覆盖它们**。
+
+`demux_c15_set()` 里有完全一样的核心依赖比较：
+
+```c
+/* This is also invariant: you can't change it. */
+if (newval != get_ccsidr(val))
+        return -EINVAL;
+```
+
+而 `get_ccsidr()` 是 `read_sysreg(ccsidr_el1)` —— **读的是执行它的那个核的缓存几何**。
+A55 与 A76 的缓存不同，CCSIDR 必然不同，于是跨簇的读-写回和 MIDR 一样必然失败。
+
+#### 第二版修复
+
+对 16 个 `CSSELR` 槽位同样在 `kvm_arch_init_vm()` 里取快照，
+`demux_c15_get()` / `demux_c15_set()` 都走快照。
+
+> **状态**：寄存器层面的成因**已实测定位**（上面 3 个 EINVAL 是实测值），
+> 修复**已实现并通过编译**，但**尚未刷入实测**。
+> 端到端的 8 vCPU 启动验证仍待完成。
 
 #### 复现脚本
 
-两个测试程序都已附在仓库里：
-
 ```text
-kvm_manager/tools/kvm_midr_repro.c   12.11 的失败复现（绑单核读写）
-kvm_manager/tools/kvm_crosstest.c    12.12 的跨核读写回验证
+kvm_manager/tools/kvm_midr_repro.c    12.11 的失败复现（绑单核读写）
+kvm_manager/tools/kvm_crosstest.c     跨核读-写回验证
+kvm_manager/tools/kvm_exhaustive.c    穷举全部寄存器，定位到 demux
 ```
 
-编译与运行（在设备上，需要 `root` 与 `/dev/kvm`）：
+编译运行（设备上，需 `root` 与 `/dev/kvm`）：
 
 ```bash
-gcc -D_GNU_SOURCE -O0 -o kvm_crosstest kvm_crosstest.c -lpthread
-./kvm_crosstest
+gcc -D_GNU_SOURCE -O0 -o kvm_exh kvm_exhaustive.c -lpthread
+./kvm_exh
 ```
-
-> **仍待验证**：本文尚未跑「不绑核的 8 vCPU QEMU 完整启动」。
-> 寄存器层面的失败模式已消除，但 `ckvm` 里的 `BOOT_CPU=6`（先钉单核再放开）
-> 尚未移除，所以端到端的确认还差一步。
 
 ## 附：本机原始测量记录
 

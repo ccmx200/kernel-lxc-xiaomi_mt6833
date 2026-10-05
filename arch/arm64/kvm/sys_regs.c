@@ -2030,7 +2030,38 @@ static bool is_valid_cache(u32 val)
 	}
 }
 
-static int demux_c15_get(u64 id, void __user *uaddr)
+/*
+ * Capture the demuxed cache registers for this VM.
+ *
+ * Like the sysreg snapshot, this runs once from kvm_arch_init_vm() so every
+ * subsequent read and write sees one value regardless of the core the caller
+ * is on.
+ */
+int kvm_arm_id_demux_snapshot(struct kvm *kvm)
+{
+	unsigned int i;
+
+	if (kvm->arch.id_demux_snapshot_valid)
+		return 0;
+
+	for (i = 0; i < ARRAY_SIZE(kvm->arch.id_demux_snapshot); i++)
+		kvm->arch.id_demux_snapshot[i] = is_valid_cache(i) ? get_ccsidr(i) : 0;
+
+	kvm->arch.id_demux_snapshot_valid = true;
+	return 0;
+}
+
+/* CCSIDR value for @csselr as this VM reports it. */
+static u32 demux_snapshot_value(struct kvm *kvm, u32 csselr)
+{
+	if (!kvm || !kvm->arch.id_demux_snapshot_valid ||
+	    csselr >= ARRAY_SIZE(kvm->arch.id_demux_snapshot))
+		return get_ccsidr(csselr);
+
+	return kvm->arch.id_demux_snapshot[csselr];
+}
+
+static int demux_c15_get(struct kvm *kvm, u64 id, void __user *uaddr)
 {
 	u32 val;
 	u32 __user *uval = uaddr;
@@ -2049,13 +2080,13 @@ static int demux_c15_get(u64 id, void __user *uaddr)
 		if (!is_valid_cache(val))
 			return -ENOENT;
 
-		return put_user(get_ccsidr(val), uval);
+		return put_user(demux_snapshot_value(kvm, val), uval);
 	default:
 		return -ENOENT;
 	}
 }
 
-static int demux_c15_set(u64 id, void __user *uaddr)
+static int demux_c15_set(struct kvm *kvm, u64 id, void __user *uaddr)
 {
 	u32 val, newval;
 	u32 __user *uval = uaddr;
@@ -2077,8 +2108,14 @@ static int demux_c15_set(u64 id, void __user *uaddr)
 		if (get_user(newval, uval))
 			return -EFAULT;
 
-		/* This is also invariant: you can't change it. */
-		if (newval != get_ccsidr(val))
+		/*
+		 * Also invariant, but compared against this VM's snapshot.
+		 * get_ccsidr() reads CCSIDR_EL1, whose value differs between
+		 * the A55 and A76 clusters; comparing against the live value
+		 * failed whenever the read and the write landed on different
+		 * clusters.
+		 */
+		if (newval != demux_snapshot_value(kvm, val))
 			return -EINVAL;
 		return 0;
 	default:
@@ -2092,7 +2129,7 @@ int kvm_arm_sys_reg_get_reg(struct kvm_vcpu *vcpu, const struct kvm_one_reg *reg
 	void __user *uaddr = (void __user *)(unsigned long)reg->addr;
 
 	if ((reg->id & KVM_REG_ARM_COPROC_MASK) == KVM_REG_ARM_DEMUX)
-		return demux_c15_get(reg->id, uaddr);
+		return demux_c15_get(vcpu->kvm, reg->id, uaddr);
 
 	if (KVM_REG_SIZE(reg->id) != sizeof(__u64))
 		return -ENOENT;
@@ -2113,7 +2150,7 @@ int kvm_arm_sys_reg_set_reg(struct kvm_vcpu *vcpu, const struct kvm_one_reg *reg
 	void __user *uaddr = (void __user *)(unsigned long)reg->addr;
 
 	if ((reg->id & KVM_REG_ARM_COPROC_MASK) == KVM_REG_ARM_DEMUX)
-		return demux_c15_set(reg->id, uaddr);
+		return demux_c15_set(vcpu->kvm, reg->id, uaddr);
 
 	if (KVM_REG_SIZE(reg->id) != sizeof(__u64))
 		return -ENOENT;
