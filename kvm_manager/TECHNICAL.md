@@ -1848,10 +1848,82 @@ qemu-system-aarch64: Failed to put registers after init: Invalid argument
 （见本仓库 `a76c36485`）。快照在任何 vCPU 存在之前建立，只有一个核参与，
 因此整个 VM 看到同一个 `MIDR_EL1`，写入不再因线程落点而失败。
 
-> **注意**：该修复**已在源码中实现并通过编译**，但**尚未刷入设备实测**。
-> 上一节的复现证明的是失败机制，不是修复效果 —— 要确认修复，需要刷入后
-> 在 `CPUSET=0-7` 上跑一个 8 vCPU 客户机。
+> **已刷入实测**，见 12.12 节。
 
+
+### 12.12 修复实测：跨簇读写不再失败
+
+12.11 证明了失败机制。这一节是刷入带修复内核后的**实测结果**，
+内核版本 `4.14.356-Evergo-KVM-cuicanmx-v1.0 #5`，
+`/proc/kallsyms` 里可见 `kvm_arm_id_reg_snapshot`。
+
+#### 方法一：同一个 VM 跨核读，值应当一致
+
+创建一个 VM，然后起两个线程分别绑到 `cpu0`（A55）和 `cpu6`（A76），
+从**同一个 VM** 读同一批寄存器：
+
+```text
+register       read on cpu0         read on cpu6         same?
+MIDR_EL1       0x00000000414fd0b0   0x00000000414fd0b0   YES
+ID_PFR0_EL1    0x0000000010010131   0x0000000010010131   YES
+ID_ISAR0_EL1   0x0000000002101110   0x0000000002101110   YES
+CTR_EL0        0x000000009444c004   0x000000009444c004   YES
+```
+
+修复前该测试必然出现两个不同的值（见 12.11）。
+
+> **一个容易犯的测试错误**：如果在**两次独立运行**中分别绑不同的核，
+> 每次都会新建一个 VM，因而得到各自的快照值，看起来「没生效」。
+> 每个 VM 有独立快照是**正确**行为。
+> 必须**在同一个 VM 内**跨核读，才能验证这一点。
+
+#### 方法二：复现 QEMU 的读-写回，但跨簇
+
+这是决定性的一项。QEMU 的行为是「读宿主 CPU 模型，再原值写回」。
+下面在 `cpu0` 读一个值，然后把这个**一模一样的值**在 `cpu6` 上写回：
+
+```text
+register       read on                value              write back
+MIDR_EL1       cpu0 -> write cpu6     0x00000000412fd050 OK
+ID_PFR0_EL1    cpu0 -> write cpu6     0x0000000010000131 OK
+ID_PFR1_EL1    cpu0 -> write cpu6     0x0000000010011011 OK
+ID_ISAR0_EL1   cpu0 -> write cpu6     0x0000000002101110 OK
+CLIDR_EL1      cpu0 -> write cpu6     0x00000000c3000123 OK
+CTR_EL0        cpu0 -> write cpu6     0x0000000084448004 OK
+```
+
+**修补前，`cpu6` 上的这一次写回必然 `EINVAL`**（12.11 已实测），
+因为内核拿它跟「开机那个核」的快照比对。
+现在六项全部 `OK`。
+
+`REVIDR_EL1` 在 `ID_PFR0_EL1` 之前一项返回 `ENOENT` ——
+该寄存器在这个内核上没有通过 `KVM_SET_ONE_REG` 暴露，与本次修复无关。
+
+#### 结论
+
+`Failed to put registers after init: Invalid argument` 的根因是
+「读依赖调用方所在核，写回比对的是开机那个核的记录」。
+修复让整个 VM 共用一份快照后，**该失败模式在寄存器操作层面已消失**。
+
+#### 复现脚本
+
+两个测试程序都已附在仓库里：
+
+```text
+kvm_manager/tools/kvm_midr_repro.c   12.11 的失败复现（绑单核读写）
+kvm_manager/tools/kvm_crosstest.c    12.12 的跨核读写回验证
+```
+
+编译与运行（在设备上，需要 `root` 与 `/dev/kvm`）：
+
+```bash
+gcc -D_GNU_SOURCE -O0 -o kvm_crosstest kvm_crosstest.c -lpthread
+./kvm_crosstest
+```
+
+> **仍待验证**：本文尚未跑「不绑核的 8 vCPU QEMU 完整启动」。
+> 寄存器层面的失败模式已消除，但 `ckvm` 里的 `BOOT_CPU=6`（先钉单核再放开）
+> 尚未移除，所以端到端的确认还差一步。
 
 ## 附：本机原始测量记录
 
