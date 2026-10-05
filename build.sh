@@ -414,7 +414,12 @@ SECONDS=0
 DATE="$(date '+%Y%m%d-%H%M')"
 DEVICE="${DEVICE:-evergo}"
 DEFCONFIG="${DEVICE}_defconfig"
-ZIPNAME="ReSukiSU-AdrenalinKernel-${DATE}.zip"
+# Artefact tag, taken from the kernel's own version string so the zip and
+# uname -r agree.  -Evergo-KVM-cuicanmx-v1.0 -> Evergo-KVM-cuicanmx-v1.0
+KERNEL_TAG="$(sed -n 's/^CONFIG_LOCALVERSION="-\{0,1\}\(.*\)"$/\1/p' \
+                  arch/arm64/configs/${DEFCONFIG} 2>/dev/null | head -1)"
+[ -n "$KERNEL_TAG" ] || KERNEL_TAG="kernel"
+ZIPNAME="ReSukiSU-${KERNEL_TAG}-${DATE}.zip"
 
 cleanup() {
     roll_stop 2>/dev/null || true

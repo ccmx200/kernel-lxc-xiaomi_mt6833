@@ -132,7 +132,7 @@ susfs4ksu-toco
 
 /out
 # ReSukiSU build artifacts
-/ReSukiSU-AdrenalinKernel-*.zip
+/ReSukiSU-*.zip
 /build-resukisu.log
 /AnyKernel3/
 /bgtest.log

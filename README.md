@@ -318,7 +318,7 @@ cd /root/kernel-lxc_xiaomi_mtk810_mt6833-resukisu
 
 ```text
 out/arch/arm64/boot/Image.gz
-ReSukiSU-AdrenalinKernel-YYYYMMDD-HHMM.zip
+ReSukiSU-Evergo-KVM-cuicanmx-v1.0-YYYYMMDD-HHMM.zip   (AnyKernel3 刷机包)
 ```
 
 ## 刷入

@@ -1764,6 +1764,95 @@ root / qemu-system-aarch64 / /dev/kvm / cloud-localds / firmware / free disk
 `widen_affinity` 改坏了，`ckvm selftest` 会当场失败。
 
 
+### 12.11 根因复现：MIDR_EL1 的写入为什么会被拒
+
+第 12.2 节把失败归因于「QEMU 在一种核上读、在另一种核上写回」。这一节是在真机上
+**直接复现**该机制的证据，不需要刷新内核。
+
+#### 硬件事实
+
+两颗簇的 `MIDR_EL1` 不同（读 `/sys/devices/system/cpu/cpuN/regs/identification/midr_el1`）：
+
+```text
+cpu0-5  (Cortex-A55)   midr_el1 = 0x00000000412fd050
+cpu6-7  (Cortex-A76)   midr_el1 = 0x00000000414fd0b0
+```
+
+#### 内核机制
+
+`arch/arm64/kvm/sys_regs.c` 里 `MIDR_EL1` 属于 invariant 表：
+
+```c
+static struct sys_reg_desc invariant_sys_regs[] = {
+        { SYS_DESC(SYS_MIDR_EL1), NULL, get_midr_el1 },
+        ...
+};
+
+static int set_invariant_sys_reg(struct kvm *kvm, u64 id, void __user *uaddr)
+{
+        ...
+        if (invariant_reg_value(kvm, r) != val)
+                return -EINVAL;
+```
+
+而表的内容由 `kvm_sys_reg_table_init()` **在开机时填一次**：
+
+```c
+#define FUNCTION_INVARIANT(reg)                                       \
+        static void get_##reg(struct kvm_vcpu *v,                     \
+                              const struct sys_reg_desc *r)           \
+        {                                                             \
+                ((struct sys_reg_desc *)r)->val = read_sysreg(reg);   \
+        }
+```
+
+`read_sysreg()` 读的是**执行它的那个核**。所以值是「开机时那个核」的，
+之后任何携带另一个簇数值的写入都会被 `-EINVAL` 拒绝。
+
+#### 实测复现
+
+一个最小的 KVM 程序（`KVM_CREATE_VM` → `KVM_ARM_VCPU_INIT` → `KVM_GET/SET_ONE_REG`）
+在两种绑核下运行，结果互为镜像：
+
+```text
+$ taskset -c 0 ./kvm_midr2          # 小核
+MIDR_EL1            read   -> OK  value=0x00000000412fd050
+MIDR_EL1  <- A55    write  -> OK
+MIDR_EL1  <- A76    write  -> EINVAL
+MIDR_EL1  <- junk   write  -> EINVAL
+
+$ taskset -c 6 ./kvm_midr2          # 大核
+MIDR_EL1            read   -> OK  value=0x00000000414fd0b0
+MIDR_EL1  <- A55    write  -> EINVAL
+MIDR_EL1  <- A76    write  -> OK
+```
+
+**读到的值跟着当前核变，写入只接受与当前核一致的值。**
+QEMU 的行为正是「在一次初始化里读一次、写一次」，只要这两步落在不同的簇上，
+写入必然 `-EINVAL` —— 这就是
+
+```text
+qemu-system-aarch64: Failed to put registers after init: Invalid argument
+```
+
+#### 顺带确认：失败的不是 ID_AA64* 寄存器
+
+同一程序里读 `ID_AA64PFR0_EL1` 与 `ID_AA64ISAR0_EL1` 都返回 **ENOENT**，
+因为它们不在 4.14 的 invariant 表里（表里只有 `MIDR_EL1`、`REVIDR_EL1`、
+`CLIDR_EL1`、`AIDR_EL1`、`CTR_EL0` 和一组 AArch32 的 `ID_PFR*/ID_MMFR*/ID_ISAR*`）。
+所以被拒的确实是 `MIDR_EL1` 这一类 invariant 寄存器，与第 12.2 节的判断一致。
+
+#### 修复
+
+`kvm_arch_init_vm()` 里按 VM 取一次快照，读写都走这份快照
+（见本仓库 `a76c36485`）。快照在任何 vCPU 存在之前建立，只有一个核参与，
+因此整个 VM 看到同一个 `MIDR_EL1`，写入不再因线程落点而失败。
+
+> **注意**：该修复**已在源码中实现并通过编译**，但**尚未刷入设备实测**。
+> 上一节的复现证明的是失败机制，不是修复效果 —— 要确认修复，需要刷入后
+> 在 `CPUSET=0-7` 上跑一个 8 vCPU 客户机。
+
+
 ## 附：本机原始测量记录
 
 CPU 拓扑（`/proc/cpuinfo`）：
