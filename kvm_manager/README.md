@@ -442,6 +442,45 @@ ckvm disable ubuntu26
 
 ---
 
+## guest 内部优化：`ckvm tune`
+
+apt 慢不在下载 —— 实测下载 5.1 MB/s，而**每次安装后要跑几个钩子**。
+`ckvm tune` 一次关掉它们，并**当场测出前后差异**：
+
+```bash
+ckvm tune ubuntu2604              # 应用并测速
+ckvm tune ubuntu2604 --status     # 看当前状态
+ckvm tune ubuntu2604 --revert     # 全部还原
+```
+
+```text
+  🔧 guest 内部优化
+  先测一个基准（装一个小包）
+  基准 install: 9.56 秒
+  禁用 99update-notifier hook（apt-check 每次 apt 都跑）
+  删除翻译索引（apt 用不到）
+  禁用 man-db trigger（每次装包重建 man 索引）
+  · needrestart 未安装，跳过
+  再测一次
+  优化后 install: 6.21 秒
+
+  ✅ 快了 3.36 秒（35%）
+```
+
+### 它改了什么
+
+| 项 | 为什么 |
+|---|---|
+| `99update-notifier` hook | 每次 apt 后跑 `apt-check`，扫描整个 dpkg 库（实测 2.8 秒）|
+| 翻译索引 | apt 解析用不到，占 32 MB |
+| `man-db` trigger | 每次装包重建 man 索引（9777 个页面 × 26 语言）|
+| `needrestart` | 每次 apt 后扫描**所有运行中的进程**（装了才处理）|
+
+**全部可还原**，`--revert` 一条命令撤销。`needrestart` 不会被装回来 ——
+它本来就是个可选的通知工具。
+
+---
+
 ## 命令一览
 
 ```bash

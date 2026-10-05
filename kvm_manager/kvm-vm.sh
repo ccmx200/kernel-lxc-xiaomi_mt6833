@@ -29,7 +29,9 @@
 # =============================================================================
 set -u
 
-CKVM_VERSION="1.13"
+CKVM_VERSION="1.14"
+# 1.14: `ckvm tune` for guest-side apt speed-ups, plus emoji
+#       and richer status output throughout.
 # 1.13: port-mapping editor with presets, nano by default,
 #       selectable disk cache mode, more feedback.
 # 1.12: shared base-image cache (one download for many guests),
@@ -147,15 +149,15 @@ fi
 # Shown once at startup so the name and author are always visible.
 banner() {
     [ -t 1 ] || return 0
-    printf '\n  %sckvm%s %s·%s KVM 虚拟机管理器 %s%s%s\n' \
-           "$C_B" "$C_RST" "$C_DIM" "$C_RST" "$C_DIM" "$CKVM_VERSION" "$C_RST"
-    printf '  %s作者  %s%s璀璨梦星 · cuicanmx%s   %s%s%s\n\n' \
+    printf '\n  %s🚀%s %sckvm%s %s·%s KVM 虚拟机管理器 %s%s%s\n' \
+           "$C_C" "$C_RST" "$C_B" "$C_RST" "$C_DIM" "$C_RST" "$C_DIM" "$CKVM_VERSION" "$C_RST"
+    printf '     %s作者  %s%s璀璨梦星 · cuicanmx%s   %s%s%s\n\n' \
            "$C_DIM" "$C_RST" "$C_AUTHOR" "$C_RST" "$C_DIM" "$CKVM_HOME" "$C_RST"
 }
 
 
-warn() { printf '  ! %s\n' "$*" >&2; }
-die()  { printf '  ERROR: %s\n' "$*" >&2; exit 1; }
+warn() { printf '  %s⚠️%s  %s\n' "$C_Y" "$C_RST" "$*" >&2; }
+die()  { printf '  %s❌ %s%s\n' "$C_R" "$*" "$C_RST" >&2; exit 1; }
 need_root() { [ "$(id -u)" = 0 ] || die "run as root"; }
 
 # colour only when it makes sense
@@ -172,7 +174,7 @@ UI_ACTIVE=0
 # print one dim line and look like nothing happened.
 ok_flash() {
     [ "$IS_TTY" = 1 ] || { say "$1"; return 0; }
-    printf '  %s✓%s %s%s%s\n' "$C_G" "$C_RST" "$C_B" "$1" "$C_RST"
+    printf '  %s✅%s %s%s%s\n' "$C_G" "$C_RST" "$C_B" "$1" "$C_RST"
 }
 
 # Copy a file with a byte progress bar.  Falls back to a plain cp when not on
@@ -444,7 +446,7 @@ install_firmware() {
     mkdir -p "$CKVM_FWDIR"
     # installing from the destination itself is a no-op, not an error
     if [ "$(readlink -f "$src")" = "$(readlink -f "$CKVM_FWDIR/edk2_qemu_aarch64_nonvram.fd" 2>/dev/null)" ]; then
-        say "firmware already in $CKVM_FWDIR"
+        say "📦 固件已在 $CKVM_FWDIR"
         return 0
     fi
     cp -f "$src" "$CKVM_FWDIR/edk2_qemu_aarch64_nonvram.fd"
@@ -453,7 +455,7 @@ install_firmware() {
     for v in "$d/edk2_vars.fd" /root/limbo_fw/edk2_vars.fd; do
         [ -f "$v" ] && { cp -f "$v" "$CKVM_FWDIR/edk2_vars.fd"; break; }
     done
-    say "firmware installed into $CKVM_FWDIR"
+    ok_flash "UEFI 固件已安装到 $CKVM_FWDIR"
 }
 
 
@@ -1404,7 +1406,7 @@ cmd_cache() {
             return 0 ;;
     esac
 
-    printf '\n  %s%s镜像缓存%s  %s%s%s\n\n' "$C_B" "$C_C" "$C_RST" "$C_DIM" "$dir" "$C_RST"
+    printf '\n  %s💾 镜像缓存%s  %s%s%s\n\n' "$C_B" "$C_RST" "$C_DIM" "$dir" "$C_RST"
 
     if [ ! -d "$dir" ] || [ -z "$(ls -A "$dir" 2>/dev/null)" ]; then
         printf '  %s（空）— 下一次 ckvm create 会在这里缓存基础镜像%s\n\n' "$C_DIM" "$C_RST"
@@ -1607,7 +1609,7 @@ EOF
     cp -f "$CKVM_FWDIR/edk2_vars.fd" "$d/uefi-vars.fd"
 
     printf '\n'
-    say "已创建 '$name'  (Ubuntu $rel, $port 端口, ${cpus} vCPU, ${mem} MiB, ${disk}G)"
+    ok_flash "已创建 '$name'  (Ubuntu $rel, $port 端口, ${cpus} vCPU, ${mem} MiB, ${disk}G)"
     say "network: $net_mode${forwards:+ (forwards: $forwards)}"
     say "disk cache: $cache_mode"
     say "download backend: $(download_pick_backend)"
@@ -1622,7 +1624,7 @@ EOF
     make_seed "$name"
     say "物理核心: $(cores_to_label "$cpuset")"
     printf '\n'
-    say "启动： ckvm start $name"
+    printf '  %s🎉%s 启动它： %sckvm start %s%s\n' "$C_G" "$C_RST" "$C_B" "$name" "$C_RST"
 }
 
 cmd_help_ports() {
@@ -1660,6 +1662,7 @@ EOF
 # Always a plain listing.  The interactive picker lives in `ckvm create`,
 # so calling versions from a script must never block on stdin.
 cmd_versions() {
+    printf '\n  %s📋 可用的 Ubuntu 版本%s\n\n' "$C_B" "$C_RST"
     printf '  %-8s %-12s %-5s %s\n' VERSION CODENAME LTS SIZE
     while IFS='|' read -r ver code lts size; do
         [ -n "$ver" ] || continue
@@ -1770,7 +1773,8 @@ cmd_start() {
     fi
     # only needed when we deliberately started on a narrower set
     [ -n "${BOOT_CPU:-}" ] && [ "$BOOT_CPU" != "$CPUSET" ] && widen_affinity "$p"
-    say "guest '$name' running (pid $p, ${CPUS} vCPU, ${MEM} MiB, cpuset $CPUSET)"
+    printf '  %s▶%s guest %s%s%s 运行中 (pid %s, %s vCPU, %s MiB, cpuset %s)\n' \
+           "$C_G" "$C_RST" "$C_B" "$name" "$C_RST" "$p" "$CPUS" "$MEM" "$CPUSET"
 
     # Boot takes ~30s, and until sshd is up an immediate `ssh` gets
     # "Connection reset by peer".  Wait for the banner so start only reports
@@ -1924,7 +1928,7 @@ cmd_stop() {
         kill -0 "$p" 2>/dev/null && kill -9 "$p" 2>/dev/null
         rm -f "$(vm_pid "$name")"
         tap_down "$name" >/dev/null 2>&1
-        say "guest '$name' stopped"
+        printf '  %s⏹%s guest %s%s%s 已停止\n' "$C_DIM" "$C_RST" "$C_B" "$name" "$C_RST"
     else
         say "guest '$name' is not running"
         rm -f "$(vm_pid "$name")"
@@ -2067,6 +2071,153 @@ cmd_console() {
     fi
     # tail -F (capital) survives log rotation/recreation
     tail -c +$(( $(stat -c%s "$log") + 1 )) -F "$log" 2>/dev/null | strip_serial
+}
+
+# ---------------------------------------------------------------------------
+# ckvm tune <name> - guest-side speed-ups
+# ---------------------------------------------------------------------------
+
+# SSH into a guest using the credentials recorded in its vm.conf.
+guest_ssh() {
+    local name="$1"; shift
+    local user pass
+    load_vm "$name"
+    user="${VM_USER:-ubuntu}"; pass="${VM_PASS:-}"
+    [ "$user" = "root" ] || user="${VM_USER:-ubuntu}"
+    if [ -z "$pass" ]; then
+        warn "该 guest 没记录密码，无法自动执行"
+        return 1
+    fi
+    # user-mode NAT publishes guest 22 on PORT
+    sshpass -p "$pass" ssh -o StrictHostKeyChecking=no \
+        -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR \
+        -o ConnectTimeout=10 -p "${PORT}" "${user}@127.0.0.1" "$@"
+}
+
+# Run something as root inside the guest.
+guest_root() {
+    local name="$1"; shift
+    local user pass cmd
+    load_vm "$name"
+    user="${VM_USER:-ubuntu}"; pass="${VM_PASS:-}"
+    [ -n "$pass" ] || { warn "无密码，跳过"; return 1; }
+    if [ "$user" = "root" ]; then
+        guest_ssh "$name" "$@"
+    else
+        guest_ssh "$name" "echo '$pass' | sudo -S $*"
+    fi
+}
+
+# Time one apt install inside the guest, to show a real before/after.
+guest_time_pkg_install() {
+    local name="$1" pkg="${2:-bc}"
+    load_vm "$name"
+    # One remote bash invocation.  Splitting this across separate statements
+    # loses the assignments, which is why the first version always measured
+    # an already-installed package and reported ~1.8s regardless.
+    guest_root "$name" "bash -c '
+        set -e
+        PKG=\"$pkg\"
+        export DEBIAN_FRONTEND=noninteractive
+        apt-get remove -y --purge \$PKG >/dev/null 2>&1 || true
+        apt-get install -y --download-only \$PKG >/dev/null 2>&1 || true
+        sync
+        T0=\$(date +%s.%N)
+        apt-get install -y \$PKG >/dev/null 2>&1 || true
+        T1=\$(date +%s.%N)
+        echo \$T1 - \$T0 | bc
+    '" 2>/dev/null | tr -d '\r' | tail -1
+}
+
+TUNE_MARK_BEGIN="# >>> ckvm tune >>>"
+TUNE_MARK_END="# <<< ckvm tune <<<"
+
+cmd_tune() {
+    need_root
+    local name="$1" mode="${2:-}"
+    [ -n "$name" ] || die "用法: ckvm tune <名字> [--revert|--status]"
+    load_vm "$name"
+    running_pid "$name" >/dev/null || die "guest '$name' 没在运行"
+    command -v sshpass >/dev/null 2>&1 || die "需要 sshpass（apt-get install sshpass）"
+
+    case "$mode" in
+    --status)
+        printf '\n  %s%s 的 guest 内部优化状态%s\n\n' "$C_B" "$name" "$C_RST"
+        local st
+        st=$(guest_root "$name"              "test -f /etc/apt/apt.conf.d/99update-notifier && echo 开 || echo 关" 2>/dev/null | tr -d '\r')
+        printf '  99update-notifier hook  %s\n' "${st:-未知}"
+        st=$(guest_root "$name"              "test -f /etc/apt/apt.conf.d/99update-notifier.disabled && echo 已禁用 || echo 正常" 2>/dev/null | tr -d '\r')
+        printf '  hook 文件状态           %s\n' "${st:-未知}"
+        st=$(guest_root "$name" "ls /var/lib/apt/lists/*Translation* 2>/dev/null | wc -l" 2>/dev/null | tr -d '\r')
+        printf '  翻译索引                %s 个\n' "${st:-?}"
+        st=$(guest_root "$name" "du -sh /var/lib/apt/lists 2>/dev/null | cut -f1" 2>/dev/null | tr -d '\r')
+        printf '  apt lists 大小          %s\n' "${st:-?}"
+
+        st=$(guest_root "$name" \
+             "dpkg -s needrestart >/dev/null 2>&1 && echo 装了 || echo 没装" 2>/dev/null | tr -d '\r')
+        printf '  needrestart             %s\n' "${st:-?}"
+        printf '\n'
+        return 0 ;;
+    --revert)
+        say "恢复 $name 的 apt 行为..."
+        guest_root "$name" "mv -f /etc/apt/apt.conf.d/99update-notifier.disabled /etc/apt/apt.conf.d/99update-notifier 2>/dev/null; \
+            test -f /var/lib/dpkg/info/man-db.triggers.ckvmbak && mv -f /var/lib/dpkg/info/man-db.triggers.ckvmbak /var/lib/dpkg/info/man-db.triggers; \
+            echo done" >/dev/null 2>&1
+        ok_flash "已恢复 hook 与 man-db trigger"
+        say "  （needrestart 没有被装回来；它本来就是个可选的通知工具）"
+        return 0 ;;
+    esac
+
+    printf '\n  %s🔧 guest 内部优化%s\n' "$C_B" "$C_RST"
+
+    # ---- before ------------------------------------------------------
+    say "先测一个基准（装一个小包）"
+    local before
+    before=$(guest_time_pkg_install "$name" hello 2>/dev/null | tr -d '\r' | tail -1)
+    [ -n "$before" ] && printf '  %s基准 install: %s 秒%s\n' "$C_DIM" "$before" "$C_RST" \
+                      || say "  （测不出基准，继续）"
+
+    # ---- apply -------------------------------------------------------
+    spin "禁用 99update-notifier hook（apt-check 每次 apt 都跑）" \
+        guest_root "$name" "mv -f /etc/apt/apt.conf.d/99update-notifier /etc/apt/apt.conf.d/99update-notifier.disabled 2>/dev/null; true"
+
+    spin "删除翻译索引（apt 用不到）" \
+        guest_root "$name" "rm -f /var/lib/apt/lists/*Translation* 2>/dev/null; true"
+
+    spin "禁用 man-db trigger（每次装包重建 man 索引）" \
+        guest_root "$name" "test -f /var/lib/dpkg/info/man-db.triggers && mv -f /var/lib/dpkg/info/man-db.triggers /var/lib/dpkg/info/man-db.triggers.ckvmbak 2>/dev/null; true"
+
+    # needrestart walks every running process after each apt operation.  Not
+    # present in every image, so only act when it is.
+    if guest_root "$name" "dpkg -s needrestart >/dev/null 2>&1" >/dev/null 2>&1; then
+        spin "移除 needrestart（每次 apt 后扫描所有进程）" \
+            guest_root "$name" "bash -c 'DEBIAN_FRONTEND=noninteractive apt-get purge -y needrestart >/dev/null 2>&1 || true; true'"
+    else
+        printf '  %s·%s needrestart 未安装，跳过\n' "$C_DIM" "$C_RST"
+    fi
+
+    # ---- after -------------------------------------------------------
+    say "再测一次"
+    local after
+    after=$(guest_time_pkg_install "$name" hello 2>/dev/null | tr -d '\r' | tail -1)
+    [ -n "$after" ] && printf '  %s优化后 install: %s 秒%s\n' "$C_G" "$after" "$C_RST" \
+                    || say "  （测不出结果）"
+
+    if [ -n "$before" ] && [ -n "$after" ]; then
+        awk -v b="$before" -v a="$after" 'BEGIN{
+            d = b - a;
+            pct = (b > 0) ? d*100/b : 0;
+            if (d > 0.5)
+                printf "\n  \033[1;32m✅ 快了 %.2f 秒（%.0f%%）\033[0m\n", d, pct;
+            else if (d > 0)
+                printf "\n  \033[1;33m⚠️  快了 %.2f 秒，但在噪声范围内\033[0m\n", d;
+            else
+                printf "\n  \033[1;33m⚠️  没有变快（%.2f -> %.2f）；这台 guest 可能本来就没装那些钩子\033[0m\n", b, a;
+        }'
+    fi
+
+    printf '\n  %s恢复原样: ckvm tune %s --revert%s\n' "$C_DIM" "$name" "$C_RST"
+    printf '  %s查看状态: ckvm tune %s --status%s\n\n' "$C_DIM" "$name" "$C_RST"
 }
 
 cmd_rm() {
@@ -2701,6 +2852,12 @@ ckvm $CKVM_VERSION - KVM guest manager (MT6833 / evergo)
   ckvm image <name>                (re)download the guest image
   ckvm start <name> [-f]           start (foreground with -f)
   ckvm stop|restart <name>
+  ckvm tune <name> [--revert]      speed up apt INSIDE a running guest:
+                                   disable the update-notifier hook (apt-check
+                                   runs after every apt operation), drop the
+                                   translation indexes, disable the man-db
+                                   trigger.  Measures before and after.
+                                   --status to inspect, --revert to undo.
   ckvm list                        all guests and their state
   ckvm status <name>               detail + serial tail
   ckvm console <name>              follow the serial console
@@ -2761,6 +2918,7 @@ case "${1:-help}" in
     create)    shift; cmd_create "$@" ;;
     image)     shift; cmd_image "$@" ;;
     cache)     shift; cmd_cache "$@" ;;
+    tune)      shift; cmd_tune "$@" ;;
     versions|list-releases|releases) cmd_versions ;;
     ports|fwd)  cmd_help_ports ;;
     start)     shift; cmd_start "$@" ;;
