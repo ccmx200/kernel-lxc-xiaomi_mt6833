@@ -29,7 +29,9 @@
 # =============================================================================
 set -u
 
-CKVM_VERSION="1.9"
+CKVM_VERSION="1.10"
+# 1.10: documentation - the device note is settled: everpal is another
+#       name for the same evergo device, not a second machine.
 # 1.9: documentation only - the device note said evergo and everpal were
 #      the same machine; they are the Redmi Note 11T 5G and the Redmi
 #      Note 11 5G, two different devices.

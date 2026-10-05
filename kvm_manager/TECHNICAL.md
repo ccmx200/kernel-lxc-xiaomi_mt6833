@@ -1445,13 +1445,12 @@ EL2 就重新归内核所有，`CONFIG_ARM64_VHE` 与 KVM 才有落脚点。
 两条路径的其余部分（`ESR_EL2.ISV == 0`、NISV 回移、绑核、固件选择）与本节
 正交，不因 GZ 是否禁用而改变。
 
-> **设备代号的说明**：本文的实测数据来自 **Redmi Note 11T 5G（MT6833，代号
-> `evergo`）** —— 本仓库的 DTS 就是 `arch/arm64/boot/dts/mediatek/evergo.dts`，
-> 所以第 1 章的环境、第 9 章的测量、第 12 章的拓扑都是这一台。
+> **设备代号的说明**：本文的实测数据全部来自**同一台设备** —— MT6833，
+> 代号 `evergo`（本仓库的 DTS 是 `evergo.dts`）。文档与版本号里也出现过
+> `everpal`，那是**同一个东西的另一个名字**，不是第二台机器。
 >
-> `everpal` 是**另一台设备**（Redmi Note 11 5G），在
-> [Xiaomi-MT6833](https://github.com/Xiaomi-MT6833) 下有独立的 kernel 与
-> device 仓库。两者同属 MT6833 但不是同一款手机，**不要混用**。
+> 第 1 章的环境、第 9 章的测量、第 11 章的 GenieZone、第 12 章的 CPU 拓扑，
+> 指的都是这一台。不需要维护两份设备档案。
 
 ### 11.11 致谢（重申）
 
