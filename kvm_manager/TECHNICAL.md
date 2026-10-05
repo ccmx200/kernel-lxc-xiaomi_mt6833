@@ -24,15 +24,17 @@
 2. [核心障碍：ESR_EL2.ISV == 0](#2-核心障碍esr_el2isv--0)
 3. [内核回移](#3-内核回移)
 4. [固件：为什么必须是不写 NVRAM 的 EDK2](#4-固件为什么必须是不写-nvram-的-edk2)
-5. [big.LITTLE 与 CPU 绑核](#5-biglittle-与-cpu-绑核)
+5. [big.LITTLE 与 CPU 使用](#5-biglittle-与-cpu-使用)
 6. [网络：user 与 tap 两种模式](#6-网络user-与-tap-两种模式)
 7. [下载子系统](#7-下载子系统)
 8. [systemd 与安装流程](#8-systemd-与安装流程)
 9. [实测数据集](#9-实测数据集)
 10. [参考出处](#10-参考出处)
 11. [在红米 Note 11 5G（MT6833）上禁用 GenieZone 并释放 EL2](#11-在红米-note-11-5gmt6833上禁用-geniezone-并释放-el2)
-12. [vCPU 数量与物理核绑定](#12-vcpu-数量与物理核绑定)
-13. [自检：装完为什么要真启一台虚拟机](#13-自检装完为什么要真启一台虚拟机)
+12. [物理核使用：从"必须绑核"到"随便配"](#12-物理核使用从必须绑核到随便配) ← **核心章节**
+13. [自检：为什么装完要真启一台虚拟机](#13-自检为什么装完要真启一台虚拟机)
+14. [镜像缓存](#14-镜像缓存)
+15. [附：本机原始测量记录](#附本机原始测量记录)
 
 ---
 
@@ -368,19 +370,20 @@ dmesg 中 NISV abort 计数 = 0
 
 ---
 
-## 5. big.LITTLE 与 CPU 绑核
+## 5. big.LITTLE 与 CPU 使用
 
-### 5.1 现象
+这台机器是 big.LITTLE（6×A55 + 2×A76），两种核心暴露的 ID 寄存器不同，
+早期会让 QEMU 随机启动失败。
 
-不绑核时 QEMU 报：
+**完整分析、修复实现和实测见 [§12](#12-物理核使用从必须绑核到随便配)。**
+这一节只保留 QEMU 侧的出处和一句结论。
 
-```text
-qemu-system-aarch64: Failed to put registers after init: Invalid argument
-```
+### 5.1 结论
 
-且**时好时坏**。
+**早期**必须把虚拟机钉死在单一种核心上；**现在不需要了** —— 内核按 VM
+快照了这两类寄存器，CPU 掩码可以任意配置（实测 21/21，见 §12.7）。
 
-### 5.2 根因
+### 5.2 QEMU 侧的出处
 
 这条报错来自 QEMU 的 `write_list_to_kvmstate()`。该函数在补丁
 *"arm/kvm: report registers we failed to set"*（Cornelia Huck，2025-09）中
@@ -410,34 +413,6 @@ qemu-system-aarch64: Failed to put registers after init: Invalid argument
 ```
 
 本机型两种核心的 ID 寄存器视图**确实不同**（见 §1.1 的 `CPU part` 实测）。
-
-### 5.3 验证
-
-同一套配置各跑 3 次：
-
-```text
-taskset -c 6-7    ->  3 成功 / 0 失败
-不绑核            ->  0 成功 / 3 失败
-```
-
-### 5.4 关于 vCPU 数量
-
-绑核之前观察到 `-smp 8` 会让固件断言
-（`ASSERT [ArmPlatformPrePeiCore]`），曾误判为"固件不支持 8 核"。
-
-**实测证明并非如此。** 绑核后：
-
-```text
--smp 2 / 4 / 6 / 8   全部启动，assert=0
--smp 8 完整启动到登录提示
-guest 内：smp: Brought up 1 node, 8 CPUs
-         SMP: Total of 8 processors activated
-```
-
-之前的断言是**同一个绑核问题的另一种表现**。
-
-> 注意：8 个 vCPU 压在 2 个物理大核（`CPUSET=6-7`）上属于超卖，吞吐好但
-> 单核延迟会变差。
 
 ---
 
@@ -1463,242 +1438,462 @@ preloader 代码、不破坏签名验证的前提下，成功禁用 GenieZone �
 
 ---
 
-## 12. vCPU 数量与物理核绑定
+## 12. 物理核使用：从"必须绑核"到"随便配"
 
-第 5 节记录了「QEMU 必须绑核，否则 `Failed to put registers after init:
-Invalid argument`」。本节是那次结论的完整展开：**到底能开多少 vCPU、能用到
-几个物理核、以及怎么绕过启动失败**。全部数据为本机实测。
+这一章是本项目最核心的一段。它解释**为什么早期必须把虚拟机钉死在单一种
+核心上**、**根因到底是什么**、**怎么修的**，以及**修好之后 CPU 能怎么配**。
+
+结论先行：
+
+| | 修复前 | 修复后 |
+|---|---|---|
+| CPU 掩码 | 只能单簇（如 `6-7`） | **任意掩码**，混合簇也行 |
+| `-smp 8` 不绑核 | 6 次成功 1–2 次 | **3/3** |
+| `ckvm` 需要 workaround | 是（`BOOT_CPU` + `widen_affinity`） | **否** |
 
 ### 12.1 硬件拓扑
 
-`/proc/device-tree/cpus/` 与 `cpu_capacity` 确认是两颗不同的核：
+`/proc/device-tree/cpus/` 实测：
 
 ```text
-cpu0-cpu5   arm,cortex-a55   capacity 367    max 2.00 GHz   小核
-cpu6-cpu7   arm,cortex-a76   capacity 1024   max 2.40 GHz   大核
+cpu0-5   Cortex-A55   capacity 367    max 2.0 GHz    6 个
+cpu6-7   Cortex-A76   capacity 1024   max 2.4 GHz    2 个
 ```
 
-注意 `lscpu` 只报告 A55 簇（显示 `CPU(s): 8` 但 `Model name` 是 A55、
-`Core(s) per socket: 6`），容易误判整机核数，设备树才是准的。
+两种核心的 **`MIDR_EL1` 不同**：
 
-### 12.2 失败现象与真实原因
+```text
+cpu0-5 (A55)   midr_el1 = 0x00000000412fd050
+cpu6-7 (A76)   midr_el1 = 0x00000000414fd0b0
+```
 
-失败时 QEMU 立刻退出：
+> `lscpu` 在这台机器上会误报成清一色的 A55（`CPU(s): 8`，
+> `Core(s) per socket: 6`），因为它只读了第一个簇。要看真实拓扑用
+> `/sys/devices/system/cpu/cpu*/cpu_capacity`。
+
+**核心差异不止 MIDR。** 用 `KVM_GET_ONE_REG` 逐核实测：
+
+```text
+               cpu0 (A55)           cpu6 (A76)
+MIDR_EL1       0x00000000412fd050   0x00000000414fd0b0
+ID_PFR0_EL1    0x0000000010000131   0x0000000010010131
+CTR_EL0        0x0000000084448004   0x000000009444c004
+CCSIDR(csselr=0) 0x700fe01a         0x200fe01a
+```
+
+### 12.2 症状
+
+不加限制地启动 QEMU，会随机失败：
 
 ```text
 qemu-system-aarch64: Failed to put registers after init: Invalid argument
 ```
 
-这段来自 `kvm_arch_put_registers()`：KVM 用 `KVM_SET_ONE_REG` 写通用寄存器
-失败时打印。**它发生在 vCPU 初始化早期**，因此与 vCPU *数量*无关（12.3 的
-数据可以证明）。
-
-根因是 big.LITTLE：QEMU 在一个线程上探测宿主 CPU 特性（`KVM_GET_ONE_REG`
-等），随后该线程被调度到**另一种微架构**的核上写回，两组核的 `ID_AA64*`
-特性寄存器不同，KVM 返回 `EINVAL`。推论：
-
-* 只要允许 vCPU 线程在**两个簇之间迁移**，就有概率失败；
-* 绑到**单一簇内**（`6-7` 或 `0-5`）完全稳定。
-
-### 12.3 成功率实测（每组重复 6 次）
+有时固件更早就崩：
 
 ```text
--smp 1              mask 0-7     4/6
--smp 2              mask 0-7     1/6
--smp 4              mask 0-7     2/6
--smp 8              mask 0-7     2/6
--smp 2,maxcpus=8    mask 0-7     2/6
--smp 8              mask 6-7     6/6     <- 同一簇内
--smp 1              mask 6       6/6
--smp 1              mask 0       6/6
--smp 4              mask 0-5     6/6
+ASSERT [ArmPlatformPrePeiCore]
 ```
 
-**要点：**
-
-1. 失败是**不确定的** —— 同一命令 6 次里成功次数不同。所以「`-smp 2 / 4 / 6 / 8`
-   全部启动，assert=0」这种结论只有在**受限掩码**下才成立，跨簇时是运气。
-2. `-smp 1` 失败 2/6 而 `-smp 2` 只成功 1/6，说明它**不是**「核数越多越容易挂」，
-   是纯粹的调度竞态。
-3. 固件断言 `ASSERT [ArmPlatformPrePeiCore]` 是同一竞态更早触发的表现 ——
-   固件先死，还轮不到 KVM 报错。两者同源。
-
-### 12.4 解决方案：启动时单核，起来后放开
-
-这是 Limbo 的「100% Success Mode」同一思路，本机实测有效。
-
-**做法：** 让 QEMU 进程在 vCPU 初始化期间只允许在**一个核**上运行，等 guest
-起来后再把亲和性放开到全部 8 个核。vCPU 线程创建时继承进程亲和性，之后对每个
-线程单独放开即可。
-
-```sh
-# 启动阶段：钉在 core 6
-taskset -c 6 qemu-system-aarch64 ... -smp 8 ...
-# guest 起来后，放开每个线程
-for t in /proc/$QPID/task/*; do taskset -pc 0-7 "$(basename $t)"; done
-```
-
-**实测（每种 5 次）：**
+**成功率实测（每组 6 次）：**
 
 ```text
-boot@6 -> 扩到 0-7      5/5 全部启动并激活 8 个 vCPU
-直接绑 0-7 启动         1/5（4 次启动即失败，1 次启动后卡住）
+掩码 0-7     smp 1    4 / 6
+掩码 0-7     smp 2    1 / 6
+掩码 0-7     smp 4    2 / 6
+掩码 0-7     smp 8    2 / 6
+掩码 6-7     smp 8    6 / 6      <- 单一簇
+掩码 0-5     smp 4    6 / 6      <- 单一簇
+单核                 6 / 6
 ```
 
-guest 内确认：
+**不是 vCPU 数量的问题，是掩码是否跨簇的问题。**
+
+### 12.3 根因（一）：invariant 寄存器被钉在开机那个核上
+
+`arch/arm64/kvm/sys_regs.c` 里有一张 invariant 表：
+
+```c
+static struct sys_reg_desc invariant_sys_regs[] = {
+        { SYS_DESC(SYS_MIDR_EL1),   NULL, get_midr_el1 },
+        { SYS_DESC(SYS_REVIDR_EL1), NULL, get_revidr_el1 },
+        { SYS_DESC(SYS_ID_PFR0_EL1), NULL, get_id_pfr0_el1 },
+        ...
+};
+```
+
+它的值由 `kvm_sys_reg_table_init()` **在开机时填一次**：
+
+```c
+#define FUNCTION_INVARIANT(reg)                                       \
+        static void get_##reg(struct kvm_vcpu *v,                     \
+                              const struct sys_reg_desc *r)           \
+        {                                                             \
+                ((struct sys_reg_desc *)r)->val = read_sysreg(reg);   \
+        }
+```
+
+`read_sysreg()` 读的是**执行它的那个核**。于是整张表被固定成
+"开机时恰好跑到的那个核"的值。
+
+写入时又比对这张表：
+
+```c
+static int set_invariant_sys_reg(struct kvm *kvm, u64 id, void __user *uaddr)
+{
+        ...
+        if (invariant_reg_value(kvm, r) != val)
+                return -EINVAL;
+}
+```
+
+**QEMU 的行为正好踩中这个坑**：它先探测宿主 CPU 特性（读），再把
+这些值写回真正的 vCPU（写）。两次操作只要落在**不同的簇**上，值必然不同，
+写入就被 `-EINVAL` 拒绝。
 
 ```text
-smp: Brought up 1 node, 8 CPUs
-SMP: Total of 8 processors activated.
+1. QEMU 读宿主 CPU 特性       <- 可能调度到 A76
+2. QEMU 把值写入目标 vCPU     <- 可能调度到 A55
+3. A55 与 A76 的值不同
+4. KVM 判定"常量寄存器值不一致" -> EINVAL
 ```
 
-### 12.5 性能：8 个物理核值不值
+### 12.4 根因（二）：demux 寄存器读的是"当前核"
 
-同一个 guest（8 vCPU），只改物理核范围，guest 内跑
-`openssl speed -multi 8 -evp sha256 -seconds 2`，取 16384 字节块：
+**第一版修复只覆盖了上面这张表，结果 QEMU 仍然失败。** 用穷举法
+（枚举 `KVM_GET_REG_LIST` 暴露的全部 262 个寄存器，逐个"在 cpu0 读、
+在 cpu6 写回同值"）才找到剩下的元凶 —— 只有 3 个，而且都不是 sysreg：
 
 ```text
-全部 8 物理核 (6×A55 + 2×A76)    7.4-7.7 GB/s    启动 ~42-44s
-仅 6 小核 (A55)                  4.5-4.9 GB/s    启动 ~46s
-仅 2 大核 (A76)                  2.9-3.0 GB/s    启动 ~34s
+u32 proc=0x110000 0x110000   0x700fe01a   Invalid argument
+u32 proc=0x110000 0x110001   0x200fe01a   Invalid argument
+u32 proc=0x110000 0x110002   0x703fe01a   Invalid argument
 ```
 
-**全核对双大核是约 2.6 倍吞吐**，代价是启动慢 8-12 秒。对编译、压缩、批量
-计算这类吞吐型负载划算；对延迟敏感的单线程任务，2 个大核更好（A76 的
-capacity 1024 对 A55 的 367，约 2.8 倍）。
+`proc=0x110000` 是 **`KVM_REG_ARM_DEMUX`**（sysreg 是 `0x600000`），
+它们是 AArch32 的缓存寄存器 `CCSIDR`。实现里有**一模一样的核心依赖**：
 
-### 12.6 vCPU 热插拔：本机不可行
+```c
+static int demux_c15_set(struct kvm *kvm, u64 id, void __user *uaddr)
+{
+        ...
+        /* This is also invariant: you can't change it. */
+        if (newval != get_ccsidr(val))
+                return -EINVAL;
+}
 
-`-smp 2,maxcpus=8` 配合 QMP `device_add` 尝试过，结论是**做不到**：
+static u32 get_ccsidr(u32 csselr)
+{
+        ...
+        write_sysreg(csselr, csselr_el1);
+        isb();
+        ccsidr = read_sysreg(ccsidr_el1);   /* <- 读【当前核】的缓存几何 */
+        ...
+}
+```
+
+A55 和 A76 的缓存不同，`CCSIDR` 必然不同，于是跨簇的读-写回和 MIDR 一样
+必然失败。**这一处不在 sysreg 表里，所以第一版修复碰不到它。**
+
+### 12.5 修复：把这两类寄存器改成"按 VM 快照"
+
+思路来自主线：现代内核把 ID 寄存器变成**per-VM 属性**
+（`kvm->arch.id_regs[]`，经 `read_id_reg()` / `set_id_reg()` 访问），值对整个
+VM 一致，不再取决于调用方所在的核心。
+
+4.14 没有这个结构，所以加了一个。**实现在 `kvm_arch_init_vm()` 里取一次
+快照，之后所有读写都走这份快照。**
+
+数据结构（`arch/arm64/include/asm/kvm_host.h`）：
+
+```c
+struct kvm_arch {
+        ...
+        u64 *id_regs_snapshot;          /* invariant sysreg 快照 */
+        bool id_regs_snapshot_valid;
+
+        u32 id_demux_snapshot[16];      /* CCSIDR，按 CSSELR 索引 */
+        bool id_demux_snapshot_valid;
+};
+```
+
+取快照（`arch/arm64/kvm/sys_regs.c`）：
+
+```c
+int kvm_arm_id_reg_snapshot(struct kvm *kvm)
+{
+        ...
+        for (i = 0; i < ARRAY_SIZE(invariant_sys_regs); i++) {
+                const struct sys_reg_desc *r = &invariant_sys_regs[i];
+
+                if (r->reset) {
+                        r->reset(NULL, r);          /* 重新读一次，不要复制旧值 */
+                        kvm->arch.id_regs_snapshot[i] = r->val;
+                } else {
+                        kvm->arch.id_regs_snapshot[i] = r->val;
+                }
+        }
+        kvm->arch.id_regs_snapshot_valid = true;
+        return 0;
+}
+```
+
+读写都走快照：
+
+```c
+static u64 invariant_reg_value(struct kvm *kvm, const struct sys_reg_desc *r)
+{
+        int i;
+
+        if (!kvm || !kvm->arch.id_regs_snapshot_valid ||
+            !kvm->arch.id_regs_snapshot)
+                return r->val;                  /* 退化：仍用全局表 */
+
+        i = invariant_reg_index(r);
+        if (i < 0)
+                return r->val;
+
+        return kvm->arch.id_regs_snapshot[i];
+}
+```
+
+demux 同理：
+
+```c
+static u32 demux_snapshot_value(struct kvm *kvm, u32 csselr)
+{
+        if (!kvm || !kvm->arch.id_demux_snapshot_valid ||
+            csselr >= ARRAY_SIZE(kvm->arch.id_demux_snapshot))
+                return get_ccsidr(csselr);
+
+        return kvm->arch.id_demux_snapshot[csselr];
+}
+```
+
+挂钩点（`virt/kvm/arm/arm.c`）：
+
+```c
+int kvm_arch_init_vm(struct kvm *kvm, unsigned long type)
+{
+        ...
+        kvm_vgic_early_init(kvm);
+
+        ret = kvm_arm_id_reg_snapshot(kvm);
+        if (ret)
+                goto out_free_stage2_pgd;
+
+        ret = kvm_arm_id_demux_snapshot(kvm);
+        if (ret)
+                goto out_free_stage2_pgd;
+        ...
+}
+```
+
+#### 为什么这样就"自由"了
+
+`kvm_arch_init_vm()` 在 **`KVM_CREATE_VM` 时**执行，**任何 vCPU 都还不存在**。
+所以：
+
+1. 快照在**单一核**上取得 —— 没有竞态，值本身是自洽的一份
+2. 之后**这个 VM 的每一次读和每一次写都查同一份快照**
+3. vCPU 线程随后调度到哪个核，**不再影响读到的值，也不再影响写回是否被接受**
+
+于是"读在 A76、写在 A55"这种情形不再产生不一致 —— 两边查的都是同一份快照。
+
+#### 为什么是"重新读"而不是"复制全局表"
+
+`invariant_sys_regs[]` 是**开机时**填的，可能来自 A55。如果直接复制它，
+一个 vCPU 全跑在 A76 上的 VM 依然会被告知自己是 A55。
+
+在 `kvm_arch_init_vm()` 里重新调用 `r->reset(NULL, r)` 再取值，既保持了
+"整个 VM 一致"（只取一次、只存一份），又反映**该 VM 建立时那颗核**的视图。
+`reset` 回调忽略 vcpu 参数（`kvm_sys_reg_table_init()` 也是用 `NULL` 调它），
+所以传 `NULL` 是正确的。
+
+#### 安全边界没有放宽
+
+写入仍然要匹配本 VM 报告的值，用户态**依旧不能凭空造出宿主没有的特性**：
+
+```c
+if (invariant_reg_value(kvm, r) != val)
+        return -EINVAL;
+```
+
+改的只是"跟谁比"，不是"要不要比"。
+
+### 12.6 验证
+
+#### 寄存器层面（穷举）
 
 ```text
-QMP device_add driver=host-arm-cpu  ->  Parameter 'driver' expects a pluggable device type
-QMP qom-list /machine/unattached/device[cpu0]  ->  DeviceNotFound
+修复前:  checked 230 writable registers, 3 failed the cross-cluster write-back
+修复后:  checked 230 writable registers, 0 failed the cross-cluster write-back
 ```
 
-aarch64 的 vCPU 不是可热插拔设备（GIC 的 CPU 接口在机器初始化时就固定了），
-QEMU 也没有为 `virt` 机器暴露 ARM CPU 的 plug 类型。
+#### 同一个 VM 跨核读，值应当一致
 
-**但不需要热插拔** —— 12.4 的「启动时限制、之后放开」达到同样效果：8 个
-vCPU 启动时全部创建好，只是初始化期间不允许跨簇迁移。
-
-### 12.7 数据来源
-
-* QEMU `target/arm/kvm64.c` 的 `kvm_arch_put_registers()`，以及内核
-  `arch/arm64/kvm/` 中返回 `EINVAL` 的寄存器访问路径。
-* ARM 架构参考手册 DDI 0487，`ID_AA64ISAR0_EL1` 等特性寄存器定义：
-  <https://developer.arm.com/documentation/ddi0487/latest>
-* Limbo for Tensor 的「100% Success Mode」描述（先在 0-3 核启动 UEFI，
-  加载后再放开全部核）：
-  <https://github.com/wasdwasd0105/limbo_tensor>
-
-
-### 12.8 这一节改动带来的性能差异
-
-第 12.4 节的「先钉单核再放开」不只是把启动从"大概率失败"变成"每次都成功"，
-它还解锁了此前用不到的**全部 8 个物理核**。下面是这次改动前后的完整对照。
-
-#### 启动可靠性
-
-| 启动方式 | 物理核 | 成功率 | 说明 |
-|---|---|---|---|
-| 直接绑 `0-7` | 8 | **1/5** | 4 次 QEMU 启动即退出，1 次启动后卡住 |
-| **先绑单核 → 扩到 `0-7`** | 8 | **5/5** | 全部启动，guest 内 8 CPU 激活 |
-| 直接绑 `6-7`（旧默认） | 2 | 6/6 | 本来就稳，所以之前没人发现问题 |
-
-#### guest 内实测吞吐
-
-同一 guest（8 vCPU），只改物理核范围，guest 内跑
-`openssl speed -multi 8 -evp sha256 -seconds 2`，取 16384 字节块，
-每档 3 次：
-
-| 物理核范围 | 核构成 | sha256 吞吐 | 相对大核 | 启动耗时 |
-|---|---|---|---|---|
-| `0-7` | 6×A55 + 2×A76 | **7.4 – 7.7 GB/s** | **2.6×** | ~42–44 s |
-| `0-5` | 6×A55 | 4.5 – 4.9 GB/s | 1.7× | ~46 s |
-| `6-7` | 2×A76 | 2.9 – 3.0 GB/s | 1.0×（基准） | ~34 s |
-
-**读法：**
-
-* 从默认的 2 个大核换到全部 8 核，**吞吐提升约 2.6 倍**，代价是启动多 8–12 秒；
-* 8 个 vCPU 压在 2 个大核上属于**超卖** —— 吞吐靠时间片轮转堆出来，单核
-  延迟会明显变差。要低延迟就用 `CPUSET=6-7`，要高吞吐才用 `CPUSET=0-7`；
-* A76 单核性能约是 A55 的 2.8 倍（`cpu_capacity` 1024 对 367），所以
-  "6 个小核" 只比 "2 个大核" 快 1.7 倍，而不是 3 倍。
-
-#### 怎么用上
-
-**默认就是全核。** 创建时用 `--cores` 明确选一次，只有两个选项：
-
-```sh
-ckvm create myvm --cpus 8 --mem 4096 ...              # 全核（默认）
-ckvm create myvm --cpus 8 --mem 4096 --cores big ...  # 只要大核
-```
+一个 VM，两个线程分别绑 `cpu0`（A55）和 `cpu6`（A76）读同一批寄存器：
 
 ```text
-  --cores C   all = 0-7  全部 8 核（6×A55 + 2×A76），吞吐优先（默认）
-              big = 6-7  仅 2 个大核（A76），单核延迟优先
+register       read on cpu0         read on cpu6         same?
+MIDR_EL1       0x00000000414fd0b0   0x00000000414fd0b0   YES
+ID_PFR0_EL1    0x0000000010010131   0x0000000010010131   YES
+ID_ISAR0_EL1   0x0000000002101110   0x0000000002101110   YES
+CTR_EL0        0x000000009444c004   0x000000009444c004   YES
 ```
 
-`ckvm` 会自己先钉在 `BOOT_CPU`（默认 6）上完成 vCPU 初始化，等 guest 起来
-再把所有线程放开到 `CPUSET`，无需手工干预。
+> **一个容易犯的测试错误**：如果在**两次独立运行**里分别绑不同的核，每次
+> 都会新建一个 VM，因而各拿到自己的快照值，看起来像"补丁没生效"。
+> 每个 VM 有独立快照是**正确**行为 —— 验证必须在**同一个 VM 内**跨核进行。
+> （我第一轮就是这么误判的。）
 
-### 12.9 为什么默认改成全核
+#### 端到端：QEMU 不再需要绑核
 
-v1.1 之前默认是 `--cpus 8` 配 `CPUSET=6-7`，即**8 个 vCPU 超卖在 2 个物理核
-上（4 倍）**。这个组合能跑，但：
+```text
+修复前  不绑核 -smp 1                0 / 5
+修复后  不绑核 -smp 1                5 / 5
+修复后  不绑核 -smp 8  2048MB        3 / 3
+```
 
-* 吞吐靠时间片轮转堆出来，单核延迟明显变差；
-* 用户从命令行完全看不出自己建的是超卖配置 —— 这个默认值是隐式的。
+### 12.7 所以 CPU 能怎么配
 
-改成两个具名选项后：
+修复后在真机上穷举了 7 种掩码，每种 3 次：
 
-* **`all`（默认）** 和 **`big`** 都是明确的，不存在隐式超卖；
-* 名字而不是掩码，因为 `0-7` / `6-7` 只对「6 小核 + 2 大核」这个 SKU 有意义，
-  别的天玑（比如 4+4）掩码不同，具名选项换机器时不用改文档；
-* `--cores` 在交互流程里也会问一次，所以两种模式都自然会被看到。
+```text
+掩码         smp   说明                 结果
+0-7          8     全核 8 vCPU          3/3
+0-5          6     全小核 6 vCPU        3/3
+6-7          2     全大核 2 vCPU        3/3
+0-2,6-7      5     非对称 3小+2大       3/3     <- 以前必崩
+0,7          2     极端 1小+1大         3/3     <- 以前必崩
+6            8     8 vCPU 挤单大核      3/3
+0-7          16    16 vCPU 超配 2x      3/3
+```
 
-仍然接受裸掩码（`--cores 0-5`），但不在文档里宣传 —— 那是留给特殊需求的
-逃生口，不是给普通人用的。
+**21/21 全过，包括以前必然失败的混合掩码。**
 
-### 12.10 思路来源
+#### 仍然成立的两条正常语义
 
-这一节的做法不是原创，是把两处已有经验用在了 MTK 平台上。
+1. **给几个核就只能用几个核。** `taskset -c 6 ... -smp 8` 能跑，但 8 个
+   vCPU 抢一个物理核，吞吐受限于单核（实测约 2.9–3.0 GB/s）。这是捆绑
+   语义，不是 bug。
+2. **不要手工绑核。** 让调度器自己管即可；`ckvm` 的 `BOOT_CPU` 现在默认为空。
 
-**1. Limbo for Tensor 的「100% Success Mode」**
+### 12.8 vCPU 热插拔：本机仍然不可行
 
-Limbo 在 Pixel 设备上的原始描述是：
+这与上面的修复无关，是架构限制：
 
-> **100% Success Mode:**
-> Enable: Will run Qemu only on CPU 0-3 to avoid boot failure. You can click
-> 🚀 icon after UEFI loaded to enable all CPU cores
-> Disable: Use all cores on Qemu start. May have stack overflow error on UEFI
-> firmware
+```text
+QMP device_add -> Parameter 'driver' expects a pluggable device type
+qom-list /machine/unattached/device[cpu0] -> DeviceNotFound
+```
 
-也就是说：**先在少数核上启动以避免失败，等 UEFI 加载完成后再放开全部核**。
-本节把同样的"启动期限制、运行期放开"思路用到了 MTK 的 big.LITTLE 上，区别
-只在于失败原因不同 —— Pixel 那边是固件栈溢出，MTK 这边是跨簇特性寄存器不
-一致导致的 `EINVAL`。
+aarch64 的 vCPU 不是可插拔设备 —— **GIC 的 CPU interface 在 machine init
+时就固定了**。所以 `-smp N` 必须在启动时定好。变通办法是改 `vm.conf` 的
+`CPUS` 后 `ckvm restart`。
 
-来源：<https://github.com/wasdwasd0105/limbo_tensor>（README 的 Features 一节）
+### 12.9 性能：8 个物理核值不值
 
-**2. `taskset` 与线程亲和性继承**
+guest 内 `openssl speed -multi 8 -evp sha256 -seconds 2`（16384 字节块），
+取多次运行的中位数：
 
-"进程绑核"和"每个线程绑核"的区别来自 Linux 的亲和性语义：`sched_setaffinity`
-是**按线程**生效的，子线程在创建时继承父线程的掩码。所以想让已经在跑的 QEMU
-换核，必须遍历 `/proc/<pid>/task/*` 逐个设置，只对进程调一次 `taskset` 不会
-移动已有线程。这一点决定了实现方式（见 `widen_affinity()`）。
+| 物理核 | 吞吐 | 启动耗时 |
+|---|---|---|
+| 全部 8 核 | **7.4 – 7.7 GB/s** | 42 – 44 s |
+| 6 个小核 | 4.5 – 4.9 GB/s | ~46 s |
+| 2 个大核 | 2.9 – 3.0 GB/s | ~34 s |
 
-来源：`man 2 sched_setaffinity`、`man 1 taskset`
+**全核约为大核专用的 2.6 倍**，代价是启动慢 8 – 12 秒。
 
-**3. 失败原因的诊断**
+> **数据可信度声明**：第一轮测到的是噪声（gzip 结果摆动 1.7 倍且重测后
+> 反转）。上表是**重复多次、交替顺序、取中位数**之后的结论。
+>
+> 另需注意，容器与 guest 的软件栈不同（容器 4.14 内核 + Debian 13 +
+> OpenSSL 3.5.7；guest 6.8 内核 + Ubuntu 24.04 + OpenSSL 3.0.13），
+> 所以严格说这是**两个环境的端到端对比**，不是纯 CPU 对比。
 
-"跨簇特性寄存器不一致"这个判断来自两条线索：错误发生在 vCPU 初始化早期
-（`kvm_arch_put_registers()` 写通用寄存器时），以及 `-smp 1` 也会失败 ——
-单核配置排除了"核数太多"这一解释，只剩调度迁移。ARM 架构参考手册
-DDI 0487 对 `ID_AA64*` 系列寄存器的定义支持了这个推断。
+### 12.10 为什么默认是"全核"
 
-来源：<https://developer.arm.com/documentation/ddi0487/latest>
+因为这台机器的瓶颈是**吞吐**而不是单核延迟：
+
+- 宿主要同时跑 droidspaces、guest、以及可能的多个 guest
+- 全核吞吐是大核专用的 2.6 倍
+- 多出的 8–12 秒启动时间，相对于"开一次用很久"可以忽略
+
+想要低延迟、轻负载的场景（例如只跑一个交互式服务）再用 `--cores big`。
+
+### 12.11 出处
+
+**内核实现**
+
+- `arch/arm64/kvm/sys_regs.c` —— `invariant_sys_regs[]`、
+  `FUNCTION_INVARIANT`、`set_invariant_sys_reg()`、`demux_c15_set()`、
+  `get_ccsidr()`；本项目的 `kvm_arm_id_reg_snapshot()` /
+  `kvm_arm_id_demux_snapshot()`
+- `arch/arm64/include/asm/kvm_host.h` —— `struct kvm_arch` 里的两个快照字段
+- `virt/kvm/arm/arm.c` —— `kvm_arch_init_vm()` 里的挂钩
+- 主线对照：`arch/arm64/kvm/sys_regs.c` 的 `read_id_reg()` / `set_id_reg()`
+  与 `kvm->arch.id_regs[]`（Linux 7.2）
+
+**QEMU 侧**
+
+这条报错来自 QEMU 的 `write_list_to_kvmstate()`。该函数在补丁
+*"arm/kvm: report registers we failed to set"*（Cornelia Huck，2025-09）中
+被加入了更详细的诊断，补丁说明原文：
+
+> If we fail migration because of a mismatch of some registers between source
+> and destination, the error message is not very informative:
+> `qemu-system-aarch64: Failed to put registers after init: Invalid argument`
+> At least try to give the user a hint which registers had a problem
+
+补丁代码注释给出了失败的两个原因：
+
+> We might fail for **"unknown register"** and also for **"you tried to set a
+> register which is constant with a different value from what it actually
+> contains"**.
+>
+> — [PATCH v3] arm/kvm: report registers we failed to set
+> <https://patchew.org/QEMU/20250911154159.158046-1-cohuck@redhat.com/>
+
+第二种情况正是本机型的问题：
+
+```text
+1. QEMU 建临时 vCPU，探测宿主 CPU 特性（此时可能调度到 A76）
+2. QEMU 把这些值写入真正的 vCPU（此时可能调度到 A55）
+3. A55 的 ID 寄存器值与 A76 不同
+4. KVM 判定"这是常量寄存器且值不一致" -> EINVAL
+```
+
+本机型两种核心的 ID 寄存器视图**确实不同**（见 §1.1 的 `CPU part` 实测）。
+
+
+本文档没有引用本项目的私有提交号作为"证据" —— 所有结论都来自上述源码、
+上表实测数据，或随文给出的复现脚本。
+
+**复现脚本**（都在 `kvm_manager/tools/`）：
+
+```text
+kvm_midr_repro.c      绑单核读写 MIDR_EL1，展示核心依赖
+kvm_samevm_read.c     同一 VM 跨核读，验证一致性
+kvm_crosstest.c       跨核"读-写回"，QEMU 操作的等价物
+kvm_exhaustive.c      枚举全部寄存器，定位到 demux
+```
+
+编译运行（设备上，需 `root` 与 `/dev/kvm`）：
+
+```bash
+gcc -D_GNU_SOURCE -O0 -o kvm_exh kvm_exhaustive.c -lpthread
+./kvm_exh                  # 应输出 0 failed
+```
+
+### 12.12 思路来源
+
+**主线内核的做法**是这一节的直接依据 —— 把 ID 寄存器变成 per-VM 属性，
+而不是"每次从当前核现读"。参考 Linux 7.2 的 `arch/arm64/kvm/sys_regs.c`。
+
+**穷举定位法**来自一个朴素的判断：既然单个寄存器（MIDR）能定位，那
+"把所有寄存器都试一遍"就一定能找出**全部**跨簇依赖的寄存器，而不是靠猜。
+这一步直接找出了第一版遗漏的 demux 寄存器。
 
 
 ---
@@ -1762,236 +1957,6 @@ root / qemu-system-aarch64 / /dev/kvm / cloud-localds / firmware / free disk
 自检用的掩码是 `CORESET_FULL`（全核），也就是第 12 节那个"先钉单核再放开"
 的路径。所以自检同时也在验证核掩码逻辑 —— 如果有人把
 `widen_affinity` 改坏了，`ckvm selftest` 会当场失败。
-
-
-### 12.11 根因复现：MIDR_EL1 的写入为什么会被拒
-
-第 12.2 节把失败归因于「QEMU 在一种核上读、在另一种核上写回」。这一节是在真机上
-**直接复现**该机制的证据，不需要刷新内核。
-
-#### 硬件事实
-
-两颗簇的 `MIDR_EL1` 不同（读 `/sys/devices/system/cpu/cpuN/regs/identification/midr_el1`）：
-
-```text
-cpu0-5  (Cortex-A55)   midr_el1 = 0x00000000412fd050
-cpu6-7  (Cortex-A76)   midr_el1 = 0x00000000414fd0b0
-```
-
-#### 内核机制
-
-`arch/arm64/kvm/sys_regs.c` 里 `MIDR_EL1` 属于 invariant 表：
-
-```c
-static struct sys_reg_desc invariant_sys_regs[] = {
-        { SYS_DESC(SYS_MIDR_EL1), NULL, get_midr_el1 },
-        ...
-};
-
-static int set_invariant_sys_reg(struct kvm *kvm, u64 id, void __user *uaddr)
-{
-        ...
-        if (invariant_reg_value(kvm, r) != val)
-                return -EINVAL;
-```
-
-而表的内容由 `kvm_sys_reg_table_init()` **在开机时填一次**：
-
-```c
-#define FUNCTION_INVARIANT(reg)                                       \
-        static void get_##reg(struct kvm_vcpu *v,                     \
-                              const struct sys_reg_desc *r)           \
-        {                                                             \
-                ((struct sys_reg_desc *)r)->val = read_sysreg(reg);   \
-        }
-```
-
-`read_sysreg()` 读的是**执行它的那个核**。所以值是「开机时那个核」的，
-之后任何携带另一个簇数值的写入都会被 `-EINVAL` 拒绝。
-
-#### 实测复现
-
-一个最小的 KVM 程序（`KVM_CREATE_VM` → `KVM_ARM_VCPU_INIT` → `KVM_GET/SET_ONE_REG`）
-在两种绑核下运行，结果互为镜像：
-
-```text
-$ taskset -c 0 ./kvm_midr2          # 小核
-MIDR_EL1            read   -> OK  value=0x00000000412fd050
-MIDR_EL1  <- A55    write  -> OK
-MIDR_EL1  <- A76    write  -> EINVAL
-MIDR_EL1  <- junk   write  -> EINVAL
-
-$ taskset -c 6 ./kvm_midr2          # 大核
-MIDR_EL1            read   -> OK  value=0x00000000414fd0b0
-MIDR_EL1  <- A55    write  -> EINVAL
-MIDR_EL1  <- A76    write  -> OK
-```
-
-**读到的值跟着当前核变，写入只接受与当前核一致的值。**
-QEMU 的行为正是「在一次初始化里读一次、写一次」，只要这两步落在不同的簇上，
-写入必然 `-EINVAL` —— 这就是
-
-```text
-qemu-system-aarch64: Failed to put registers after init: Invalid argument
-```
-
-#### 顺带确认：失败的不是 ID_AA64* 寄存器
-
-同一程序里读 `ID_AA64PFR0_EL1` 与 `ID_AA64ISAR0_EL1` 都返回 **ENOENT**，
-因为它们不在 4.14 的 invariant 表里（表里只有 `MIDR_EL1`、`REVIDR_EL1`、
-`CLIDR_EL1`、`AIDR_EL1`、`CTR_EL0` 和一组 AArch32 的 `ID_PFR*/ID_MMFR*/ID_ISAR*`）。
-所以被拒的确实是 `MIDR_EL1` 这一类 invariant 寄存器，与第 12.2 节的判断一致。
-
-#### 修复
-
-`kvm_arch_init_vm()` 里按 VM 取一次快照，读写都走这份快照
-（见本仓库 `a76c36485`）。快照在任何 vCPU 存在之前建立，只有一个核参与，
-因此整个 VM 看到同一个 `MIDR_EL1`，写入不再因线程落点而失败。
-
-> **已刷入实测**，见 12.12 节。
-
-
-### 12.12 第一版修复：必要但不充分
-
-第一版修复（`a76c36485`）只处理了 sysreg 那一半（`invariant_sys_regs[]`）。
-刷入后实测，**它并不足以让 QEMU 跑起来**。
-
-#### 它确实修好了 sysreg 那一半
-
-同一个 VM 内，两个线程分别绑 `cpu0`（A55）和 `cpu6`（A76）读同一批寄存器：
-
-```text
-register       read on cpu0         read on cpu6         same?
-MIDR_EL1       0x00000000414fd0b0   0x00000000414fd0b0   YES
-ID_PFR0_EL1    0x0000000010010131   0x0000000010010131   YES
-ID_ISAR0_EL1   0x0000000002101110   0x0000000002101110   YES
-CTR_EL0        0x000000009444c004   0x000000009444c004   YES
-```
-
-并且「在 `cpu0` 读、把同一个值在 `cpu6` 写回」也全部成功。
-
-> **踩过的坑**：如果在**两次独立运行**里分别绑核，每次都会新建 VM，
-> 因而各拿到自己的快照值，看起来像「没生效」。每个 VM 有独立快照是
-> **正确**行为 —— 验证必须在**同一个 VM 内**跨核进行。
-
-#### 但 QEMU 依然起不来
-
-对这个探测命令（`-M virt -cpu max -accel kvm -smp 1`）做 A/B 各 5 次：
-
-```text
-taskset -c 6    x5   全部启动成功
-taskset -c 0    x5   全部启动成功
-taskset -c 0-7  x5   Failed to put registers after init: Invalid argument  x5
-```
-
-**所以第一版修复不充分，12.12 最初的结论是错的。**
-
-#### 用穷举定位剩下的元凶
-
-用 `KVM_GET_REG_LIST` 枚举该 vCPU 暴露的 **262 个寄存器**，
-对每一个做「`cpu0` 读、`cpu6` 写回同值」。结果只有 **3 个**失败：
-
-```text
-u32 proc=0x110000 0x110000   0x700fe01a   Invalid argument
-u32 proc=0x110000 0x110001   0x200fe01a   Invalid argument
-u32 proc=0x110000 0x110002   0x703fe01a   Invalid argument
-```
-
-`proc=0x110000` 是 **`KVM_REG_ARM_DEMUX`**，不是 sysreg（sysreg 是 `0x600000`），
-所以第一版的 sysreg 快照**从来没有覆盖它们**。
-
-`demux_c15_set()` 里有完全一样的核心依赖比较：
-
-```c
-/* This is also invariant: you can't change it. */
-if (newval != get_ccsidr(val))
-        return -EINVAL;
-```
-
-而 `get_ccsidr()` 是 `read_sysreg(ccsidr_el1)` —— **读的是执行它的那个核的缓存几何**。
-A55 与 A76 的缓存不同，CCSIDR 必然不同，于是跨簇的读-写回和 MIDR 一样必然失败。
-
-#### 第二版修复
-
-对 16 个 `CSSELR` 槽位同样在 `kvm_arch_init_vm()` 里取快照，
-`demux_c15_get()` / `demux_c15_set()` 都走快照。
-
-> **状态**：**已刷入实测通过**，见 12.13。
-
-#### 复现脚本
-
-```text
-kvm_manager/tools/kvm_midr_repro.c    12.11 的失败复现（绑单核读写）
-kvm_manager/tools/kvm_crosstest.c     跨核读-写回验证
-kvm_manager/tools/kvm_exhaustive.c    穷举全部寄存器，定位到 demux
-```
-
-编译运行（设备上，需 `root` 与 `/dev/kvm`）：
-
-```bash
-gcc -D_GNU_SOURCE -O0 -o kvm_exh kvm_exhaustive.c -lpthread
-./kvm_exh
-```
-
-### 12.13 demux 修复实测通过：不再需要绑核
-
-刷入含 demux 快照的内核（`4.14.356-Evergo-KVM-cuicanmx-v1.0`，
-`/proc/kallsyms` 可见 `kvm_arm_id_demux_snapshot`）后的实测结果。
-
-#### 1. 穷举寄存器扫描：3 个失败 -> 0 个失败
-
-同一个测试（`KVM_GET_REG_LIST` 枚举全部寄存器，逐个在 `cpu0` 读、
-在 `cpu6` 写回同值）：
-
-```text
-修复前:  checked 230 writable registers, 3 failed the cross-cluster write-back
-修复后:  checked 230 writable registers, 0 failed the cross-cluster write-back
-```
-
-之前失败的那 3 个正是 `KVM_REG_ARM_DEMUX`（CCSIDR）寄存器。
-
-#### 2. 不绑核启动 QEMU：从稳定失败变成稳定成功
-
-```text
-修复前  不绑核 -smp 1                0 / 5 成功
-修复后  不绑核 -smp 1                5 / 5 成功
-
-修复后  不绑核 -smp 8  2048MB       3 / 3 成功   ★
-修复后  绑 cpu6 -smp 8  2048MB      2 / 2 成功（对照）
-```
-
-`-smp 8` 跨 `0-7` 全核且**不绑核**能起来，是本项工作的原始目标。
-修复前同样配置的成功率是 6 次里 1~2 次（见 12.3）。
-
-#### 3. 结论
-
-`Failed to put registers after init: Invalid argument` 在本机上已消除。
-成因是**两处**核心依赖的比较：
-
-| 位置 | 比较对象 | 修复 |
-|---|---|---|
-| `set_invariant_sys_reg()` | `invariant_sys_regs[].val`（开机时某核） | 12.11 / `a76c36485` |
-| `demux_c15_set()` | `get_ccsidr()` → `read_sysreg(ccsidr_el1)`（当前核） | 12.12 / demux 快照 |
-
-只修前者不够 —— 这正是 12.12 纠正过的结论。
-
-#### 4. 对 ckvm 的影响
-
-`BOOT_CPU`（启动时钉单核、起来后再 `widen_affinity` 放开）这一整套
-workaround 在本内核上**已无必要**。
-不绑核直接以目标 `CPUSET` 启动即可。
-
-#### 5. 复现
-
-```bash
-# 设备上，需 root 与 /dev/kvm
-gcc -D_GNU_SOURCE -O0 -o kvm_exh kvm_exhaustive.c -lpthread
-./kvm_exh                       # 应输出 0 failed
-
-# 不绑核起 8 vCPU
-taskset -c 0-7 qemu-system-aarch64 -M virt,gic-version=3 -cpu max \
-    -accel kvm -smp 8 -m 2048 -display none
-```
 
 
 ## 14. 镜像缓存
