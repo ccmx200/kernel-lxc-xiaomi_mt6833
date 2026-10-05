@@ -108,7 +108,7 @@ DEF_CPUSET="$CORESET_FULL"
 # pinned to ONE core while it starts and its affinity is widened to CPUSET
 # once the guest is running.  Measured: booting 8 vCPU directly on 0-7 worked
 # 1/5 times; with this dance, 5/5.
-DEF_BOOT_CPU=6
+DEF_BOOT_CPU=""
 # Empty means "ask" in interactive mode; command mode falls back to
 # "ubuntu" (what the Ubuntu cloud images themselves use).
 DEF_USER=""
@@ -1444,20 +1444,34 @@ cmd_start() {
     )
 
     if [ "$fg" = 1 ]; then
-        exec taskset -c "${BOOT_CPU:-$CPUSET}" "${args[@]}"
+        if [ -n "${BOOT_CPU:-}" ] && [ "$BOOT_CPU" != "$CPUSET" ]; then
+            exec taskset -c "$BOOT_CPU" "${args[@]}"
+        elif [ -n "${CPUSET:-}" ]; then
+            exec taskset -c "$CPUSET" "${args[@]}"
+        else
+            exec "${args[@]}"
+        fi
     fi
 
-    # start on a single core, widen once QEMU is up
-    local bootc="${BOOT_CPU:-$CPUSET}"
-    nohup taskset -c "$bootc" "${args[@]}" > "$d/qemu.err" 2>&1 &
+    # Kernels with the per-VM ID-register snapshot no longer care which
+    # cluster a vCPU thread lands on, so start straight across CPUSET.
+    # Pin only if BOOT_CPU is set explicitly (older kernels needed it).
+    local launch=()
+    if [ -n "${BOOT_CPU:-}" ] && [ "$BOOT_CPU" != "$CPUSET" ]; then
+        launch=(taskset -c "$BOOT_CPU")
+    elif [ -n "${CPUSET:-}" ]; then
+        launch=(taskset -c "$CPUSET")
+    fi
+    nohup ${launch[@]+"${launch[@]}"} "${args[@]}" > "$d/qemu.err" 2>&1 &
     echo $! > "$(vm_pid "$name")"
-    sleep 6
+    sleep 3
     local p; p=$(cat "$(vm_pid "$name")")
     if ! kill -0 "$p" 2>/dev/null; then
         [ -n "$tap" ] && tap_down "$name"
         die "failed to start: $(head -1 "$d/qemu.err")"
     fi
-    widen_affinity "$p"
+    # only needed when we deliberately started on a narrower set
+    [ -n "${BOOT_CPU:-}" ] && [ "$BOOT_CPU" != "$CPUSET" ] && widen_affinity "$p"
     say "guest '$name' running (pid $p, ${CPUS} vCPU, ${MEM} MiB, cpuset $CPUSET)"
 
     # Boot takes ~30s, and until sshd is up an immediate `ssh` gets
@@ -1542,6 +1556,7 @@ sys.exit(1)
 widen_affinity() {
     local p="$1" t
     [ -n "${BOOT_CPU:-}" ] || return 0
+    [ -n "${CPUSET:-}" ] || return 0
     [ "$CPUSET" = "$BOOT_CPU" ] && return 0
     for t in /proc/"$p"/task/*; do
         [ -e "$t" ] || continue
