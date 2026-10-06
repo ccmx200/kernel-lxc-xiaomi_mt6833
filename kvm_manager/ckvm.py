@@ -43,7 +43,8 @@ FW_VARS = "edk2_vars.fd"
 DEF_CPUS = 8
 DEF_MEM = 2048
 DEF_DISK = 50
-DEF_REL = "26.04"
+DEF_REL = "26.04"   # Ubuntu default
+DEF_DISTRO = "ubuntu"
 DEF_PORT_BASE = 8023
 DEF_CORES = "0-7"
 DEF_CACHE = "writeback"
@@ -76,17 +77,91 @@ GITHUB_ACCEL = [
 # NOTE: the short /<branch>/ form.  /refs/heads/<branch>/ returned HTTP 500.
 REPO_RAW = "https://raw.githubusercontent.com/ccmx200/kernel-lxc-xiaomi_mt6833/resukisu"
 
-# version | codename | lts | size
-CATALOGUE = """\
-22.04|jammy|LTS|673M
-22.10|kinetic||716M
-23.04|lunar||688M
-23.10|mantic||684M
-24.04|noble|LTS|592M
-24.10|oracular||584M
-25.04|plucky||680M
-25.10|questing||843M
-26.04|resolute|LTS|902M"""
+class Distro:
+    """
+    One distribution family.
+
+    Each owns its release list and its download URLs, so adding a family does
+    not mean touching the create flow.
+    """
+
+    def __init__(self, key, name, default_user, releases, url_tmpls,
+                 cache_name, note=""):
+        self.key = key
+        self.name = name
+        self.default_user = default_user
+        # release: (version, codename, tag, size)
+        self.releases = releases
+        self.url_tmpls = url_tmpls
+        self.cache_name = cache_name
+        self.note = note
+
+    def rel(self, version):
+        for r in self.releases:
+            if r[0] == version:
+                return r
+        return None
+
+    def urls(self, version):
+        """Every mirror to try, in order."""
+        r = self.rel(version)
+        if not r:
+            return []
+        code = r[1]
+        out = []
+        for t in self.url_tmpls:
+            out.append(t.format(ver=version, code=code))
+        return out
+
+    def cache_file(self, version):
+        return self.cache_name.format(ver=version)
+
+
+UBUNTU = Distro(
+    "ubuntu", "Ubuntu", "ubuntu",
+    [("22.04", "jammy", "LTS", "673M"),
+     ("22.10", "kinetic", "", "716M"),
+     ("23.04", "lunar", "", "688M"),
+     ("23.10", "mantic", "", "684M"),
+     ("24.04", "noble", "LTS", "592M"),
+     ("24.10", "oracular", "", "584M"),
+     ("25.04", "plucky", "", "680M"),
+     ("25.10", "questing", "", "843M"),
+     ("26.04", "resolute", "LTS", "902M")],
+    ["https://mirror.nju.edu.cn/ubuntu-cloud-images/releases/{ver}/release/"
+     "ubuntu-{ver}-server-cloudimg-arm64.img",
+     "https://cloud-images.ubuntu.com/releases/{ver}/release/"
+     "ubuntu-{ver}-server-cloudimg-arm64.img"],
+    "ubuntu-{ver}-arm64.img",
+    note="Ubuntu 官方 cloud image",
+)
+
+DEBIAN = Distro(
+    "debian", "Debian", "debian",
+    [("13", "trixie", "stable", "322M"),
+     ("12", "bookworm", "oldstable", "326M")],
+    ["https://mirror.nju.edu.cn/debian-cdimage/cloud/{code}/latest/"
+     "debian-{ver}-genericcloud-arm64.qcow2",
+     "https://cloud.debian.org/images/cloud/{code}/latest/"
+     "debian-{ver}-genericcloud-arm64.qcow2"],
+    "debian-{ver}-arm64.qcow2",
+    note="genericcloud，带 cloud-init",
+)
+
+FEDORA = Distro(
+    "fedora", "Fedora", "fedora",
+    [("42", "42", "", "600M")],
+    ["https://download.fedoraproject.org/pub/fedora/linux/releases/{ver}/"
+     "Cloud/aarch64/images/Fedora-Cloud-Base-Generic-{ver}-1.1.aarch64.qcow2"],
+    "fedora-{ver}-arm64.qcow2",
+    note="官方 Cloud Base Generic",
+)
+
+DISTROS = [UBUNTU, DEBIAN, FEDORA]
+DISTRO_BY_KEY = {d.key: d for d in DISTROS}
+
+# kept for the code that still refers to it; the Ubuntu list
+CATALOGUE = "\n".join("|".join(r) for r in UBUNTU.releases)
 
 CACHE_MODES = {
     "writeback": "速度最快，断电时可能丢失最近写入（推荐）",
@@ -799,14 +874,23 @@ def usage() -> None:
     out()
 
 
-def cmd_versions(_rest: list[str]) -> int:
-    header("可用的 Ubuntu 版本")
-    out(f"  {S.dim}{pad('版本', 8)} {pad('代号', 14)} {pad('类型', 6)} 大小{S.rst}")
-    for line in CATALOGUE.splitlines():
-        ver, code, lts, size = line.split("|")
-        tag = f"{S.g}LTS{S.rst}" if lts else "   "
-        out(f"  {pad(ver, 8)} {pad(code, 14)} {pad(tag, 6)} {size}")
-    out()
+def cmd_versions(rest: list[str]) -> int:
+    """List releases, for one distro or for all of them."""
+    want = rest[0] if rest else ""
+    if want and want not in DISTRO_BY_KEY:
+        die(f"不支持的发行版: {want}；可选: {', '.join(DISTRO_BY_KEY)}")
+
+    for d in DISTROS:
+        if want and d.key != want:
+            continue
+        header(f"可用的 {d.name} 版本", d.note)
+        out(f"  {S.dim}{pad('版本', 8)} {pad('代号', 14)} "
+            f"{pad('标记', 10)} 大小{S.rst}")
+        for ver, code, tag, size in d.releases:
+            mark = f"{S.g}{tag}{S.rst}" if tag else " " * len(tag)
+            cached = f"  {S.g}✓ 已缓存{S.rst}" if cache_ready(ver, d) else ""
+            out(f"  {pad(ver, 8)} {pad(code, 14)} {pad(mark, 10)} {size}{cached}")
+        out()
     return 0
 
 
@@ -818,38 +902,41 @@ def cmd_cache(rest: list[str]) -> int:
     if rest and rest[0] == "--clear":
         target = rest[1] if len(rest) > 1 else None
         if target:
-            p = os.path.join(CACHE_DIR, f"ubuntu-{target}-arm64.img")
-            if os.path.isfile(p):
+            hits = [p for d in DISTROS
+                    if os.path.isfile(p := cache_img(target, d))]
+            if not hits:
+                die(f"缓存里没有 {target}")
+            for p in hits:
                 os.remove(p)
-                ok(f"已删除缓存: Ubuntu {target}")
-            else:
-                die(f"缓存里没有 Ubuntu {target}")
+                ok(f"已删除缓存: {os.path.basename(p)}")
         else:
             shutil.rmtree(CACHE_DIR, ignore_errors=True)
             ok("已清空镜像缓存")
         return 0
 
     header("💾 镜像缓存", CACHE_DIR)
-    entries = sorted(f for f in os.listdir(CACHE_DIR)
-                     if f.startswith("ubuntu-") and f.endswith("-arm64.img"))
-    if not entries:
+    rows = []
+    for d in DISTROS:
+        for ver, _code, _tag, _size in d.releases:
+            p = cache_img(ver, d)
+            if os.path.isfile(p):
+                rows.append((d, ver, p))
+    if not rows:
         info("（空）— 下一次 ckvm create 会在这里缓存基础镜像")
         info("多个虚拟机共用同一份，只有第一次需要下载")
         out()
         return 0
-    out(f"  {S.dim}{pad('版本', 10)} {pad('大小', 10, 'right')}  状态{S.rst}")
-    out(f"  {S.dim}{rule(40)}{S.rst}")
+    out(f"  {S.dim}{pad('发行版', 12)} {pad('版本', 8)} "
+        f"{pad('大小', 10, 'right')}  状态{S.rst}")
+    out(f"  {S.dim}{rule(48)}{S.rst}")
     total = 0
-    for f in entries:
-        rel = f[len("ubuntu-"):-len("-arm64.img")]
-        p = os.path.join(CACHE_DIR, f)
+    for d, ver, p in rows:
         sz = os.path.getsize(p)
         total += sz
-        okmark = f"{S.g}✓{S.rst}" if cache_ready(rel) \
-            else f"{S.y}不完整{S.rst}"
-        out(f"  {pad(rel, 10)} {pad(human(sz), 10, 'right')}  {okmark}")
-    out(f"  {S.dim}{rule(40)}{S.rst}")
-    out(f"  {pad('合计', 10)} {pad(human(total), 10, 'right')}")
+        mark = f"{S.g}✓{S.rst}" if cache_ready_path(p) else f"{S.y}不完整{S.rst}"
+        out(f"  {pad(d.name, 12)} {pad(ver, 8)} {pad(human(sz), 10, 'right')}  {mark}")
+    out(f"  {S.dim}{rule(48)}{S.rst}")
+    out(f"  {pad('合计', 12)} {pad('', 8)} {pad(human(total), 10, 'right')}")
     out()
     return 0
 
@@ -875,6 +962,8 @@ def cmd_list(_rest: list[str]) -> int:
         rows.append((
             n,
             "running" if running(n) else "stopped",
+            distro_of(cfg).name,
+            cfg.get("UBUNTU_REL", "?"),
             cfg.get("CPUS", "?"),
             cfg.get("MEM", "?"),
             cfg.get("DISK_GB", "?"),
@@ -882,16 +971,19 @@ def cmd_list(_rest: list[str]) -> int:
             cfg.get("CPUSET", "?"),
         ))
     w = max(width(r[0]) for r in rows)
+    dw = max(width(r[2]) for r in rows)
     header("虚拟机")
-    out(f"  {S.dim}{pad('名字', w)}  {pad('状态', 9)} {pad('vCPU', 4)} "
-        f"{pad('内存', 6)} {pad('磁盘', 6)} {pad('物理核', 9)} 连接{S.rst}")
-    for n, st, cpus, mem, disk, port, mask in rows:
+    out(f"  {S.dim}{pad('名字', w)}  {pad('状态', 9)} {pad('发行版', dw)} "
+        f"{pad('版本', 7)} {pad('vCPU', 4)} {pad('内存', 6)} {pad('磁盘', 6)} "
+        f"{pad('物理核', 9)} 连接{S.rst}")
+    for n, st, dname, rel, cpus, mem, disk, port, mask in rows:
         col = S.g if st == "running" else S.dim
         dot = "●" if st == "running" else "○"
-        how = f"ssh {load_vm(n).get('VM_USER','ubuntu')}@127.0.0.1 -p {port}"
-        out(f"  {pad(n, w)}  {col}{dot} {pad(st, 7)}{S.rst} {pad(cpus, 4)} "
-            f"{pad(mem, 6)} {pad(disk + 'G', 6)} {pad(dim_mask(mask), 9)} "
-            f"{S.dim}{how}{S.rst}")
+        how = f"ssh {load_vm(n).get('VM_USER', distro_of(load_vm(n)).default_user)}" \
+              f"@127.0.0.1 -p {port}"
+        out(f"  {pad(n, w)}  {col}{dot} {pad(st, 7)}{S.rst} {pad(dname, dw)} "
+            f"{pad(rel, 7)} {pad(cpus, 4)} {pad(mem, 6)} {pad(disk + 'G', 6)} "
+            f"{pad(dim_mask(mask), 9)} {S.dim}{how}{S.rst}")
     out()
     return 0
 
@@ -906,16 +998,20 @@ def cmd_show(rest: list[str]) -> int:
     name = rest[0]
     cfg = load_vm(name)
     header(f"🔧 {name}")
+    d = distro_of(cfg)
     keys = [
-        ("Ubuntu", "UBUNTU_REL"), ("vCPU", "CPUS"), ("内存", "MEM"),
-        ("磁盘", "DISK_GB"), ("端口", "PORT"), ("物理核", "CPUSET"),
-        ("网络", "NET_MODE"), ("端口映射", "FORWARDS"),
-        ("磁盘缓存", "CACHE_MODE"), ("用户", "VM_USER"),
-        ("内部优化", "TUNE"),
+        ("发行版", None), ("版本", "UBUNTU_REL"), ("vCPU", "CPUS"),
+        ("内存", "MEM"), ("磁盘", "DISK_GB"), ("端口", "PORT"),
+        ("物理核", "CPUSET"), ("网络", "NET_MODE"),
+        ("端口映射", "FORWARDS"), ("磁盘缓存", "CACHE_MODE"),
+        ("用户", "VM_USER"), ("内部优化", "TUNE"),
     ]
     w = max(width(k) for k, _ in keys)
     for label, key in keys:
-        v = cfg.get(key, "")
+        if key is None:
+            v = d.name
+        else:
+            v = cfg.get(key, "")
         if key == "CPUSET" and v:
             v = mask_label(v)
         out(f"  {pad(label, w)}  {v}")
@@ -924,10 +1020,10 @@ def cmd_show(rest: list[str]) -> int:
 
 
 
-def ask_account() -> tuple[str, str]:
+def ask_account(default_user: str = "ubuntu") -> tuple[str, str]:
     """Login name and password, including a name of the user's choosing."""
     items = [
-        ("ubuntu", "推荐，可以 sudo"),
+        (default_user, "推荐，可以 sudo"),
         ("root", "直接用 root 登录"),
         ("自定义", "自己指定用户名"),
     ]
@@ -942,7 +1038,7 @@ def ask_account() -> tuple[str, str]:
                 break
             warn("用户名只能用 a-z 0-9 _ -，且不能以数字开头")
     else:
-        user = "ubuntu"
+        user = default_user
 
     out()
     env_pw = os.environ.get("CKVM_PW", "")
@@ -995,23 +1091,26 @@ def cmd_create(rest: list[str]) -> int:
         else:
             i += 1
 
-    unknown = sorted(set(o) - {"rel", "cpus", "cores", "mem", "disk", "port",
-                               "net", "fwd", "user", "pass", "cache", "tune",
-                               "hostname", "yes", "interactive"})
+    unknown = sorted(set(o) - {"distro", "rel", "cpus", "cores", "mem", "disk",
+                               "port", "net", "fwd", "user", "pass", "cache",
+                               "tune", "hostname", "yes", "interactive"})
     if unknown:
         die(f"不认识的选项: {' '.join('--' + u for u in unknown)}\n"
-            f"     可用: --rel --cpus --cores --mem --disk --port --net "
-            f"--fwd --user --pass --cache --tune --yes")
-
-    rels = [l.split("|")[0] for l in CATALOGUE.splitlines()]
+            f"     可用: --distro --rel --cpus --cores --mem --disk --port "
+            f"--net --fwd --user --pass --cache --tune --yes")
 
     # ---- validate everything given on the command line, before asking ----
     # otherwise a bad value is only reported after the interactive questions
     def bad(msg: str) -> None:
         die(msg)
 
-    if o.get("rel") and o["rel"] not in rels:
-        bad(f"没有 Ubuntu {o['rel']}；可选: {', '.join(rels)}")
+    if o.get("distro") and o["distro"] not in DISTRO_BY_KEY:
+        bad(f"不支持的发行版: {o['distro']}；可选: {', '.join(DISTRO_BY_KEY)}")
+    if o.get("rel"):
+        pre = DISTRO_BY_KEY.get(o.get("distro", DEF_DISTRO), UBUNTU)
+        if o["rel"] not in [r[0] for r in pre.releases]:
+            bad(f"{pre.name} 没有 {o['rel']}；"
+                f"可选: {', '.join(r[0] for r in pre.releases)}")
     if name and not valid_name(name):
         bad(f"名字只能用字母数字和 _ . - ：{name}")
     if name and os.path.isdir(vm_dir(name)):
@@ -1054,31 +1153,47 @@ def cmd_create(rest: list[str]) -> int:
     if o.get("net") and o["net"] not in ("user", "host"):
         bad(f"--net 只能是 user 或 host，收到: {o['net']}")
 
-    header("创建 Ubuntu 虚拟机")
+    header("创建虚拟机")
+
+    # ---- distro ---------------------------------------------------------
+    dkey = o.get("distro", DEF_DISTRO)
+    if dkey:
+        if dkey not in DISTRO_BY_KEY:
+            die(f"不支持的发行版: {dkey}；可选: {', '.join(DISTRO_BY_KEY)}")
+        distro = DISTRO_BY_KEY[dkey]
+    else:
+        items = [(d.name, d.note or "") for d in DISTROS]
+        idx = menu("发行版", items, default=1)
+        if idx is None:
+            info("已取消")
+            return 1
+        distro = DISTROS[idx]
+    rels = [r[0] for r in distro.releases]
+    ok(f"{distro.name}")
 
     # ---- release --------------------------------------------------------
     rel = o.get("rel", "")
     if rel:
         if rel not in rels:
-            die(f"没有 Ubuntu {rel}；可选: {', '.join(rels)}")
-        ok(f"Ubuntu {rel}")
+            die(f"{distro.name} 没有 {rel}；可选: {', '.join(rels)}")
     else:
         items = []
-        for line in CATALOGUE.splitlines():
-            ver, code, lts, size = line.split("|")
-            desc = f"{code}" + (f"  {S.g}LTS{S.rst}" if lts else "") + f"  {size}"
+        for ver, code, tag, size in distro.releases:
+            desc = code + (f"  {S.g}{tag}{S.rst}" if tag else "") + f"  {size}"
             items.append((ver, desc))
-        idx = menu("Ubuntu 版本", items, default=rels.index(DEF_REL) + 1)
+        default = rels.index(DEF_REL) + 1 if DEF_REL in rels else 1
+        idx = menu(f"{distro.name} 版本", items, default=default)
         if idx is None:
             info("已取消")
             return 1
         rel = rels[idx]
-        ok(f"Ubuntu {rel}")
+    ok(f"{distro.name} {rel}")
     out()
 
     # ---- name -----------------------------------------------------------
     if not name:
-        name = ask("虚拟机名字", f"ubuntu{rel.replace('.', '')}")
+        name = ask("虚拟机名字",
+                   f"{distro.key}{rel.replace('.', '')}")
     if not valid_name(name):
         die(f"名字只能用字母数字和 _ . - ：{name}")
     if os.path.isdir(vm_dir(name)):
@@ -1170,16 +1285,16 @@ def cmd_create(rest: list[str]) -> int:
             if not re.fullmatch(r"[a-z_][a-z0-9_-]{0,31}", user):
                 die(f"用户名不合法: {user}")
             out()
-            got = ask_account()
+            got = ask_account(distro.default_user)
             user, pw = user, got[1]
         else:
-            user, pw = ask_account()
+            user, pw = ask_account(distro.default_user)
     out()
 
     # ---- summary --------------------------------------------------------
     out(f"{S.b}确认{S.rst}")
     out(f"  {S.dim}{rule(40)}{S.rst}")
-    for k, v in (("名字", name), ("Ubuntu", rel), ("vCPU", cpus),
+    for k, v in (("名字", name), ("发行版", f"{distro.name} {rel}"), ("vCPU", cpus),
                  ("物理核", mask_label(cores)), ("内存", f"{mem} MiB"),
                  ("磁盘", f"{disk} GiB"), ("缓存", cache),
                  ("端口映射", ", ".join(forwards)),
@@ -1198,7 +1313,8 @@ def cmd_create(rest: list[str]) -> int:
     d = vm_dir(name)
     os.makedirs(d, exist_ok=True)
     cfg = {
-        "NAME": name, "UBUNTU_REL": rel, "CPUS": cpus, "MEM": mem,
+        "NAME": name, "DISTRO": distro.key, "UBUNTU_REL": rel,
+        "CPUS": cpus, "MEM": mem,
         "DISK_GB": disk, "PORT": port, "CPUSET": cores,
         "NET_MODE": o.get("net", DEF_NET), "FORWARDS": ",".join(forwards),
         "CACHE_MODE": cache, "VM_USER": user, "VM_PASS": pw,
@@ -1223,14 +1339,14 @@ def cmd_create(rest: list[str]) -> int:
     # ---- cloud-init -----------------------------------------------------
     if not have("cloud-localds"):
         die("缺少 cloud-localds（apt-get install cloud-image-utils）")
-    write_seed(name, user, pw)
+    write_seed(name, user, pw, distro)
     ok("cloud-init 已生成")
 
     # ---- disk -----------------------------------------------------------
-    if not base_image(rel):
+    if not base_image(rel, distro):
         warn(f"镜像没拿到；稍后跑 ckvm image {rel} 再 ckvm rm {name} 重建")
     else:
-        make_disk(name, rel, int(disk))
+        make_disk(name, rel, int(disk), distro)
         ok(f"磁盘已就绪（{disk} GiB）")
 
     out()
@@ -1239,7 +1355,7 @@ def cmd_create(rest: list[str]) -> int:
     out()
     return 0
 
-def write_seed(name: str, user: str, pw: str) -> None:
+def write_seed(name: str, user: str, pw: str, distro: "Distro" = None) -> None:
     """Build user-data / meta-data, then let cloud-localds package them."""
     d = vm_dir(name)
     hashed = hash_pw(pw)
@@ -1252,11 +1368,16 @@ def write_seed(name: str, user: str, pw: str) -> None:
             f'    hashed_passwd: "{hashed}"\n'
         )
     else:
+        # Debian's default group for sudo rights is "sudo"; Fedora and Arch use
+        # "wheel".  The explicit sudo rule works either way, but naming the
+        # right group avoids a guest where sudo silently is not configured.
+        groups = "wheel" if (distro and distro.key in ("fedora", "arch")) \
+            else "sudo"
         user_block = (
             "users:\n"
             f"  - name: {user}\n"
             "    sudo: ALL=(ALL) NOPASSWD:ALL\n"
-            "    groups: sudo\n"
+            f"    groups: {groups}\n"
             "    shell: /bin/bash\n"
             "    lock_passwd: false\n"
             f'    hashed_passwd: "{hashed}"\n'
@@ -1297,9 +1418,9 @@ def hash_pw(pw: str) -> str:
             return out_.strip()
     # last resort: let chpasswd set it in plain text
     return pw
-def image_urls(rel: str) -> list[str]:
-    f = f"ubuntu-{rel}-server-cloudimg-arm64.img"
-    return [f"{m}/releases/{rel}/release/{f}" for m in MIRROR_IMAGES]
+def distro_of(cfg: dict) -> "Distro":
+    """The distro a guest uses.  Guests from before multi-distro are Ubuntu."""
+    return DISTRO_BY_KEY.get(cfg.get("DISTRO", "ubuntu"), UBUNTU)
 
 
 # A real cloud image is hundreds of MB.  Anything smaller is a partial
@@ -1307,32 +1428,57 @@ def image_urls(rel: str) -> list[str]:
 MIN_IMAGE = 100 * 1024 * 1024
 
 
-def cache_img(rel: str) -> str:
-    return os.path.join(CACHE_DIR, f"ubuntu-{rel}-arm64.img")
-
-
-def cache_ready(rel: str) -> bool:
-    p = cache_img(rel)
+def cache_ready_path(p: str) -> bool:
     try:
         return os.path.isfile(p) and os.path.getsize(p) >= MIN_IMAGE
     except OSError:
         return False
 
 
-def base_image(rel: str) -> bool:
+def cache_img(rel: str, distro: "Distro" = None) -> str:
+    d = distro or UBUNTU
+    return os.path.join(CACHE_DIR, d.cache_file(rel))
+
+
+def find_cached(rel: str, distro: "Distro" = None) -> "str | None":
+    """
+    The cached image for a release, if any.
+
+    With no distro given it also checks the other families, so a release whose
+    number is unique (13, 42) is found regardless of who cached it.
+    """
+    d = distro or UBUNTU
+    p = cache_img(rel, d)
+    if cache_ready_path(p):
+        return p
+    if distro is None:
+        for other in DISTROS:
+            p2 = cache_img(rel, other)
+            if cache_ready_path(p2):
+                return p2
+    return None
+
+
+def cache_ready(rel: str, distro: "Distro" = None) -> bool:
+    return find_cached(rel, distro) is not None
+
+
+def base_image(rel: str, distro: "Distro" = None) -> bool:
     """Make sure the shared cache holds this release."""
+    d = distro or UBUNTU
     os.makedirs(CACHE_DIR, exist_ok=True)
-    dst = cache_img(rel)
-    if cache_ready(rel):
-        ok(f"使用缓存 Ubuntu {rel}（{human(os.path.getsize(dst))}，跳过下载）")
+    found = find_cached(rel, d)
+    if found:
+        ok(f"使用缓存 {d.name} {rel}（{human(os.path.getsize(found))}，跳过下载）")
         return True
+    dst = cache_img(rel, d)
     if os.path.isfile(dst):
         warn("缓存里那份不完整，重新下载")
         os.remove(dst)
-    for url in image_urls(rel):
+    for url in d.urls(rel):
         info(f"下载 {url}")
         rc = run(download_cmd(url, dst))
-        if rc == 0 and cache_ready(rel):
+        if rc == 0 and cache_ready_path(dst):
             ok(f"已缓存 {human(os.path.getsize(dst))}")
             return True
         warn("这个源不行，换下一个")
@@ -1364,14 +1510,18 @@ def download_cmd(url: str, outfile: str) -> list[str]:
     return ["curl", "-fL", "--progress-bar", "-C", "-", "-o", outfile, url]
 
 
-def make_disk(name: str, rel: str, disk_gb: int) -> None:
+def make_disk(name: str, rel: str, disk_gb: int,
+              distro: "Distro" = None) -> None:
     d = vm_dir(name)
     img = os.path.join(d, "disk.qcow2")
     if os.path.isfile(img) and os.path.getsize(img) > 1024 * 1024:
         info("磁盘已存在")
     else:
+        src = find_cached(rel, distro)
+        if not src:
+            raise RuntimeError(f"缓存里没有 {rel} 的镜像")
         info("从缓存复制基础镜像...")
-        shutil.copyfile(cache_img(rel), img)
+        shutil.copyfile(src, img)
     run(["qemu-img", "resize", img, f"{disk_gb}G"])
 
 
@@ -2105,36 +2255,71 @@ def save_forwards(name: str, forwards: list[str]) -> None:
 # --------------------------------------------------------------------------
 def cmd_image(rest: list[str]) -> int:
     banner()
-    if not rest:
-        header("🖼  可用镜像")
-        for line in CATALOGUE.splitlines():
-            ver, code, lts, size = line.split("|")
-            have_it = cache_ready(ver)
-            mark = f"{S.g}✓ 已缓存{S.rst}" if have_it else f"{S.dim}未下载{S.rst}"
-            out(f"  {pad(ver, 8)} {pad(code, 12)} {pad(size, 6)} {mark}")
-        out()
-        info("下载： ckvm image <版本>      例如 ckvm image 26.04")
+    # --distro selects the family; the release may also be given as
+    # "debian:13" or "13" (searched across families)
+    want_distro = ""
+    args = []
+    i = 0
+    while i < len(rest):
+        if rest[i] == "--distro" and i + 1 < len(rest):
+            want_distro = rest[i + 1]
+            i += 2
+            continue
+        args.append(rest[i])
+        i += 1
+
+    if not args:
+        for d in DISTROS:
+            if want_distro and d.key != want_distro:
+                continue
+            header(f"🖼  {d.name}", d.note)
+            for ver, code, tag, size in d.releases:
+                have_it = cache_ready(ver, d)
+                mark = f"{S.g}✓ 已缓存{S.rst}" if have_it else f"{S.dim}未下载{S.rst}"
+                out(f"  {pad(ver, 8)} {pad(code, 12)} {pad(size, 6)} {mark}")
+            out()
+        info("下载： ckvm image <版本>        例如 ckvm image 26.04")
+        info("      ckvm image 13 --distro debian")
         out()
         return 0
 
-    # a release, or a guest name whose release we should fetch
-    target = rest[0]
-    rels = [l.split("|")[0] for l in CATALOGUE.splitlines()]
-    if target in rels:
-        rel = target
-    elif os.path.isfile(vm_conf(target)):
-        rel = load_vm(target).get("UBUNTU_REL", DEF_REL)
-        info(f"{target} 用的是 Ubuntu {rel}")
+    target = args[0]
+    distro = None
+    rel = ""
+    if ":" in target:
+        dk, _, rv = target.partition(":")
+        if dk not in DISTRO_BY_KEY:
+            die(f"不支持的发行版: {dk}；可选: {', '.join(DISTRO_BY_KEY)}")
+        distro, rel = DISTRO_BY_KEY[dk], rv
+        if rel not in [r[0] for r in distro.releases]:
+            die(f"{distro.name} 没有 {rel}")
     else:
-        die(f"不是已知版本也不是虚拟机: {target}\n"
-            f"     版本有: {', '.join(rels)}")
+        if want_distro:
+            if want_distro not in DISTRO_BY_KEY:
+                die(f"不支持的发行版: {want_distro}")
+            distro = DISTRO_BY_KEY[want_distro]
+        for d in ([distro] if distro else DISTROS):
+            if target in [r[0] for r in d.releases]:
+                distro, rel = d, target
+                break
+        if not distro:
+            if os.path.isfile(vm_conf(target)):
+                cfg = load_vm(target)
+                distro = distro_of(cfg)
+                rel = cfg.get("UBUNTU_REL", DEF_REL)
+                info(f"{target} 用的是 {distro.name} {rel}")
+            else:
+                allr = ", ".join(f"{d.key}:{r[0]}"
+                                 for d in DISTROS for r in d.releases)
+                die(f"不是已知版本也不是虚拟机: {target}\n     可选: {allr}")
 
-    header(f"🖼  Ubuntu {rel}")
-    if cache_ready(rel):
-        ok(f"已在缓存里（{human(os.path.getsize(cache_img(rel)))}）")
+    header(f"🖼  {distro.name} {rel}")
+    found = find_cached(rel, distro)
+    if found:
+        ok(f"已在缓存里（{human(os.path.getsize(found))}）")
         out()
         return 0
-    if base_image(rel):
+    if base_image(rel, distro):
         out()
         ok("可以创建虚拟机了： ckvm create")
         out()
