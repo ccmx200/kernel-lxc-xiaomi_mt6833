@@ -65,15 +65,16 @@ APT_MIRRORS = [
 ]
 
 # The repo lives behind several accelerators; the user picks, we do not.
+# Only these two served raw files from the device when tested; git.yylx.win
+# proxies git clone only and returns 404 for raw content.
 GITHUB_ACCEL = [
-    ("", "直连 GitHub（不加速）"),
-    ("https://git.yylx.win/", "git.yylx.win"),
-    ("https://ghproxy.net/", "ghproxy.net"),
-    ("https://gh-proxy.com/", "gh-proxy.com"),
-    ("https://mirror.ghproxy.com/", "mirror.ghproxy.com"),
+    ("https://ghproxy.net/", "ghproxy.net（实测可用）"),
+    ("https://gh-proxy.com/", "gh-proxy.com（实测可用）"),
+    ("", "直连 GitHub（国内通常不通）"),
 ]
 
-REPO_RAW = "https://raw.githubusercontent.com/ccmx200/kernel-lxc-xiaomi_mt6833/refs/heads/resukisu"
+# NOTE: the short /<branch>/ form.  /refs/heads/<branch>/ returned HTTP 500.
+REPO_RAW = "https://raw.githubusercontent.com/ccmx200/kernel-lxc-xiaomi_mt6833/resukisu"
 
 # version | codename | lts | size
 CATALOGUE = """\
@@ -1377,15 +1378,25 @@ def cmd_install(rest: list[str]) -> int:
         else:
             accel = pick_accel()
         os.makedirs(FW_DIR, exist_ok=True)
-        okall = True
-        for fn in (FW_CODE, FW_VARS):
-            url = f"{accel}{REPO_RAW}/kvm_manager/{fn}"
-            info(f"下载 {fn}")
-            rc = run(download_cmd(url, os.path.join(FW_DIR, fn)))
-            if rc != 0 or not os.path.isfile(os.path.join(FW_DIR, fn)):
-                warn(f"{fn} 下载失败")
-                okall = False
+
+        # try the chosen accelerator, then the rest of the list, so a dead
+        # mirror does not end the install
+        order = [accel] + [a for a, _ in GITHUB_ACCEL if a != accel]
+        okall = False
+        for pref in order:
+            good = True
+            for fn in (FW_CODE, FW_VARS):
+                url = f"{pref}{REPO_RAW}/kvm_manager/{fn}"
+                dest = os.path.join(FW_DIR, fn)
+                info(f"下载 {fn}  ({pref or '直连'})")
+                rc = run(download_cmd(url, dest))
+                if rc != 0 or not os.path.isfile(dest)                         or os.path.getsize(dest) < 1024 * 1024:
+                    good = False
+                    break
+            if good:
+                okall = True
                 break
+            warn(f"{(pref or '直连')} 不行，换下一个")
         if okall:
             ok(f"固件已安装到 {FW_DIR}")
         else:

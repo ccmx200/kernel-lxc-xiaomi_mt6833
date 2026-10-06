@@ -1,4 +1,4 @@
-# ckvm — KVM 虚拟机管理器
+# ckvm 2.0 — KVM 虚拟机管理器
 
 在 **MT6833 / evergo**（小米天玑 810 机型）上跑**硬件加速**的 KVM 虚拟机。
 
@@ -6,7 +6,7 @@
 虚拟机那样随便配。
 
 ```
-  ckvm · KVM 虚拟机管理器                              v1.12
+  ckvm · KVM 虚拟机管理器                              v2.0
   作者  璀璨梦星 · cuicanmx            github.com/ccmx200
 ```
 
