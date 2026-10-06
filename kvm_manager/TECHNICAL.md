@@ -12,7 +12,8 @@
 > **许可**：ckvm 采用 **GPL-2.0**，与所在内核仓库一致。它下载或驱动的
 > 外部组件（Ubuntu 镜像、EDK2 固件、`mtk-soc-disable-geniezone` 等）各有
 > 其许可，见 kvm_manager/README.md 的「作者与许可」一节。
-面向需要排查问题、移植到别的机型、或想改这套东西的人。
+
+本文面向需要排查问题、移植到别的机型、或想改这套东西的人。
 
 用户向的用法说明在 [README.md](README.md)。
 
@@ -32,7 +33,7 @@
 10. [参考出处](#10-参考出处)
 11. [在红米 Note 11 5G（MT6833）上禁用 GenieZone 并释放 EL2](#11-在红米-note-11-5gmt6833上禁用-geniezone-并释放-el2)
 12. [物理核使用：从"必须绑核"到"随便配"](#12-物理核使用从必须绑核到随便配) ← **核心章节**
-13. [自检：为什么装完要真启一台虚拟机](#13-自检为什么装完要真启一台虚拟机)
+13. [自检](#13-自检)
 14. [镜像缓存](#14-镜像缓存)
 15. [附：本机原始测量记录](#附本机原始测量记录)
 
@@ -650,75 +651,78 @@ spin "扩容到 ${DISK_GB}G" qemu-img resize "$img" "${DISK_GB}G"
 
 ### 7.4 脚本自身的下载源
 
-**默认是 GitHub 官方地址，不做任何加速或改写。** 加速需显式请求：
+ckvm 是 Python 程序，**没法在自己还没跑起来的时候安装自己**，所以由一个极小的
+POSIX sh 包装（`install2.sh`）先取 `ckvm.py`，校验，再执行 `install`。
 
-#### 为什么 URL 用 `refs/heads/<branch>`
+#### 为什么路径是 `<branch>` 而不是 `refs/heads/<branch>`
 
-GitHub 的加速镜像按 **URL 路径**缓存。实测同一个仓库、同一份文件：
-
-```text
-.../resukisu/kvm_manager/kvm-vm.sh             51871 bytes   stale
-.../refs/heads/resukisu/kvm_manager/kvm-vm.sh  56456 bytes   FRESH
-```
-
-响应头证实了缓存行为：
+一开始按 `refs/heads/resukisu/...` 写，全部失败。从设备逐条实测：
 
 ```text
-cache-control: max-age=300
-x-cache: HIT
-x-cache-hits: 24
+raw.githubusercontent.com/<repo>/resukisu/...            200
+raw.githubusercontent.com/<repo>/refs/heads/resukisu/... 500
 ```
 
-裸分支名命中了缓存条目（`HIT`，已命中 24 次），而完整 ref 路径是新的
-缓存键。两者内容相同，只是路径写法不同 —— 所以脚本统一使用
-`refs/heads/resukisu`。
+**短格式可用，`refs/heads/` 形式被 GitHub 的 raw 主机拒绝。** 之前的记录
+（认为 `refs/heads/` 才新鲜）是早期在另一个镜像上测的，缓存行为已经变了，
+那份结论对当前环境是错的。
+
+#### 哪些加速可用
+
+从设备实测（同一个文件，逐个请求）：
+
+| 地址 | 结果 |
+|---|---|
+| `ghproxy.net/https://raw.githubusercontent.com/...` | **200** ✅ |
+| `gh-proxy.com/https://raw.githubusercontent.com/...` | **200** ✅ |
+| 直连 `raw.githubusercontent.com` | 连接重置 |
+| `git.yylx.win/raw.githubusercontent.com/...` | **404** ❌ |
+| `ghfast.top` / `raw.gitmirror.com` / `cdn.jsdelivr.net` | 失败 |
+| `hub.gitmirror.com` / `ghproxy.cc` / `raw.kkgithub.com` | 失败 |
+
+**`git.yylx.win` 只代理 `git clone`，不代理 raw 文件**（`git ls-remote` 和
+clone 都通，raw 一律 404）。所以基于 clone 的安装方案在这里同样不可行。
+
+#### 缓存是按路径的，绕不过
+
+`install.sh` 这个路径被国内镜像缓存到了旧版本。加查询参数、换用另一个加速，
+拿到的都是同一份旧文件 —— 说明缓存键是路径，客户端没有别的杠杆。
+解决办法是**换一个新文件名**（`install2.sh`），并把 `install.sh` 留成转发存根，
+这样已经写进文档的旧地址在缓存过期后仍然能用。
+
+`install2.sh` 里带 `INSTALLER_VERSION`，一眼能看出是不是旧副本。
+
+#### 安装脚本的选择顺序
+
+`ghproxy.net → gh-proxy.com → 直连`，每个下载都用
+`python3 -c "import ast; ast.parse(...)"` 校验过才算成功，
+并用第一个通过的。想固定一个：
 
 ```bash
-install -cn                    # 探测内置列表
-install -cn <url>              # 用用户自己的地址
-install --repo <url>
-CKVM_ACCEL=<url>
+sh install2.sh --from https://ghproxy.net/
 ```
 
-`-cn <url>` 接受三种形式，都会自动补上仓库路径（`normalise_mirror()`）：
-
-| 输入 | 规范化结果 |
-|---|---|
-| `https://ghproxy.net/https://raw.githubusercontent.com` | 原样使用（已含完整前缀） |
-| `https://ghproxy.net` | `https://ghproxy.net/github.com/ccmx200/...` |
-| `ghproxy.net` | `https://ghproxy.net/github.com/ccmx200/...` |
-| `https://p/{url}` 或 `https://p/%s` | 占位符替换为真实 GitHub 地址 |
-
-用户给的地址不通时**明确报错并回落 GitHub**，不静默换源。
-
-本机实测：`raw.githubusercontent.com` 与 `github.com` 均
-`Connection reset by peer`（TLS 被重置）；`git.yylx.win`、`ghproxy.net`、
-`gh-proxy.com` 均返回 200。
+失败会明确报错并给出可手动执行的命令，不会静默换源。
 
 ### 7.4.1 为什么要校验下载
 
-`install` 之前会把镜像返回的**任何**字节直接写进 `/usr/local/bin/ckvm`。
-两种失败都真实发生过：
+包装脚本会把镜像返回的**任何**字节交给 `python3` 执行，所以必须验。
 
-| 情况 | 症状 |
-|---|---|
-| 镜像发旧版本 | 缺少新命令（`ckvm versions` 报 usage） |
-| 响应被截断（实测抓到 2993 字节的错误响应） | 脚本解析到一半失败，运行时报 `--fwd: command not found` |
-
-现在下载必须通过全部检查才会替换目标文件：
-
-```bash
-verify_download() {
-    head -1 "$f" | grep -q '^#!/bin/bash'   || return 1
-    grep -q 'CKVM_BUILD=' "$f"              || return 1   # 版本标记
-    grep -q 'cmd_versions()' "$f"           || return 1   # 特征函数
-    bash -n "$f" 2>/dev/null                || return 1   # 能解析
+```sh
+looks_valid() {
+    [ -s "$TMP" ] || return 1
+    head -1 "$TMP" | grep -q python || return 1
+    python3 -c "import ast,sys; ast.parse(open(sys.argv[1]).read())" "$TMP"
 }
 ```
 
-脚本顶部因此有一个 `CKVM_BUILD` 标记，新功能上线时一并更新。
+三道：非空、首行是 Python、**能整体解析**。第三道是关键 —— 被截断的响应
+往往前几行看着正常，只有解析整个文件才会暴露。校验不过就换下一个源，
+全部失败才报错。
 
----
+早期用 shell 写时有另一套标记（`#!/bin/bash`、`CKVM_BUILD=`、特征函数名、
+`bash -n`）。改成 Python 后这些不再适用，改为 `ast.parse`，它同时覆盖了
+「是不是 Python」和「完不完整」两件事。
 
 ### 7.5 安装的原子性
 
@@ -1898,66 +1902,70 @@ gcc -D_GNU_SOURCE -O0 -o kvm_exh kvm_exhaustive.c -lpthread
 
 ---
 
-## 13. 自检：为什么装完要真启一台虚拟机
+## 13. 自检
 
-`ckvm install` 原本的校验（`verify_download`）只做四件事：文件非空、首行是
-`#!/bin/bash`、含 `CKVM_BUILD=`、`bash -n` 通过。它保证的是**下载没有损坏
-或被镜像投毒**，不保证**装完能跑**。
-
-这个区别在开发过程中反复造成误判：文件是好的、命令能执行、帮助能打印，
-但虚拟机根本起不来。文件级校验测不出下列任何一项：
-
-| 故障 | 现象 | 文件校验 |
-|---|---|---|
-| 固件写 NVRAM 卡死 | guest 停在 UEFI，永不进内核 | 通过 |
-| 核掩码跨簇被拒 | QEMU 立即退出 `Failed to put registers` | 通过 |
-| 空 host key | guest 起来了但 sshd `no hostkeys` 退出 | 通过 |
-| 固件断言 | `ASSERT [ArmPlatformPrePeiCore]` | 通过 |
-| 磁盘/镜像损坏 | 启动后找不到根文件系统 | 通过 |
-
-### 13.1 `ckvm selftest` 做什么
-
-分两段。第一段是**廉价的环境检查**，任一失败就跳过第二段，不必等下载：
+`ckvm selftest` **只检查配置，不启动任何虚拟机**。这样它瞬间完成、随时可跑，
+也不需要先下载几个 GB 的镜像。
 
 ```text
-root / qemu-system-aarch64 / /dev/kvm / cloud-localds / firmware / free disk
+$ ckvm selftest
+
+  自检  只检查配置，不启动虚拟机
+  ────────────────────────────────────────────────────────────────────
+
+    ✅ root 权限
+    ✅ /dev/kvm
+    ✅ qemu-system-aarch64
+    ✅ qemu-img
+    ✅ cloud-localds
+    ✅ UEFI 固件
+    ✅ 固件大小             64.0M
+    ✅ CPU 拓扑             8 核，小核 367 / 大核 1024
+    ✅ 内存                 总 5.5G，可用 1.4G
+    ✅ 磁盘                 /var/lib/ckvm 可用 91.4G
+    ✅ 虚拟机               1 台
+    ✅ 镜像缓存             1 个，901.7M
+    ✅ apt 源               https://mirror.nju.edu.cn/debian
+
+  ✅ 全部通过
+
+  下一步： ckvm create
 ```
 
-第二段是**真实的启动验证**：建一台一次性 guest（2 vCPU、1024 MiB、3G 磁盘、
-全核掩码），用与 `ckvm start` 相同的 QEMU 参数启动，然后断言：
+### 13.1 检查项为什么是这些
 
-* QEMU 进程存活（即核掩码与固件都被接受）
-* 串口出现 `login:`，并记录耗时
-* guest 报告了 CPU 数量（接受 `SMP: Total of N` 与 `Brought up 1 node, N CPU`
-  两种写法 —— 只测一种会在单 vCPU 时误报）
-* 串口里没有 `ASSERT` 或 `Synchronous exception`
+| 项 | 不做会怎样 |
+|---|---|
+| root / `/dev/kvm` | KVM 用不了，只剩软件模拟 |
+| 三个必需命令 | 创建到一半才失败 |
+| UEFI 固件与大小 | guest 停在 UEFI，看不出原因 |
+| CPU 拓扑（`cpu_capacity`）| 掩码选错也不知道大小核 |
+| 内存 / 磁盘余量 | 启动时 QEMU 才报错 |
+| apt 源 | 官方源在国内很慢，装依赖会像卡死 |
 
-结束后自动删除测试机；`--keep` 保留它供 `ckvm console` 检查。
+固件大小用「大于 1 MB」判断：真实的 EDK2 blob 是 64 MB，比这小的只可能是
+错误页面或半截下载。
 
-### 13.2 实现上踩到的坑
+### 13.2 曾经写过一个永远通过的检查
 
-写这个自检时踩了几个，都记在这里以免以后重复：
+早期版本里有这么一行：
 
-1. **不能只拷 `uefi-vars.fd`。** `cmd_create` 会拷**两个**固件文件
-   （`uefi-code.fd` 与 `uefi-vars.fd`），只拷一个 QEMU 会报
-   `Could not open .../uefi-code.fd`。自检里必须照做。
-2. **必须写 `qemu.pid`。** `running_pid` 是读这个文件的，不写它就认为
-   QEMU 没起来 —— 即使 QEMU 已经正常引导。症状是"启动失败"但
-   `qemu.err` 是空的。
-3. **颜色变量名是 `C_G` / `C_R`**，不是 `C_GREEN` / `C_RED`；用错会在
-   `set -u` 下直接中断。
-4. **测试脚本里别用 `pkill -f ckvm-selftest`** —— 它连自己的命令行一起匹配，
-   会把发起测试的 shell 杀掉。用 `pkill -f 'name ckvm-selftest'`。
-5. **1 个 vCPU 的 guest 不稳。** 有一次固件抛异常（串口出现
-   `X29=... SP=... PSTATE=... EL1h`）。自检改用 2 vCPU，既更接近实际使用，
-   也更稳。
+```python
+add("固件不写 NVRAM",
+    b"NonVolatile" not in open(code, "rb").read(4096) or True, "")
+```
+
+`or True` 让它恒为真 —— 是占位符忘了填。**永远通过的检查比没有检查更糟**，
+它会让人以为刻度是可信的。这条已经删掉：从固件二进制里没有便宜的办法判断
+这个属性，所以就不假装能判断。
+
+真正的后果（NVRAM 被污染导致 GRUB 卡住）在 `start` 时处理 ——
+每次启动都从模板重新拷 `uefi-vars.fd`。
 
 ### 13.3 与第 12 节的关系
 
-自检用的掩码是 `CORESET_FULL`（全核），也就是第 12 节那个"先钉单核再放开"
-的路径。所以自检同时也在验证核掩码逻辑 —— 如果有人把
-`widen_affinity` 改坏了，`ckvm selftest` 会当场失败。
-
+`selftest` 只读 `cpu_capacity` 来确认大小核划分，不验证跨簇。跨簇能不能用是
+内核侧的事（第 12 章），由 `ckvm status` 里实际生效的亲和掩码来体现。
 
 ## 14. 镜像缓存
 
@@ -2075,7 +2083,7 @@ ssh               172.28.100.2:22 -> SSH-2.0-OpenSSH_10.2p1 Ubuntu-2ubuntu3.6
 ```text
 raw.githubusercontent.com   Connection reset by peer
 github.com                  Connection reset by peer
-git.yylx.win                200
+git.yylx.win                404（只代理 git clone，不代理 raw）
 ghproxy.net                 200
 gh-proxy.com                200
 mirror.nju.edu.cn           200

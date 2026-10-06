@@ -773,7 +773,8 @@ def usage() -> None:
     banner()
     out(f"{S.b}用法{S.rst}")
     out()
-    out(f"  ckvm create [名字]        交互式创建虚拟机")
+    out(f"  ckvm create               交互式创建（一步一步问）")
+    out(f"  ckvm create <名字> [选项]  命令式创建，见 ckvm create --help")
     out(f"  ckvm list                 列出虚拟机")
     out(f"  ckvm start <名字> [-f]    启动（-f 前台）")
     out(f"  ckvm stop <名字>          停止")
@@ -958,52 +959,175 @@ def ask_account() -> tuple[str, str]:
 
 
 def cmd_create(rest: list[str]) -> int:
+    """
+    Interactive when it needs to be, command-driven when given flags.
+
+    Any option supplied here is used as-is and not asked again; anything left
+    out is asked.  So `ckvm create` is the full wizard and
+    `ckvm create web --rel 24.04 --cpus 4 --pass x` runs straight through.
+    """
     banner()
+
+    # ---- parse options -------------------------------------------------
+    # switches take no value; everything else does
+    SWITCHES = {"yes", "y", "interactive", "i", "on", "off"}
+    o: dict[str, str] = {}
+    name = ""
+    i = 0
+    while i < len(rest):
+        a = rest[i]
+        if a.startswith("--"):
+            key = a[2:]
+            if key in SWITCHES:
+                o[key] = "1"
+                i += 1
+                continue
+            if i + 1 >= len(rest):
+                die(f"{a} 后面要跟一个值")
+            o[key] = rest[i + 1]
+            i += 2
+        elif a == "-i":
+            o["interactive"] = "1"
+            i += 1
+        elif not name:
+            name = a
+            i += 1
+        else:
+            i += 1
+
+    unknown = sorted(set(o) - {"rel", "cpus", "cores", "mem", "disk", "port",
+                               "net", "fwd", "user", "pass", "cache", "tune",
+                               "hostname", "yes", "interactive"})
+    if unknown:
+        die(f"不认识的选项: {' '.join('--' + u for u in unknown)}\n"
+            f"     可用: --rel --cpus --cores --mem --disk --port --net "
+            f"--fwd --user --pass --cache --tune --yes")
+
     header("创建 Ubuntu 虚拟机")
 
-    # version
-    items = []
-    for line in CATALOGUE.splitlines():
-        ver, code, lts, size = line.split("|")
-        desc = f"{code}" + (f"  {S.g}LTS{S.rst}" if lts else "") + f"  {size}"
-        items.append((ver, desc))
-    idx = menu("Ubuntu 版本", items,
-               default=[l.split("|")[0] for l in CATALOGUE.splitlines()].index(DEF_REL) + 1)
-    if idx is None:
-        info("已取消")
-        return 1
-    rel = CATALOGUE.splitlines()[idx].split("|")[0]
-    ok(f"Ubuntu {rel}")
+    rels = [l.split("|")[0] for l in CATALOGUE.splitlines()]
+
+    # ---- release --------------------------------------------------------
+    rel = o.get("rel", "")
+    if rel:
+        if rel not in rels:
+            die(f"没有 Ubuntu {rel}；可选: {', '.join(rels)}")
+        ok(f"Ubuntu {rel}")
+    else:
+        items = []
+        for line in CATALOGUE.splitlines():
+            ver, code, lts, size = line.split("|")
+            desc = f"{code}" + (f"  {S.g}LTS{S.rst}" if lts else "") + f"  {size}"
+            items.append((ver, desc))
+        idx = menu("Ubuntu 版本", items, default=rels.index(DEF_REL) + 1)
+        if idx is None:
+            info("已取消")
+            return 1
+        rel = rels[idx]
+        ok(f"Ubuntu {rel}")
     out()
 
-    name = ask("虚拟机名字", f"ubuntu{rel.replace('.', '')}")
+    # ---- name -----------------------------------------------------------
+    if not name:
+        name = ask("虚拟机名字", f"ubuntu{rel.replace('.', '')}")
     if not valid_name(name):
         die(f"名字只能用字母数字和 _ . - ：{name}")
     if os.path.isdir(vm_dir(name)):
         die(f"'{name}' 已经存在")
-    cpus = ask("vCPU 数量", str(DEF_CPUS))
+
+    # ---- cpu ------------------------------------------------------------
+    cpus = o.get("cpus", "")
+    if not cpus:
+        cpus = ask("vCPU 数量", str(DEF_CPUS))
     if not cpus.isdigit() or int(cpus) < 1:
         die("vCPU 必须是正整数")
     out()
-    cores = ask_cores()
-    out()
-    mem = ask("内存 (MiB)", str(DEF_MEM))
-    disk = ask("磁盘 (GiB)", str(DEF_DISK))
-    out()
-    cache = ask_cache()
-    out()
-    idx = menu("安装后自动优化", [
-        ("启用", "装软件包会快一些"),
-        ("不启用", "保持系统默认"),
-    ], default=1, extra="之后随时可以改： ckvm tune <名字> / --revert")
-    do_tune = "yes" if idx == 0 else "no"
-    out()
-    forwards = edit_forwards([DEF_FORWARDS], next_free_port())
-    out()
-    user, pw = ask_account()
+
+    # ---- physical cores -------------------------------------------------
+    cores = o.get("cores", "")
+    if cores:
+        if cores == "all":
+            cores = DEF_CORES
+        elif cores == "big":
+            cores = "6-7"
+        try:
+            cs = mask_cores(cores)
+        except ValueError as e:
+            die(f"--cores {cores}: {e}")
+        bad = [c for c in cs if c > 7]
+        if bad:
+            die(f"这台机器只有核 0-7，越界: {bad}")
+        ok(f"{mask_label(cores)}")
+    else:
+        cores = ask_cores()
     out()
 
-    # summary - includes the login, because it is chosen above
+    # ---- memory / disk --------------------------------------------------
+    mem = o.get("mem", "") or ask("内存 (MiB)", str(DEF_MEM))
+    disk = o.get("disk", "") or ask("磁盘 (GiB)", str(DEF_DISK))
+    for label, v, lo in (("内存", mem, 256), ("磁盘", disk, 2)):
+        if not v.isdigit() or int(v) < lo:
+            die(f"{label} 至少 {lo}，收到: {v}")
+    out()
+
+    # ---- cache ----------------------------------------------------------
+    cache = o.get("cache", "")
+    if cache:
+        if cache not in CACHE_MODES:
+            die(f"--cache 只能是: {', '.join(CACHE_MODES)}")
+    else:
+        cache = ask_cache()
+        out()
+
+    # ---- tune -----------------------------------------------------------
+    tune = o.get("tune", "")
+    if tune:
+        do_tune = "yes" if tune.lower() in ("yes", "y", "1", "on", "true") else "no"
+    else:
+        idx = menu("安装后自动优化", [
+            ("启用", "装软件包会快一些"),
+            ("不启用", "保持系统默认"),
+        ], default=1, extra="之后随时可以改： ckvm tune <名字> / --revert")
+        do_tune = "yes" if idx != 1 else "no"
+    out()
+
+    # ---- forwards -------------------------------------------------------
+    fwd = o.get("fwd", "")
+    if fwd:
+        forwards = []
+        for part in fwd.split(","):
+            part = part.strip()
+            if not part:
+                continue
+            try:
+                forwards.append(forward_text(part))
+            except ValueError as e:
+                die(f"--fwd {part}: {e}")
+        if not forwards:
+            die("--fwd 是空的")
+    else:
+        forwards = edit_forwards([DEF_FORWARDS], next_free_port())
+    out()
+
+    # ---- account --------------------------------------------------------
+    user = o.get("user", "")
+    pw = o.get("pass", "") or os.environ.get("CKVM_PW", "")
+    if user and pw:
+        if not re.fullmatch(r"[a-z_][a-z0-9_-]{0,31}", user):
+            die(f"用户名不合法: {user}")
+        ok(f"登录 {user}")
+    else:
+        if user:
+            if not re.fullmatch(r"[a-z_][a-z0-9_-]{0,31}", user):
+                die(f"用户名不合法: {user}")
+            out()
+            got = ask_account()
+            user, pw = user, got[1]
+        else:
+            user, pw = ask_account()
+    out()
+
+    # ---- summary --------------------------------------------------------
     out(f"{S.b}确认{S.rst}")
     out(f"  {S.dim}{rule(40)}{S.rst}")
     for k, v in (("名字", name), ("Ubuntu", rel), ("vCPU", cpus),
@@ -1011,52 +1135,51 @@ def cmd_create(rest: list[str]) -> int:
                  ("磁盘", f"{disk} GiB"), ("缓存", cache),
                  ("端口映射", ", ".join(forwards)),
                  ("登录", f"{user} / {'*' * len(pw)}"),
-                 ("内部优化", "创建后启用" if do_tune == "yes" else "不启用")):
+                 ("内部优化", "启用" if do_tune == "yes" else "不启用")):
         out(f"  {pad(k, 8)} {v}")
     out(f"  {S.dim}{rule(40)}{S.rst}")
     out()
-    if not confirm("开始创建"):
+    if not o.get("yes") and not confirm("开始创建"):
         info("已取消")
         return 1
     out()
-    port = next_free_port()
 
-    # ---- write the config ------------------------------------------
+    # ---- write config ---------------------------------------------------
+    port = o.get("port", "") or str(next_free_port())
     d = vm_dir(name)
     os.makedirs(d, exist_ok=True)
     cfg = {
         "NAME": name, "UBUNTU_REL": rel, "CPUS": cpus, "MEM": mem,
         "DISK_GB": disk, "PORT": port, "CPUSET": cores,
-        "NET_MODE": DEF_NET, "FORWARDS": ",".join(forwards),
+        "NET_MODE": o.get("net", DEF_NET), "FORWARDS": ",".join(forwards),
         "CACHE_MODE": cache, "VM_USER": user, "VM_PASS": pw,
-        "TUNE": do_tune,
-        "VM_HOSTNAME": name,
+        "TUNE": do_tune, "VM_HOSTNAME": o.get("hostname", name),
     }
     with open(vm_conf(name), "w", encoding="utf-8") as fh:
         for k, v in cfg.items():
             fh.write(f"{k}={v}\n")
     ok(f"配置已写入 {vm_conf(name)}")
 
-    # ---- firmware ---------------------------------------------------
-    ok_src = os.path.join(FW_DIR, FW_CODE)
-    if not os.path.isfile(ok_src):
-        die(f"缺少固件 {ok_src}\n"
-            f"     它应该在安装 ckvm 时放进 {FW_DIR}")
-    shutil.copyfile(ok_src, os.path.join(d, "uefi-code.fd"))
+    # ---- firmware -------------------------------------------------------
+    code_src = os.path.join(FW_DIR, FW_CODE)
+    if not os.path.isfile(code_src):
+        die(f"缺少固件 {code_src}\n"
+            f"     跑 ckvm install 会装好")
+    shutil.copyfile(code_src, os.path.join(d, "uefi-code.fd"))
     var_src = os.path.join(FW_DIR, FW_VARS)
     if os.path.isfile(var_src):
         shutil.copyfile(var_src, os.path.join(d, "uefi-vars.fd"))
     ok("UEFI 固件已就位")
 
-    # ---- cloud-init seed -------------------------------------------
+    # ---- cloud-init -----------------------------------------------------
     if not have("cloud-localds"):
         die("缺少 cloud-localds（apt-get install cloud-image-utils）")
     write_seed(name, user, pw)
     ok("cloud-init 已生成")
 
-    # ---- disk image ------------------------------------------------
+    # ---- disk -----------------------------------------------------------
     if not base_image(rel):
-        warn("镜像没准备好，稍后可跑 ckvm image " + name)
+        warn(f"镜像没拿到；稍后跑 ckvm image {rel} 再 ckvm rm {name} 重建")
     else:
         make_disk(name, rel, int(disk))
         ok(f"磁盘已就绪（{disk} GiB）")
@@ -1066,7 +1189,6 @@ def cmd_create(rest: list[str]) -> int:
     out(f"  {S.dim}启动它：{S.rst} {S.b}ckvm start {name}{S.rst}")
     out()
     return 0
-
 
 def write_seed(name: str, user: str, pw: str) -> None:
     """Build user-data / meta-data, then let cloud-localds package them."""
@@ -1767,6 +1889,7 @@ def cmd_ssh(rest: list[str]) -> int:
 
     if "-p" in rest or "--print" in rest:
         print(cmd)
+        print(f"# 密码 {cfg.get('VM_PASS','')}")
         return 0
 
     out(f"  {S.dim}密码 {cfg.get('VM_PASS','')}{S.rst}")
@@ -1812,7 +1935,9 @@ def cmd_status(rest: list[str]) -> int:
     out(f"  {pad('配置', 8)} {cfg.get('CPUS','?')} vCPU, {cfg.get('MEM','?')} MiB, "
         f"磁盘 {cfg.get('DISK_GB','?')}G, 端口 {cfg.get('PORT','?')}")
     out(f"  {pad('物理核', 8)} {mask_label(cfg.get('CPUSET', DEF_CORES))}")
-    out(f"  {pad('登录', 8)} {cfg.get('VM_USER','ubuntu')} / {cfg.get('VM_PASS','')}")
+    pw = cfg.get("VM_PASS", "")
+    out(f"  {pad('登录', 8)} {cfg.get('VM_USER','ubuntu')} / {'*' * len(pw)}"
+        f"  {S.dim}要看密码： ckvm ssh {name} -p{S.rst}")
     if cfg.get("NET_MODE", DEF_NET) == "user":
         out(f"  {pad('连接', 8)} {ssh_target(name)}")
 
