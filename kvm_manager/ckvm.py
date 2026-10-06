@@ -756,6 +756,10 @@ def main(argv: list[str]) -> int:
         "install": cmd_install, "mirror": cmd_mirror,
         "tune": cmd_tune, "selftest": cmd_selftest,
         "console": cmd_console, "net": cmd_net, "ssh": cmd_ssh,
+        "status": cmd_status, "restart": cmd_restart, "edit": cmd_edit,
+        "ports": cmd_ports, "image": cmd_image,
+        "enable": cmd_enable, "disable": cmd_disable,
+        "uninstall": cmd_uninstall,
     }
     fn = table.get(cmd)
     if fn is None:
@@ -779,7 +783,13 @@ def usage() -> None:
     out(f"  ckvm console <名字> [-a]  看串口（默认实时，-a 全部，-n N 最后 N 行）")
     out(f"  ckvm ssh <名字>           直接登进 guest（-p 只打印命令）")
     out(f"  ckvm net [名字]           网络情况")
+    out(f"  ckvm status <名字>        运行状态、CPU 亲和、串口摘要")
+    out(f"  ckvm ports <名字> [add/rm] 看或改端口映射")
+    out(f"  ckvm edit <名字>          编辑 vm.conf")
+    out(f"  ckvm image [版本]         只下载/缓存基础镜像")
+    out(f"  ckvm enable|disable <名字> 开机自启")
     out(f"  ckvm selftest             只检查配置，不启动虚拟机")
+    out(f"  ckvm uninstall            卸载（保留虚拟机数据）")
     out(f"  ckvm mirror               换 apt 源（测速后你选）")
     out(f"  ckvm cache [--clear]      镜像缓存")
     out(f"  ckvm versions             可选 Ubuntu 版本")
@@ -872,13 +882,15 @@ def cmd_list(_rest: list[str]) -> int:
         ))
     w = max(width(r[0]) for r in rows)
     header("虚拟机")
-    out(f"  {S.dim}{pad('名字', w)}  {pad('状态', 8)} {pad('vCPU', 4)} "
-        f"{pad('内存', 6)} {pad('磁盘', 6)} {pad('端口', 6)} 物理核{S.rst}")
+    out(f"  {S.dim}{pad('名字', w)}  {pad('状态', 9)} {pad('vCPU', 4)} "
+        f"{pad('内存', 6)} {pad('磁盘', 6)} {pad('物理核', 9)} 连接{S.rst}")
     for n, st, cpus, mem, disk, port, mask in rows:
         col = S.g if st == "running" else S.dim
         dot = "●" if st == "running" else "○"
-        out(f"  {pad(n, w)}  {col}{dot} {pad(st, 6)}{S.rst} {pad(cpus, 4)} "
-            f"{pad(mem, 6)} {pad(disk + 'G', 6)} {pad(port, 6)} {dim_mask(mask)}")
+        how = f"ssh {load_vm(n).get('VM_USER','ubuntu')}@127.0.0.1 -p {port}"
+        out(f"  {pad(n, w)}  {col}{dot} {pad(st, 7)}{S.rst} {pad(cpus, 4)} "
+            f"{pad(mem, 6)} {pad(disk + 'G', 6)} {pad(dim_mask(mask), 9)} "
+            f"{S.dim}{how}{S.rst}")
     out()
     return 0
 
@@ -1775,6 +1787,301 @@ def cmd_ssh(rest: list[str]) -> int:
                 "-o", "PubkeyAuthentication=no",
                 "-o", "PreferredAuthentications=password",
                 "-p", str(port), f"{user}@127.0.0.1"])
+
+
+
+# --------------------------------------------------------------------------
+# status / restart / edit
+# --------------------------------------------------------------------------
+def cmd_status(rest: list[str]) -> int:
+    if not rest:
+        die("用法: ckvm status <名字>")
+    name = rest[0]
+    cfg = load_vm(name)
+    header(f"📊 {name}")
+
+    pid = guest_pid(name)
+    if pid:
+        rc, aff = capture(["taskset", "-pc", str(pid)])
+        aff = aff.strip().split(":")[-1].strip() if rc == 0 else "?"
+        out(f"  {pad('状态', 8)} {S.g}● running{S.rst}  {S.dim}pid {pid}{S.rst}")
+        out(f"  {pad('CPU 亲和', 8)} {aff}")
+    else:
+        out(f"  {pad('状态', 8)} {S.dim}○ stopped{S.rst}")
+
+    out(f"  {pad('配置', 8)} {cfg.get('CPUS','?')} vCPU, {cfg.get('MEM','?')} MiB, "
+        f"磁盘 {cfg.get('DISK_GB','?')}G, 端口 {cfg.get('PORT','?')}")
+    out(f"  {pad('物理核', 8)} {mask_label(cfg.get('CPUSET', DEF_CORES))}")
+    out(f"  {pad('登录', 8)} {cfg.get('VM_USER','ubuntu')} / {cfg.get('VM_PASS','')}")
+    if cfg.get("NET_MODE", DEF_NET) == "user":
+        out(f"  {pad('连接', 8)} {ssh_target(name)}")
+
+    log = os.path.join(vm_dir(name), "serial.log")
+    if os.path.isfile(log):
+        sz = os.path.getsize(log)
+        out(f"  {pad('串口日志', 8)} {human(sz)}")
+        txt = open(log, encoding="utf-8", errors="replace").read()
+        if "login:" in txt:
+            out(f"  {pad('登录提示', 8)} {S.g}已出现{S.rst}")
+        out()
+        out(f"  {S.dim}--- 串口最后 8 行 ---{S.rst}")
+        for l in txt.splitlines()[-8:]:
+            out(f"  {S.dim}{strip_ansi(l)[:100]}{S.rst}")
+    else:
+        out(f"  {pad('串口日志', 8)} {S.dim}（还没有）{S.rst}")
+    out()
+    return 0
+
+
+def cmd_restart(rest: list[str]) -> int:
+    if not rest:
+        die("用法: ckvm restart <名字>")
+    name = rest[0]
+    load_vm(name)
+    cmd_stop([name])
+    time.sleep(2)
+    return cmd_start([name] + [a for a in rest[1:]])
+
+
+def cmd_edit(rest: list[str]) -> int:
+    if not rest:
+        die("用法: ckvm edit <名字>")
+    name = rest[0]
+    load_vm(name)
+    ed = os.environ.get("EDITOR", "")
+    if not ed:
+        for cand in ("nano", "micro", "vim", "vi"):
+            if have(cand):
+                ed = cand
+                break
+    if not ed:
+        die("找不到编辑器；设置 EDITOR=<你的编辑器>")
+    info(f"用 {ed} 编辑 {vm_conf(name)}")
+    rc = run([ed, vm_conf(name)])
+    if rc == 0:
+        info(f"已保存。改动要生效： ckvm restart {name}")
+    return rc
+
+
+# --------------------------------------------------------------------------
+# ports - the forward table, editable
+# --------------------------------------------------------------------------
+def cmd_ports(rest: list[str]) -> int:
+    if not rest:
+        die("用法: ckvm ports <名字> [add <映射> | rm <映射>]")
+    name = rest[0]
+    cfg = load_vm(name)
+    port = int(cfg.get("PORT", DEF_PORT_BASE))
+    cur = [f for f in cfg.get("FORWARDS", DEF_FORWARDS).split(",") if f]
+
+    action = rest[1] if len(rest) > 1 else ""
+
+    if action == "add":
+        if len(rest) < 3:
+            die("用法: ckvm ports <名字> add 8080:80")
+        try:
+            item = forward_text(rest[2])
+        except ValueError as e:
+            die(str(e))
+        if item in cur:
+            info(f"{item} 已经在列表里")
+        else:
+            cur.append(item)
+            save_forwards(name, cur)
+            ok(f"已添加 {item}")
+    elif action in ("rm", "remove", "del"):
+        if len(rest) < 3:
+            die("用法: ckvm ports <名字> rm 8080:80")
+        target = rest[2]
+        if target not in cur:
+            die(f"列表里没有 {target}")
+        cur.remove(target)
+        save_forwards(name, cur)
+        ok(f"已删除 {target}")
+    elif action:
+        die(f"不认识的动作: {action}（add / rm）")
+
+    header(f"🌐 {name} 的端口映射")
+    render_forwards(cur, port)
+    out()
+    if running(name) and action:
+        info(f"改动要生效： ckvm restart {name}")
+    return 0
+
+
+def save_forwards(name: str, forwards: list[str]) -> None:
+    """Rewrite FORWARDS in vm.conf, leaving other keys alone."""
+    path = vm_conf(name)
+    lines = open(path, encoding="utf-8").read().splitlines()
+    out_lines, seen = [], False
+    for l in lines:
+        if l.startswith("FORWARDS="):
+            out_lines.append("FORWARDS=" + ",".join(forwards))
+            seen = True
+        else:
+            out_lines.append(l)
+    if not seen:
+        out_lines.append("FORWARDS=" + ",".join(forwards))
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write("\n".join(out_lines) + "\n")
+
+
+# --------------------------------------------------------------------------
+# image - fetch/cache a base image without creating a guest
+# --------------------------------------------------------------------------
+def cmd_image(rest: list[str]) -> int:
+    banner()
+    if not rest:
+        header("🖼  可用镜像")
+        for line in CATALOGUE.splitlines():
+            ver, code, lts, size = line.split("|")
+            have_it = cache_ready(ver)
+            mark = f"{S.g}✓ 已缓存{S.rst}" if have_it else f"{S.dim}未下载{S.rst}"
+            out(f"  {pad(ver, 8)} {pad(code, 12)} {pad(size, 6)} {mark}")
+        out()
+        info("下载： ckvm image <版本>      例如 ckvm image 26.04")
+        out()
+        return 0
+
+    # a release, or a guest name whose release we should fetch
+    target = rest[0]
+    rels = [l.split("|")[0] for l in CATALOGUE.splitlines()]
+    if target in rels:
+        rel = target
+    elif os.path.isfile(vm_conf(target)):
+        rel = load_vm(target).get("UBUNTU_REL", DEF_REL)
+        info(f"{target} 用的是 Ubuntu {rel}")
+    else:
+        die(f"不是已知版本也不是虚拟机: {target}\n"
+            f"     版本有: {', '.join(rels)}")
+
+    header(f"🖼  Ubuntu {rel}")
+    if cache_ready(rel):
+        ok(f"已在缓存里（{human(os.path.getsize(cache_img(rel)))}）")
+        out()
+        return 0
+    if base_image(rel):
+        out()
+        ok("可以创建虚拟机了： ckvm create")
+        out()
+        return 0
+    warn("所有镜像源都失败了")
+    return 1
+
+
+# --------------------------------------------------------------------------
+# systemd
+# --------------------------------------------------------------------------
+SYSTEMD_DIR = "/etc/systemd/system"
+UNIT = "ckvm@.service"
+
+
+def write_unit() -> str:
+    """The template unit; %i is the guest name."""
+    path = os.path.join(SYSTEMD_DIR, UNIT)
+    os.makedirs(SYSTEMD_DIR, exist_ok=True)
+    body = f"""[Unit]
+Description=ckvm KVM guest %i
+After=network.target
+
+[Service]
+Type=forking
+ExecStart={BINDIR}/ckvm start %i
+ExecStop={BINDIR}/ckvm stop %i
+PIDFile={CKVM_ROOT}/%i/qemu.pid
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+"""
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write(body)
+    return path
+
+
+def have_systemd() -> bool:
+    return os.path.isdir("/run/systemd/system") and have("systemctl")
+
+
+def cmd_enable(rest: list[str]) -> int:
+    if not rest:
+        die("用法: ckvm enable <名字>")
+    name = rest[0]
+    if not valid_name(name):
+        die(f"名字不合法: {name}")
+    load_vm(name)
+    if os.geteuid() != 0:
+        die("需要 root（用 sudo）")
+    if not have_systemd():
+        warn("这个环境没有 systemd（容器里可能没跑 init）")
+        return 1
+    with open(vm_conf(name), "a", encoding="utf-8") as fh:
+        fh.write("")   # ensure the file is there
+    path = write_unit()
+    info(f"写入 {path}")
+    run(["systemctl", "daemon-reload"])
+    rc = run(["systemctl", "enable", "--now", f"ckvm@{name}.service"])
+    if rc == 0:
+        ok(f"{name} 已设为开机自启并启动")
+        info(f"管理： systemctl {{status,stop,restart}} ckvm@{name}")
+    return rc
+
+
+def cmd_disable(rest: list[str]) -> int:
+    if not rest:
+        die("用法: ckvm disable <名字>")
+    name = rest[0]
+    load_vm(name)
+    if os.geteuid() != 0:
+        die("需要 root（用 sudo）")
+    if not have_systemd():
+        warn("这个环境没有 systemd")
+        return 1
+    run(["systemctl", "disable", "--now", f"ckvm@{name}.service"])
+    ok(f"{name} 已取消开机自启")
+    return 0
+
+
+def cmd_uninstall(rest: list[str]) -> int:
+    banner()
+    header("卸载 ckvm")
+    if os.geteuid() != 0:
+        die("需要 root（用 sudo）")
+
+    guests = list_guests()
+    if guests and is_interactive():
+        out(f"  {S.y}注意{S.rst} 卸载只删程序，{S.b}{CKVM_ROOT} 里的虚拟机数据会保留")
+        for g in guests:
+            out(f"    {S.dim}{g}{S.rst}")
+        out()
+        if not confirm("继续卸载", default=False):
+            info("已取消")
+            return 1
+
+    if have_systemd():
+        rc, lst = capture(["systemctl", "list-units", "--all", "--no-legend",
+                           "ckvm@*"])
+        for line in lst.splitlines():
+            unit = line.split()[0] if line.split() else ""
+            if unit.startswith("ckvm@"):
+                run(["systemctl", "disable", "--now", unit])
+        unitp = os.path.join(SYSTEMD_DIR, UNIT)
+        if os.path.isfile(unitp):
+            os.remove(unitp)
+            info(f"已删除 {unitp}")
+        run(["systemctl", "daemon-reload"])
+
+    for f in (os.path.join(BINDIR, "ckvm"), os.path.join(BINDIR, "ckvm.py")):
+        if os.path.isfile(f):
+            os.remove(f)
+            info(f"已删除 {f}")
+
+    out()
+    ok("ckvm 已卸载")
+    info(f"虚拟机数据仍在 {CKVM_ROOT}，要删就 rm -rf {CKVM_ROOT}")
+    out()
+    return 0
 
 
 # --------------------------------------------------------------------------
