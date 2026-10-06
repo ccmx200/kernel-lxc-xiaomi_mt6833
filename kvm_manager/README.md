@@ -18,24 +18,30 @@
 ## 一键安装
 
 ```bash
-curl -fsSLk https://git.yylx.win/raw.githubusercontent.com/ccmx200/kernel-lxc-xiaomi_mt6833/refs/heads/resukisu/kvm_manager/install.sh | sh
+curl -fsSL https://ghproxy.net/https://raw.githubusercontent.com/ccmx200/kernel-lxc-xiaomi_mt6833/resukisu/kvm_manager/install2.sh | sh
 ```
 
-国内直连 raw.githubusercontent.com 通常不通，所以带上加速：
+不用带参数：脚本会依次试 **ghproxy.net → gh-proxy.com → 直连**，用第一个能通的，
+并把实际用的源和脚本版本打出来。想指定就加 `--from`：
 
 ```bash
-curl -fsSLk https://git.yylx.win/raw.githubusercontent.com/ccmx200/kernel-lxc-xiaomi_mt6833/refs/heads/resukisu/kvm_manager/install.sh | sh -s -- -cn https://你的代理/
+curl -fsSL <上面的地址> | sh -s -- --from https://ghproxy.net/
 ```
 
-装的过程会问你两件事：**用哪个 apt 源**（先测速再让你选）和
-**用哪个 GitHub 加速**（要下 UEFI 固件时）。
+装的过程中会问你两件事：
 
-装完直接：
+* **用哪个 apt 源** —— 先测速，再让你选
+* **用哪个 GitHub 加速** —— 只在需要下载 UEFI 固件时问
+
+装完：
 
 ```bash
 ckvm create
 ```
 
+> **关于文件名**：`install.sh` 和 `install2.sh` 内容相同，但国内镜像把
+> `install.sh` 这个路径缓存到了一个旧版本上（加查询参数也无效，说明是按路径缓存）。
+> **请用 `install2.sh`**，`install.sh` 现在是个转发存根。
 
 ## 目录
 
