@@ -29,7 +29,10 @@
 # =============================================================================
 set -u
 
-CKVM_VERSION="1.14"
+CKVM_VERSION="1.15"
+# 1.15: dependency install picks the fastest mirror by measurement,
+#       shows progress instead of going silent, is bounded by a
+#       timeout, and detects a held apt lock.
 # 1.14: `ckvm tune` for guest-side apt speed-ups, plus emoji
 #       and richer status output throughout.
 # 1.13: port-mapping editor with presets, nano by default,
@@ -791,36 +794,112 @@ ask_apt_mirror_restore() {
     spin "apt update" apt-get update -qq || warn "apt update 失败"
 }
 
+# Pick the apt mirror with the best measured throughput.
+# apt_mirror_speed downloads a real index and reports MB/s, so this is a
+# bandwidth test, not a latency test - ranking by latency picked the slowest
+# mirror once already.
+apt_pick_fastest_mirror() {
+    local best="" bestt=0 m t
+    for m in $APT_MIRROR_LIST; do
+        t=$(apt_mirror_speed "$m" 2>/dev/null) || continue
+        case "$t" in ''|0|0.0) continue ;; esac
+        awk -v a="$t" -v b="$bestt" 'BEGIN{exit !(a>b)}' && { best="$m"; bestt="$t"; }
+    done
+    [ -n "$best" ] && { echo "$best"; return 0; }
+    return 1
+}
+
 ensure_deps() {
     local missing; missing=$(deps_missing)
     [ -n "$missing" ] || return 0
+
     if command -v apt-get >/dev/null 2>&1; then
-        say "安装缺少的依赖: $missing"
-        # Switch to a nearby mirror first: the stock deb.debian.org took 2.35s
-        # per index file here versus 0.53s for mirror.nju.edu.cn.
-        if [ "${CKVM_NO_APT_MIRROR:-0}" != 1 ]; then
-            local cur t
-            cur=$(apt_current_mirror)
-            case "$cur" in
-                *deb.debian.org*|*archive.ubuntu.com*|*security.ubuntu.com*|"")
-                    t=$(apt_mirror_speed "$(echo "$APT_MIRROR_LIST" | head -1)" 2>/dev/null) \
-                        && { apt_apply_mirror "$(echo "$APT_MIRROR_LIST" | head -1)"; \
-                             say "已换用更快的 apt 源（原源: ${cur:-未知}）"; } ;;
-            esac
+        printf '\n  %s📦 缺少依赖%s  %s%s%s\n' "$C_B" "$C_RST" "$C_DIM" "$missing" "$C_RST"
+
+        # ---- mirror -------------------------------------------------
+        local cur fast
+        cur=$(apt_current_mirror)
+        case "$cur" in
+            *deb.debian.org*|*archive.ubuntu.com*|*security.ubuntu.com*|"")
+                if [ "${CKVM_NO_APT_MIRROR:-0}" != 1 ]; then
+                    printf '  %s当前源 %s 很慢，正在测速挑一个更快的...%s\n' \
+                           "$C_DIM" "${cur:-未知}" "$C_RST"
+                    if fast=$(apt_pick_fastest_mirror); then
+                        apt_apply_mirror "$fast" >/dev/null 2>&1 || true
+                        printf '  %s→%s 已换用 %s%s%s\n' "$C_G" "$C_RST" "$C_C" "$fast" "$C_RST"
+                    else
+                        printf '  %s! 测速失败，继续用当前源%s\n' "$C_Y" "$C_RST"
+                    fi
+                fi ;;
+        esac
+
+        # ---- apt update, visibly ------------------------------------
+        # An unrelated apt run holding the lock makes our update a no-op, after
+        # which apt reports the packages as unknown - a confusing error that
+        # says nothing about the real cause.
+        local holder=""
+        if command -v fuser >/dev/null 2>&1; then
+            holder=$(fuser /var/lib/apt/lists/lock 2>/dev/null | tr -d ' ')
         fi
-        DEBIAN_FRONTEND=noninteractive apt-get update -qq >/dev/null 2>&1 || true
-        # shellcheck disable=SC2086
-        DEBIAN_FRONTEND=noninteractive apt-get install -y -qq $CKVM_APT_DEPS \
-            >/dev/null 2>&1 || true
+        [ -n "$holder" ] || holder=$(pgrep -x apt-get 2>/dev/null | head -1 | tr -d ' ')
+        if [ -n "$holder" ]; then
+            printf '  %s⚠️  有别的 apt 在运行（pid %s），正等它结束...%s\n' \
+                   "$C_Y" "$holder" "$C_RST"
+            local w=0
+            while [ "$w" -lt 120 ]; do
+                kill -0 "$holder" 2>/dev/null || break
+                sleep 2; w=$((w+2))
+            done
+            if kill -0 "$holder" 2>/dev/null; then
+                printf '  %s它还在跑。要么等它，要么： sudo kill %s%s\n' \
+                       "$C_Y" "$holder" "$C_RST"
+                printf '  %s(它可能是你手动跑的 apt update，用的还是慢速源)%s\n' \
+                       "$C_DIM" "$C_RST"
+                return 1
+            fi
+            printf '  %s✓%s 它已结束，继续\n' "$C_G" "$C_RST"
+        fi
+
+        spin "更新软件包索引" bash -c \
+             'DEBIAN_FRONTEND=noninteractive timeout 300 apt-get update -qq 2>&1' \
+            || warn "apt-get update 失败（继续尝试安装）"
+
+        # ---- install, visibly ---------------------------------------
+        # qemu-system-arm alone is ~200MB; silently waiting looks like a hang.
+        say "下载并安装（qemu 约 200 MB，慢的话几分钟；Ctrl-C 可中断）"
+        local tmp rc
+        tmp=$(mktemp "${TMPDIR:-/tmp}/ckvm-apt.XXXXXX")
+        if [ "$IS_TTY" = 1 ]; then
+            ( DEBIAN_FRONTEND=noninteractive timeout 1800 \
+                apt-get install -y $CKVM_APT_DEPS >"$tmp" 2>&1 ) &
+            local pid=$! i=0 last
+            while kill -0 "$pid" 2>/dev/null; do
+                last=$(tail -1 "$tmp" 2>/dev/null | tr -d '\r' | cut -c1-46)
+                ui_tick $((i++)) "" "安装依赖" "  $last"
+                sleep 0.5
+            done
+            wait "$pid"; rc=$?
+            ui_stop
+        else
+            DEBIAN_FRONTEND=noninteractive timeout 1800 \
+                apt-get install -y $CKVM_APT_DEPS >"$tmp" 2>&1
+            rc=$?
+        fi
+        if [ "$rc" != 0 ]; then
+            warn "apt-get install 返回 $rc"
+            tail -6 "$tmp" 2>/dev/null | sed 's/^/      /' >&2
+        fi
+        rm -f "$tmp"
     fi
+
     missing=$(deps_missing)
     if [ -n "$missing" ]; then
-        printf '  ERROR: 缺少必需依赖: %s\n' "$missing" >&2
-        printf '         装一下: apt-get install -y %s\n' "$(ckvm_apt_packages)" >&2
-        printf '         或者先跑: ckvm selftest  看看环境缺什么\n' >&2
+        printf '\n  %s❌ 仍缺少: %s%s\n' "$C_R" "$missing" "$C_RST" >&2
+        printf '     %s手动装: apt-get install -y %s%s\n' "$C_DIM" "$(ckvm_apt_packages)" "$C_RST" >&2
+        printf '     %s排查:   ckvm selftest%s\n' "$C_DIM" "$C_RST" >&2
         return 1
     fi
-    # soft deps: mention once, do not block
+
     local soft="" d
     for d in $CKVM_SOFT_DEPS; do
         command -v "$d" >/dev/null 2>&1 || soft="$soft $d"
