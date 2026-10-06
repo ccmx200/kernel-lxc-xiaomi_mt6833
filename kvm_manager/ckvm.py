@@ -23,6 +23,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import time
 import unicodedata
 
@@ -87,10 +88,10 @@ CATALOGUE = """\
 26.04|resolute|LTS|902M"""
 
 CACHE_MODES = {
-    "writeback": "宿主页缓存 + 尊重 flush（默认，等价于现状）",
-    "none": "绕过宿主缓存（O_DIRECT），最保险但最慢",
-    "unsafe": "忽略 flush，最快，断电可能损坏",
-    "writethrough": "读走缓存，写直通",
+    "writeback": "速度最快，断电时可能丢失最近写入（推荐）",
+    "none": "每次写入都落盘，最安全但最慢",
+    "unsafe": "比 writeback 更快，断电容易损坏磁盘",
+    "writethrough": "读走缓存，写直接落盘",
 }
 
 # CPU mask presets.  Arbitrary masks are accepted too - the kernel snapshots
@@ -381,9 +382,8 @@ def mask_label(mask: str) -> str:
 def ask_cores() -> str:
     """Pick a CPU mask.  Presets plus an option for an arbitrary mask."""
     items = [(mask_label(m), f"{desc}，{note}") for m, _n, desc, note in CORE_PRESETS]
-    items.append(("自定义掩码", "例如 0-2,6-7 混搭大小核"))
-    idx = menu("物理核心", items, default=1,
-               extra="内核按 VM 快照了 ID 寄存器，任意掩码都可用")
+    items.append(("自定义", "想自己指定就用这个，例如 0-2,6-7"))
+    idx = menu("物理核心", items, default=1)
     if idx is None:
         return DEF_CORES
     if idx < len(CORE_PRESETS):
@@ -536,8 +536,7 @@ def _del_forward(forwards: list[str], port: int) -> list[str]:
 # --------------------------------------------------------------------------
 def ask_cache() -> str:
     items = [(m, d) for m, d in CACHE_MODES.items()]
-    idx = menu("磁盘缓存", items, default=1,
-               extra="qemu 打开磁盘时没有 O_DIRECT，所以 writeback 是现状，不是新增加速")
+    idx = menu("磁盘缓存", items, default=1)
     if idx is None:
         return DEF_CACHE
     return list(CACHE_MODES)[idx]
@@ -758,7 +757,7 @@ def main(argv: list[str]) -> int:
         "show": cmd_show, "config": cmd_show,
         "install": cmd_install, "mirror": cmd_mirror,
         "tune": cmd_tune, "selftest": cmd_selftest,
-        "console": cmd_console, "net": cmd_net,
+        "console": cmd_console, "net": cmd_net, "ssh": cmd_ssh,
     }
     fn = table.get(cmd)
     if fn is None:
@@ -780,6 +779,7 @@ def usage() -> None:
     out(f"  ckvm show <名字>          看配置")
     out(f"  ckvm tune <名字>          优化 guest 内部 apt（--status/--revert）")
     out(f"  ckvm console <名字> [-a]  看串口（默认实时，-a 全部，-n N 最后 N 行）")
+    out(f"  ckvm ssh <名字>           直接登进 guest（-p 只打印命令）")
     out(f"  ckvm net [名字]           网络情况")
     out(f"  ckvm selftest             只检查配置，不启动虚拟机")
     out(f"  ckvm mirror               换 apt 源（测速后你选）")
@@ -914,14 +914,30 @@ def cmd_show(rest: list[str]) -> int:
 
 
 def ask_account() -> tuple[str, str]:
-    """Login name and password.  Root is an explicit choice, not a default."""
+    """Login name and password, including a name of the user's choosing."""
     items = [
-        ("ubuntu", "普通用户，可以 sudo"),
+        ("ubuntu", "推荐，可以 sudo"),
         ("root", "直接用 root 登录"),
+        ("自定义", "自己指定用户名"),
     ]
     idx = menu("登录账号", items, default=1)
-    user = "ubuntu" if idx is None or idx == 0 else "root"
+    if idx == 1:
+        user = "root"
+    elif idx == 2:
+        while True:
+            raw = ask("用户名", "")
+            if re.fullmatch(r"[a-z_][a-z0-9_-]{0,31}", raw or ""):
+                user = raw
+                break
+            warn("用户名只能用 a-z 0-9 _ -，且不能以数字开头")
+    else:
+        user = "ubuntu"
+
     out()
+    env_pw = os.environ.get("CKVM_PW", "")
+    if env_pw:
+        info("密码取自 CKVM_PW")
+        return user, env_pw
     while True:
         p1 = ask_secret(f"{user} 的密码")
         p2 = ask_secret("再输一次")
@@ -966,10 +982,10 @@ def cmd_create(rest: list[str]) -> int:
     out()
     cache = ask_cache()
     out()
-    idx = menu("guest 内部优化", [
-        ("启用", "关掉拖慢 apt 的几个钩子（每次装包省几秒）"),
-        ("不启用", "保持 Ubuntu 默认行为"),
-    ], default=1, extra="可以随时用 ckvm tune <名字> 补上或撤销")
+    idx = menu("安装后自动优化", [
+        ("启用", "装软件包会快一些"),
+        ("不启用", "保持系统默认"),
+    ], default=1, extra="之后随时可以改： ckvm tune <名字> / --revert")
     do_tune = "yes" if idx == 0 else "no"
     out()
     forwards = edit_forwards([DEF_FORWARDS], next_free_port())
@@ -1042,24 +1058,6 @@ def cmd_create(rest: list[str]) -> int:
     return 0
 
 
-def key_paths(name: str) -> tuple[str, str]:
-    d = vm_dir(name)
-    return os.path.join(d, "id_ed25519"), os.path.join(d, "id_ed25519.pub")
-
-
-def ensure_key(name: str) -> str:
-    """Create a per-guest key pair if there is not one.  Returns the pubkey."""
-    priv, pub = key_paths(name)
-    if not os.path.isfile(pub):
-        run(["ssh-keygen", "-t", "ed25519", "-N", "", "-C", f"ckvm@{name}",
-             "-f", priv])
-        os.chmod(priv, 0o600)
-    try:
-        return open(pub, encoding="utf-8").read().strip()
-    except OSError:
-        return ""
-
-
 def write_seed(name: str, user: str, pw: str) -> None:
     """Build user-data / meta-data, then let cloud-localds package them."""
     d = vm_dir(name)
@@ -1083,11 +1081,6 @@ def write_seed(name: str, user: str, pw: str) -> None:
             f'    hashed_passwd: "{hashed}"\n'
         )
 
-    pub = ensure_key(name)
-    # ssh_authorized_keys is a per-user field.  At the top level it only
-    # applies to the *default* user, so a named user would never receive it.
-    key_block = f"    ssh_authorized_keys:\n      - {pub}\n" if pub else ""
-
     user_data = (
         "#cloud-config\n"
         f"hostname: {name}\n"
@@ -1096,7 +1089,6 @@ def write_seed(name: str, user: str, pw: str) -> None:
         "chpasswd:\n"
         "  expire: false\n"
         + user_block
-        + key_block
     )
 
     with open(os.path.join(d, "user-data"), "w", encoding="utf-8") as fh:
@@ -1202,7 +1194,28 @@ def make_disk(name: str, rel: str, disk_gb: int) -> None:
     run(["qemu-img", "resize", img, f"{disk_gb}G"])
 
 
+def port_busy(port: int) -> bool:
+    """True when something already listens on this host port."""
+    import socket
+    for host in ("0.0.0.0", "127.0.0.1"):
+        s_ = socket.socket()
+        try:
+            s_.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            s_.bind((host, port))
+        except OSError:
+            return True
+        finally:
+            s_.close()
+    return False
+
+
 def next_free_port() -> int:
+    """
+    A port that is neither claimed by a guest config nor actually in use.
+
+    Checking only the configs was not enough: an old guest (or anything else)
+    can hold the port, and QEMU then refuses to start with a hostfwd error.
+    """
     used = set()
     for n in list_guests():
         try:
@@ -1210,7 +1223,7 @@ def next_free_port() -> int:
         except ValueError:
             pass
     p = DEF_PORT_BASE
-    while p in used:
+    while p in used or port_busy(p):
         p += 1
     return p
 
@@ -1267,7 +1280,7 @@ def cmd_rm(rest: list[str]) -> int:
 # --------------------------------------------------------------------------
 APT_DEPS = ["qemu-system-arm", "qemu-utils", "cloud-image-utils", "aria2", "sshpass"]
 BIN_DEPS = ["qemu-system-aarch64", "qemu-img", "cloud-localds"]
-SOFT_DEPS = ["aria2c", "sshpass", "numfmt"]
+SOFT_DEPS = ["aria2c", "numfmt"]
 
 
 def missing_deps() -> list[str]:
@@ -1305,6 +1318,19 @@ def cmd_install(rest: list[str]) -> int:
     banner()
     if os.geteuid() != 0:
         die("需要 root（用 sudo）")
+
+    # -cn <url> pins the GitHub accelerator instead of asking
+    accel_hint = os.environ.get("CKVM_ACCEL", "")
+    i = 0
+    while i < len(rest):
+        if rest[i] in ("-cn", "--cn", "--accel") and i + 1 < len(rest):
+            accel_hint = rest[i + 1]
+            i += 2
+            continue
+        if rest[i].startswith("http"):
+            accel_hint = rest[i]
+        i += 1
+
     header("安装 ckvm")
 
     # ---- 1. dependencies -------------------------------------------
@@ -1345,7 +1371,11 @@ def cmd_install(rest: list[str]) -> int:
     else:
         out(f"  {S.b}需要 UEFI 固件{S.rst}  {S.dim}（约 134 MB，不写 NVRAM 的 EDK2）{S.rst}")
         out()
-        accel = pick_accel()
+        if accel_hint:
+            accel = accel_hint
+            info(f"使用指定的加速地址: {accel}")
+        else:
+            accel = pick_accel()
         os.makedirs(FW_DIR, exist_ok=True)
         okall = True
         for fn in (FW_CODE, FW_VARS):
@@ -1407,25 +1437,21 @@ def guest_ssh(name: str, command: str, timeout: int = 600) -> tuple[int, str]:
     port = cfg.get("PORT", str(DEF_PORT_BASE))
     if not pw:
         return 1, "guest 没记录密码"
-    priv, _pub = key_paths(name)
     common = ["-o", "StrictHostKeyChecking=no",
               "-o", "UserKnownHostsFile=/dev/null",
               "-o", "LogLevel=ERROR",
               "-o", "ConnectTimeout=10"]
 
-    if os.path.isfile(priv):
-        argv = (["ssh"] + common
-                + ["-i", priv, "-o", "IdentitiesOnly=yes",
-                   "-p", str(port), f"{user}@127.0.0.1", command])
-    elif have("sshpass"):
-        argv = (["sshpass", "-p", pw, "ssh"] + common
-                + ["-o", "PubkeyAuthentication=no",
-                   "-p", str(port), f"{user}@127.0.0.1", command])
-    else:
-        return 1, ("没有该 guest 的 SSH 密钥，也没装 sshpass。"
-                   "重建这台虚拟机即可获得密钥，或先 apt-get install sshpass")
+    if not have("sshpass"):
+        return 1, "需要 sshpass（apt-get install sshpass）"
+    argv = (["sshpass", "-e", "ssh"] + common
+            + ["-o", "PubkeyAuthentication=no",
+               "-o", "PreferredAuthentications=password",
+               "-p", str(port), f"{user}@127.0.0.1", command])
+    env = dict(os.environ, SSHPASS=pw)
     try:
-        p = subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
+        p = subprocess.run(argv, capture_output=True, text=True, env=env,
+                           timeout=timeout)
         return p.returncode, ((p.stdout or "") + (p.stderr or "")).strip()
     except subprocess.TimeoutExpired:
         return 1, "超时"
@@ -1436,10 +1462,12 @@ def guest_root(name: str, command: str, timeout: int = 600) -> tuple[int, str]:
     cfg = load_vm(name)
     if cfg.get("VM_USER", "ubuntu") == "root":
         return guest_ssh(name, command, timeout)
-    priv, _ = key_paths(name)
     quoted = command.replace("'", "'\\''")
-    if os.path.isfile(priv):
-        # the key has no password, so a passwordless sudo is fine here
+    # try passwordless sudo first (works for root and for NOPASSWD users),
+    # then fall back to feeding the password
+    rc, out_ = guest_ssh(name, f"sudo -n true 2>/dev/null && echo __SUDO_OK__ || true",
+                         timeout=120)
+    if "__SUDO_OK__" in out_:
         return guest_ssh(name, f"sudo -n bash -c '{quoted}'", timeout)
     pw = cfg.get("VM_PASS", "")
     return guest_ssh(name, f"echo '{pw}' | sudo -S bash -c '{quoted}'", timeout)
@@ -1629,7 +1657,8 @@ def cmd_start(rest: list[str]) -> int:
     if net == "user":
         info("等 guest 启动到 SSH 就绪（最多 300 秒）...")
         if wait_ssh(name, int(port)):
-            ok(f"SSH 已就绪  {S.b}ssh {cfg.get('VM_USER','ubuntu')}@127.0.0.1 -p {port}{S.rst}")
+            ok(f"SSH 已就绪  {S.b}{ssh_target(name)}{S.rst}")
+            info(f"密码 {cfg.get('VM_PASS','')}   直连: ckvm ssh {name}")
             if cfg.get("TUNE", "no") == "yes":
                 out()
                 info("应用 guest 内部优化（TUNE=yes）...")
@@ -1651,24 +1680,23 @@ def ssh_probe(name: str, port: int, timeout: int = 15) -> bool:
     """True when a real SSH command completes, not merely when the port is up."""
     cfg = load_vm(name)
     user = cfg.get("VM_USER", "ubuntu")
-    priv, _ = key_paths(name)
+    # NOTE: no BatchMode here.  It disables interactive auth, which is exactly
+    # what sshpass provides, so the probe could never succeed.
     common = ["-o", "StrictHostKeyChecking=no",
               "-o", "UserKnownHostsFile=/dev/null",
               "-o", "LogLevel=ERROR",
-              "-o", "ConnectTimeout=5",
-              "-o", "BatchMode=yes"]
-    if os.path.isfile(priv):
-        argv = (["ssh"] + common
-                + ["-i", priv, "-o", "IdentitiesOnly=yes",
-                   "-p", str(port), f"{user}@127.0.0.1", "true"])
-    elif have("sshpass"):
-        argv = (["sshpass", "-p", cfg.get("VM_PASS", ""), "ssh"] + common
-                + ["-o", "PubkeyAuthentication=no",
-                   "-p", str(port), f"{user}@127.0.0.1", "true"])
-    else:
+              "-o", "ConnectTimeout=5"]
+    pw = cfg.get("VM_PASS", "")
+    if not pw or not have("sshpass"):
         return False
+    argv = (["sshpass", "-e", "ssh"] + common
+            + ["-o", "PubkeyAuthentication=no",
+               "-o", "PreferredAuthentications=password",
+               "-p", str(port), f"{user}@127.0.0.1", "true"])
+    env = dict(os.environ, SSHPASS=pw)
     try:
-        return subprocess.run(argv, capture_output=True, timeout=timeout).returncode == 0
+        return subprocess.run(argv, capture_output=True, env=env,
+                              timeout=timeout).returncode == 0
     except (subprocess.TimeoutExpired, OSError):
         return False
 
@@ -1697,6 +1725,48 @@ def tail_serial(name: str, n: int = 8) -> None:
     for l in lines[-n:]:
         out(f"  {S.dim}{l[:100]}{S.rst}")
 
+
+
+
+def ssh_target(name: str) -> str:
+    """The exact ssh command for this guest, for display and for use."""
+    cfg = load_vm(name)
+    user = cfg.get("VM_USER", "ubuntu")
+    port = cfg.get("PORT", str(DEF_PORT_BASE))
+    return f"ssh {user}@127.0.0.1 -p {port}"
+
+
+def cmd_ssh(rest: list[str]) -> int:
+    if not rest:
+        die("用法: ckvm ssh <名字>")
+    name = rest[0]
+    cfg = load_vm(name)
+    if not running(name):
+        die(f"{name} 没在运行")
+    cmd = ssh_target(name)
+
+    if "-p" in rest or "--print" in rest:
+        print(cmd)
+        return 0
+
+    out(f"  {S.dim}密码 {cfg.get('VM_PASS','')}{S.rst}")
+    out(f"  {S.b}{cmd}{S.rst}")
+    out()
+    if not have("sshpass"):
+        # hand over a plain ssh the user can type, with the password shown
+        info("（装了 sshpass 就能免密直连： apt-get install sshpass）")
+        return run(["ssh", "-o", "StrictHostKeyChecking=no",
+                    "-o", "UserKnownHostsFile=/dev/null",
+                    "-p", str(cfg.get("PORT", DEF_PORT_BASE)),
+                    f"{cfg.get('VM_USER','ubuntu')}@127.0.0.1"])
+    user = cfg.get("VM_USER", "ubuntu")
+    port = cfg.get("PORT", str(DEF_PORT_BASE))
+    return run(["sshpass", "-p", cfg.get("VM_PASS", ""), "ssh",
+                "-o", "StrictHostKeyChecking=no",
+                "-o", "UserKnownHostsFile=/dev/null",
+                "-o", "PubkeyAuthentication=no",
+                "-o", "PreferredAuthentications=password",
+                "-p", str(port), f"{user}@127.0.0.1"])
 
 
 # --------------------------------------------------------------------------

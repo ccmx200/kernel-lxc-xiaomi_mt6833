@@ -15,6 +15,28 @@
 
 ---
 
+## 一键安装
+
+```bash
+curl -fsSLk https://git.yylx.win/raw.githubusercontent.com/ccmx200/kernel-lxc-xiaomi_mt6833/refs/heads/resukisu/kvm_manager/install.sh | sh
+```
+
+国内直连 raw.githubusercontent.com 通常不通，所以带上加速：
+
+```bash
+curl -fsSLk https://git.yylx.win/raw.githubusercontent.com/ccmx200/kernel-lxc-xiaomi_mt6833/refs/heads/resukisu/kvm_manager/install.sh | sh -s -- -cn https://你的代理/
+```
+
+装的过程会问你两件事：**用哪个 apt 源**（先测速再让你选）和
+**用哪个 GitHub 加速**（要下 UEFI 固件时）。
+
+装完直接：
+
+```bash
+ckvm create
+```
+
+
 ## 目录
 
 - [它能做什么](#它能做什么)
@@ -54,67 +76,6 @@ guest 内 `openssl speed -multi 8 -evp sha256`（16 KB 块，本机实测）：
 
 ---
 
-## 安装
-
-```bash
-curl -fsSLk https://raw.githubusercontent.com/ccmx200/kernel-lxc-xiaomi_mt6833/refs/heads/resukisu/kvm_manager/kvm-vm.sh | bash -s -- install
-```
-
-默认走 GitHub 官方源，脚本**不做任何加速、不改写地址**。
-
-> **URL 里为什么是 `refs/heads/resukisu`**
->
-> GitHub 的加速镜像**按 URL 路径缓存**。裸分支名 `resukisu` 实测会命中旧缓存
-> （`x-cache: HIT`、`x-cache-hits: 24`、`max-age=300`），而完整 ref 路径拿到的是
-> 当前版本。同一份文件，只是写法不同。
->
-> 装完自检：
-> ```bash
-> ckvm help | grep -q 'ckvm cache' && echo 已是最新 || echo 装到了旧版
-> ```
-
-装完你会得到：
-
-```
-/usr/local/bin/ckvm                              命令
-/usr/local/share/ckvm/firmware/                  UEFI 固件
-/etc/systemd/system/ckvm@.service                systemd 模板单元
-```
-
-### GitHub 不通时
-
-```bash
-# 用你自己的加速地址
-bash /tmp/ckvm.sh install -cn https://你的加速地址
-
-# 只给主机名也行，会自动补全仓库路径
-bash /tmp/ckvm.sh install -cn ghproxy.net
-
-# 模板形式
-bash /tmp/ckvm.sh install -cn "https://你的代理/{url}"
-
-# 不带参数：探测内置列表，选第一个能通的
-bash /tmp/ckvm.sh install -cn
-```
-
-`--repo <url>` 等价，`CKVM_ACCEL=<url>` 也行。
-
-> **建议先手动抓脚本再 install**：`curl | bash` 那一跳本身也要过网络。
-> GitHub 不通时 `curl` 就先失败了，轮不到 `-cn` 生效。
->
-> ```bash
-> curl -fsSLk <能通的地址>/kvm-vm.sh -o /tmp/ckvm.sh
-> bash /tmp/ckvm.sh install -cn https://你的加速地址
-> ```
-
-### 卸载
-
-```bash
-ckvm uninstall          # 只删命令和服务，虚拟机数据保留
-rm -rf /var/lib/ckvm    # 连数据一起删（含镜像缓存）
-```
-
----
 
 ## 快速开始
 
