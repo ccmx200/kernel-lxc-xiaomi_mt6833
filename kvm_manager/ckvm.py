@@ -829,9 +829,8 @@ def cmd_cache(rest: list[str]) -> int:
         p = os.path.join(CACHE_DIR, f)
         sz = os.path.getsize(p)
         total += sz
-        okmark = f"{S.g}✓{S.rst}" if os.path.isfile(
-            os.path.join(CACHE_DIR, f"ubuntu-{rel}-arm64.img.ok")) \
-            else f"{S.y}未完成{S.rst}"
+        okmark = f"{S.g}✓{S.rst}" if cache_ready(rel) \
+            else f"{S.y}不完整{S.rst}"
         out(f"  {pad(rel, 10)} {pad(human(sz), 10, 'right')}  {okmark}")
     out(f"  {S.dim}{rule(40)}{S.rst}")
     out(f"  {pad('合计', 10)} {pad(human(total), 10, 'right')}")
@@ -1094,27 +1093,37 @@ def image_urls(rel: str) -> list[str]:
     return [f"{m}/releases/{rel}/release/{f}" for m in MIRROR_IMAGES]
 
 
+# A real cloud image is hundreds of MB.  Anything smaller is a partial
+# download, so size is a sufficient test and needs no marker file.
+MIN_IMAGE = 100 * 1024 * 1024
+
+
 def cache_img(rel: str) -> str:
     return os.path.join(CACHE_DIR, f"ubuntu-{rel}-arm64.img")
+
+
+def cache_ready(rel: str) -> bool:
+    p = cache_img(rel)
+    try:
+        return os.path.isfile(p) and os.path.getsize(p) >= MIN_IMAGE
+    except OSError:
+        return False
 
 
 def base_image(rel: str) -> bool:
     """Make sure the shared cache holds this release."""
     os.makedirs(CACHE_DIR, exist_ok=True)
     dst = cache_img(rel)
-    if os.path.isfile(dst) and os.path.getsize(dst) > 1024 * 1024 \
-            and os.path.isfile(dst + ".ok"):
+    if cache_ready(rel):
         ok(f"使用缓存 Ubuntu {rel}（{human(os.path.getsize(dst))}，跳过下载）")
         return True
-    if os.path.isfile(dst) and not os.path.isfile(dst + ".ok"):
-        warn("缓存里有一份不完整的镜像，重新下载")
+    if os.path.isfile(dst):
+        warn("缓存里那份不完整，重新下载")
         os.remove(dst)
     for url in image_urls(rel):
         info(f"下载 {url}")
         rc = run(download_cmd(url, dst))
-        if rc == 0 and os.path.isfile(dst) and os.path.getsize(dst) > 1024 * 1024:
-            with open(dst + ".ok", "w", encoding="utf-8") as fh:
-                fh.write(f"{os.path.getsize(dst)}\n")
+        if rc == 0 and cache_ready(rel):
             ok(f"已缓存 {human(os.path.getsize(dst))}")
             return True
         warn("这个源不行，换下一个")
