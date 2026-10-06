@@ -1635,6 +1635,35 @@ def download_cmd(url: str, outfile: str, quiet: bool = False) -> list[str]:
     return cmd
 
 
+def copy_with_progress(src: str, dst: str, label: str = "复制镜像") -> None:
+    """
+    Copy a file, showing how far along it is.
+
+    shutil.copyfile has no callback and the source is a few hundred MB, so the
+    copy is done in chunks and the byte count reported as it goes.
+    """
+    total = os.path.getsize(src)
+    chunk = 4 * 1024 * 1024
+    done = 0
+    pr = Progress(label, total) if HAVE_UI else None
+    if pr:
+        pr.__enter__()
+    try:
+        with open(src, "rb") as fi, open(dst, "wb") as fo:
+            while True:
+                buf = fi.read(chunk)
+                if not buf:
+                    break
+                fo.write(buf)
+                done += len(buf)
+                if pr:
+                    pr.update(done)
+    finally:
+        if pr:
+            pr.__exit__()
+    shutil.copystat(src, dst)
+
+
 def make_disk(name: str, rel: str, disk_gb: int,
               distro: "Distro" = None) -> None:
     d = vm_dir(name)
@@ -1645,8 +1674,7 @@ def make_disk(name: str, rel: str, disk_gb: int,
         src = find_cached(rel, distro)
         if not src:
             raise RuntimeError(f"缓存里没有 {rel} 的镜像")
-        info("从缓存复制基础镜像...")
-        shutil.copyfile(src, img)
+        copy_with_progress(src, img, f"复制 {distro.name if distro else ''} 镜像".strip())
     run(["qemu-img", "resize", img, f"{disk_gb}G"])
 
 
@@ -2174,19 +2202,59 @@ def ssh_probe(name: str, port: int, timeout: int = 15) -> bool:
         return False
 
 
+def serial_last(name: str, width: int = 58) -> str:
+    """
+    The last meaningful serial line, for a progress note.
+
+    Boot output is very noisy (kernel timestamps, systemd colour codes, the
+    cloud-init fingerprint art), so pick the last line that says something:
+    strip the escapes, drop the fingerprint block, and keep the tail.
+    """
+    p = os.path.join(vm_dir(name), "serial.log")
+    try:
+        with open(p, "rb") as fh:
+            fh.seek(0, os.SEEK_END)
+            size = fh.tell()
+            fh.seek(max(0, size - 8192))
+            raw = fh.read().decode("utf-8", "replace")
+    except OSError:
+        return ""
+    lines = [strip_ansi(x).strip() for x in raw.splitlines()]
+    skip = ("+--", "|", "\\", "/", "=")
+    for l in reversed(lines):
+        if not l or l.startswith(skip):
+            continue
+        # kernel timestamp noise is not useful to a person waiting
+        l = re.sub(r"^\[\s*[\d.]+\]\s*", "", l)
+        l = re.sub(r"^cloud-init\[\d+\]:\s*", "", l)
+        if len(l) < 4:
+            continue
+        return l[:width]
+    return ""
+
+
 def wait_ssh(name: str, port: int, timeout: int = 420) -> bool:
     """
     Wait until SSH accepts a command.
 
     Testing the socket is not enough: the port is forwarded while sshd is still
     starting, so the first real connection can be reset.
+
+    Boot takes up to a few minutes, so while waiting this shows the last
+    meaningful line from the serial console.  Waiting silently with a fixed
+    message is indistinguishable from a hang.
     """
     import time as _t
     end = _t.time() + timeout
-    while _t.time() < end:
-        if ssh_probe(name, port):
-            return True
-        _t.sleep(4)
+    sp = Spinner("等 guest 启动")
+    with sp:
+        while _t.time() < end:
+            if ssh_probe(name, port):
+                return True
+            note = serial_last(name)
+            if note:
+                sp.note(note)
+            _t.sleep(4)
     return False
 
 
