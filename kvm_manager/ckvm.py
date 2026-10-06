@@ -1003,9 +1003,58 @@ def cmd_create(rest: list[str]) -> int:
             f"     可用: --rel --cpus --cores --mem --disk --port --net "
             f"--fwd --user --pass --cache --tune --yes")
 
-    header("创建 Ubuntu 虚拟机")
-
     rels = [l.split("|")[0] for l in CATALOGUE.splitlines()]
+
+    # ---- validate everything given on the command line, before asking ----
+    # otherwise a bad value is only reported after the interactive questions
+    def bad(msg: str) -> None:
+        die(msg)
+
+    if o.get("rel") and o["rel"] not in rels:
+        bad(f"没有 Ubuntu {o['rel']}；可选: {', '.join(rels)}")
+    if name and not valid_name(name):
+        bad(f"名字只能用字母数字和 _ . - ：{name}")
+    if name and os.path.isdir(vm_dir(name)):
+        bad(f"'{name}' 已经存在")
+    if o.get("cpus") and not (o["cpus"].isdigit() and int(o["cpus"]) >= 1):
+        bad(f"--cpus 必须是正整数，收到: {o['cpus']}")
+    if o.get("cores"):
+        c = o["cores"]
+        c = DEF_CORES if c == "all" else ("6-7" if c == "big" else c)
+        try:
+            cs = mask_cores(c)
+        except ValueError as e:
+            bad(f"--cores {o['cores']}: {e}")
+        if any(x > 7 for x in cs):
+            bad(f"--cores {o['cores']}: 这台机器只有核 0-7")
+    for key, label, lo in (("mem", "内存 (MiB)", 256), ("disk", "磁盘 (GiB)", 2)):
+        v = o.get(key, "")
+        if v and not (v.isdigit() and int(v) >= lo):
+            bad(f"--{key} 至少 {lo}，收到: {v}")
+        if v and key == "mem" and int(v) > 8192:
+            warn(f"--mem {v} 超过本机可用内存，可能起不来")
+    if o.get("cache") and o["cache"] not in CACHE_MODES:
+        bad(f"--cache 只能是: {', '.join(CACHE_MODES)}")
+    if o.get("fwd"):
+        for part in o["fwd"].split(","):
+            part = part.strip()
+            if part:
+                try:
+                    forward_text(part)
+                except ValueError as e:
+                    bad(f"--fwd {part}: {e}")
+    if o.get("user") and not re.fullmatch(r"[a-z_][a-z0-9_-]{0,31}", o["user"]):
+        bad(f"--user 不合法: {o['user']}")
+    if o.get("port"):
+        p = o["port"]
+        if not p.isdigit() or not (1 <= int(p) <= 65535):
+            bad(f"--port 必须是 1-65535，收到: {p}")
+        if port_busy(int(p)):
+            bad(f"--port {p} 已被占用")
+    if o.get("net") and o["net"] not in ("user", "host"):
+        bad(f"--net 只能是 user 或 host，收到: {o['net']}")
+
+    header("创建 Ubuntu 虚拟机")
 
     # ---- release --------------------------------------------------------
     rel = o.get("rel", "")
