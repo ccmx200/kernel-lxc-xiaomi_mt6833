@@ -29,7 +29,9 @@
 # =============================================================================
 set -u
 
-CKVM_VERSION="1.15"
+CKVM_VERSION="1.16"
+# 1.16: apt output is no longer swallowed - it prints directly,
+#       which is what apt's own progress bars are for.
 # 1.15: dependency install picks the fastest mirror by measurement,
 #       shows progress instead of going silent, is bounded by a
 #       timeout, and detects a held apt lock.
@@ -331,7 +333,8 @@ ensure_aria2() {
     [ "${CKVM_NO_APT:-0}" = 1 ] && return 1
     command -v apt-get >/dev/null 2>&1 || return 1
     say "installing aria2 (multi-connection downloads)..."
-    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq aria2 >/dev/null 2>&1
+    printf '  %s安装 aria2（多线程下载）...%s\n' "$C_DIM" "$C_RST"
+        DEBIAN_FRONTEND=noninteractive timeout 300 apt-get install -y aria2 || true
     command -v aria2c >/dev/null 2>&1
 }
 
@@ -809,6 +812,17 @@ apt_pick_fastest_mirror() {
     return 1
 }
 
+apt_pick_fastest_mirror() {
+    local best="" bestt=0 m t
+    for m in $APT_MIRROR_LIST; do
+        t=$(apt_mirror_speed "$m" 2>/dev/null) || continue
+        case "$t" in ''|0|0.0) continue ;; esac
+        awk -v a="$t" -v b="$bestt" 'BEGIN{exit !(a>b)}' && { best="$m"; bestt="$t"; }
+    done
+    [ -n "$best" ] && { echo "$best"; return 0; }
+    return 1
+}
+
 ensure_deps() {
     local missing; missing=$(deps_missing)
     [ -n "$missing" ] || return 0
@@ -816,13 +830,13 @@ ensure_deps() {
     if command -v apt-get >/dev/null 2>&1; then
         printf '\n  %s📦 缺少依赖%s  %s%s%s\n' "$C_B" "$C_RST" "$C_DIM" "$missing" "$C_RST"
 
-        # ---- mirror -------------------------------------------------
+        # ---- mirror: measure, do not take the first in the list -------
         local cur fast
         cur=$(apt_current_mirror)
         case "$cur" in
             *deb.debian.org*|*archive.ubuntu.com*|*security.ubuntu.com*|"")
                 if [ "${CKVM_NO_APT_MIRROR:-0}" != 1 ]; then
-                    printf '  %s当前源 %s 很慢，正在测速挑一个更快的...%s\n' \
+                    printf '  %s当前源 %s 很慢，测速挑一个更快的...%s\n' \
                            "$C_DIM" "${cur:-未知}" "$C_RST"
                     if fast=$(apt_pick_fastest_mirror); then
                         apt_apply_mirror "$fast" >/dev/null 2>&1 || true
@@ -833,17 +847,15 @@ ensure_deps() {
                 fi ;;
         esac
 
-        # ---- apt update, visibly ------------------------------------
-        # An unrelated apt run holding the lock makes our update a no-op, after
-        # which apt reports the packages as unknown - a confusing error that
-        # says nothing about the real cause.
+        # ---- an unrelated apt holding the lock ------------------------
+        # Its Update silently does nothing, after which apt reports the
+        # packages as unknown - an error that says nothing about the cause.
         local holder=""
-        if command -v fuser >/dev/null 2>&1; then
+        command -v fuser >/dev/null 2>&1 && \
             holder=$(fuser /var/lib/apt/lists/lock 2>/dev/null | tr -d ' ')
-        fi
         [ -n "$holder" ] || holder=$(pgrep -x apt-get 2>/dev/null | head -1 | tr -d ' ')
         if [ -n "$holder" ]; then
-            printf '  %s⚠️  有别的 apt 在运行（pid %s），正等它结束...%s\n' \
+            printf '  %s⚠️  有别的 apt 在运行（pid %s），等它结束...%s\n' \
                    "$C_Y" "$holder" "$C_RST"
             local w=0
             while [ "$w" -lt 120 ]; do
@@ -851,52 +863,32 @@ ensure_deps() {
                 sleep 2; w=$((w+2))
             done
             if kill -0 "$holder" 2>/dev/null; then
-                printf '  %s它还在跑。要么等它，要么： sudo kill %s%s\n' \
-                       "$C_Y" "$holder" "$C_RST"
-                printf '  %s(它可能是你手动跑的 apt update，用的还是慢速源)%s\n' \
-                       "$C_DIM" "$C_RST"
+                printf '  %s它还在跑。等它，或者 sudo kill %s%s\n' "$C_Y" "$holder" "$C_RST"
                 return 1
             fi
-            printf '  %s✓%s 它已结束，继续\n' "$C_G" "$C_RST"
+            printf '  %s✓%s 已结束，继续\n' "$C_G" "$C_RST"
         fi
 
-        spin "更新软件包索引" bash -c \
-             'DEBIAN_FRONTEND=noninteractive timeout 300 apt-get update -qq 2>&1' \
-            || warn "apt-get update 失败（继续尝试安装）"
+        # ---- apt, unobstructed ----------------------------------------
+        # apt's own progress bars and status lines are better than anything
+        # this script would draw, so its output goes straight through.
+        printf '\n  %s——— apt-get update ———%s\n' "$C_DIM" "$C_RST"
+        DEBIAN_FRONTEND=noninteractive timeout 600 apt-get update || \
+            warn "apt-get update 返回非零（继续尝试安装）"
 
-        # ---- install, visibly ---------------------------------------
-        # qemu-system-arm alone is ~200MB; silently waiting looks like a hang.
-        say "下载并安装（qemu 约 200 MB，慢的话几分钟；Ctrl-C 可中断）"
-        local tmp rc
-        tmp=$(mktemp "${TMPDIR:-/tmp}/ckvm-apt.XXXXXX")
-        if [ "$IS_TTY" = 1 ]; then
-            ( DEBIAN_FRONTEND=noninteractive timeout 1800 \
-                apt-get install -y $CKVM_APT_DEPS >"$tmp" 2>&1 ) &
-            local pid=$! i=0 last
-            while kill -0 "$pid" 2>/dev/null; do
-                last=$(tail -1 "$tmp" 2>/dev/null | tr -d '\r' | cut -c1-46)
-                ui_tick $((i++)) "" "安装依赖" "  $last"
-                sleep 0.5
-            done
-            wait "$pid"; rc=$?
-            ui_stop
-        else
-            DEBIAN_FRONTEND=noninteractive timeout 1800 \
-                apt-get install -y $CKVM_APT_DEPS >"$tmp" 2>&1
-            rc=$?
-        fi
-        if [ "$rc" != 0 ]; then
-            warn "apt-get install 返回 $rc"
-            tail -6 "$tmp" 2>/dev/null | sed 's/^/      /' >&2
-        fi
-        rm -f "$tmp"
+        printf '\n  %s——— apt-get install %s ———%s\n' \
+               "$C_DIM" "$CKVM_APT_DEPS" "$C_RST"
+        printf '  %sqemu 约 200 MB，慢的话几分钟；Ctrl-C 可中断%s\n\n' "$C_DIM" "$C_RST"
+        # shellcheck disable=SC2086
+        DEBIAN_FRONTEND=noninteractive timeout 1800 apt-get install -y $CKVM_APT_DEPS
+        local rc=$?
+        [ "$rc" = 0 ] || warn "apt-get install 返回 $rc"
     fi
 
     missing=$(deps_missing)
     if [ -n "$missing" ]; then
         printf '\n  %s❌ 仍缺少: %s%s\n' "$C_R" "$missing" "$C_RST" >&2
         printf '     %s手动装: apt-get install -y %s%s\n' "$C_DIM" "$(ckvm_apt_packages)" "$C_RST" >&2
-        printf '     %s排查:   ckvm selftest%s\n' "$C_DIM" "$C_RST" >&2
         return 1
     fi
 
@@ -2716,7 +2708,6 @@ cmd_selftest() {
     # point of the selftest is to get a working install, not just a verdict.
     local _missing; _missing=$(deps_missing)
     if [ -n "$_missing" ]; then
-        say "缺少依赖: $_missing"
         ensure_deps || true
         echo
     fi
