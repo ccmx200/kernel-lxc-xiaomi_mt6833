@@ -27,11 +27,69 @@ import tempfile
 import time
 import unicodedata
 
+# Animations live in ckvm_ui.py.  Look beside this file first so a checkout
+# works without installing, then fall back to the install directory.
+try:
+    _here = os.path.dirname(os.path.abspath(__file__))
+    for _p in (_here, "/usr/local/bin"):
+        if _p and _p not in sys.path:
+            sys.path.insert(0, _p)
+    from ckvm_ui import (Spinner, Progress, sweep, bar_reveal, steps,  # noqa
+                         human_bytes, human_time, TTY as UI_TTY)
+    HAVE_UI = True
+except Exception:                                    # pragma: no cover
+    HAVE_UI = False
+
+    class Spinner:                                   # type: ignore
+        def __init__(self, label, enabled=True):
+            self.label = label
+
+        def note(self, _t):
+            pass
+
+        def __enter__(self):
+            print(f"  {self.label}...")
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    class Progress:                                  # type: ignore
+        def __init__(self, label, total, enabled=True, width=None):
+            self.total = max(1, int(total))
+            self.done = 0
+
+        def __enter__(self):
+            return self
+
+        def update(self, done):
+            self.done = done
+
+        def __exit__(self, *a):
+            return False
+
+    def sweep(text, **k):
+        print(f"  {text}")
+
+    def bar_reveal(label, **k):
+        pass
+
+    def steps(items, **k):
+        for i in items:
+            print(f"  - {i}")
+
+    def human_bytes(n):
+        return f"{n / 1048576:.1f}M"
+
+    def human_time(s):
+        return f"{s:.0f}s"
+
 VERSION = "2.0"
 
 # --------------------------------------------------------------------------
 # paths and defaults
 # --------------------------------------------------------------------------
+BINDIR = "/usr/local/bin"
 CKVM_ROOT = os.environ.get("CKVM_ROOT", "/var/lib/ckvm")
 CACHE_DIR = os.path.join(CKVM_ROOT, ".cache")
 FW_DIR = os.environ.get("CKVM_FWDIR", "/usr/local/share/ckvm/firmware")
@@ -1476,16 +1534,75 @@ def base_image(rel: str, distro: "Distro" = None) -> bool:
         warn("缓存里那份不完整，重新下载")
         os.remove(dst)
     for url in d.urls(rel):
-        info(f"下载 {url}")
-        rc = run(download_cmd(url, dst))
+        info(f"下载 {d.name} {rel}")
+        if HAVE_UI:
+            rc = watch_download(url, dst, f"{d.name} {rel}")
+        else:
+            rc = run(download_cmd(url, dst))
         if rc == 0 and cache_ready_path(dst):
+            if HAVE_UI:
+                bar_reveal(f"已缓存 {human(os.path.getsize(dst))}")
             ok(f"已缓存 {human(os.path.getsize(dst))}")
             return True
         warn("这个源不行，换下一个")
     return False
 
 
-def download_cmd(url: str, outfile: str) -> list[str]:
+def remote_size(url: str, timeout: int = 15) -> int:
+    """Content-Length, or 0 when the server will not say."""
+    import urllib.request
+    try:
+        req = urllib.request.Request(url, method="HEAD",
+                                     headers={"User-Agent": "ckvm"})
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return int(r.headers.get("Content-Length") or 0)
+    except Exception:
+        return 0
+
+
+def watch_download(url: str, outfile: str, label: str = "下载") -> int:
+    """
+    Run the downloader while showing progress.
+
+    The total comes from a HEAD request; without it the spinner shows the byte
+    count and no percentage, because a bar against a guessed total would be
+    wrong rather than merely approximate.
+
+    aria2c and curl are told to be quiet - their own progress output and ours
+    would fight over the same line.
+    """
+    total = remote_size(url) or 0
+    quiet_cmd = download_cmd(url, outfile, quiet=True)
+
+    if not HAVE_UI or not UI_TTY:
+        return run(quiet_cmd)
+
+    proc = subprocess.Popen(quiet_cmd, stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL)
+    if total > 0:
+        with Progress(label, total) as pr:
+            while proc.poll() is None:
+                try:
+                    pr.update(os.path.getsize(outfile))
+                except OSError:
+                    pass
+                time.sleep(0.25)
+            try:
+                pr.update(os.path.getsize(outfile))
+            except OSError:
+                pass
+    else:
+        with Spinner(label) as sp:
+            while proc.poll() is None:
+                try:
+                    sp.note(human_bytes(os.path.getsize(outfile)))
+                except OSError:
+                    pass
+                time.sleep(0.3)
+    return proc.returncode
+
+
+def download_cmd(url: str, outfile: str, quiet: bool = False) -> list[str]:
     """
     aria2c when available: several connections and real resume.
 
@@ -1501,13 +1618,21 @@ def download_cmd(url: str, outfile: str) -> list[str]:
                 os.remove(ctrl)
         except OSError:
             pass
-        return ["aria2c", "-x8", "-s8", "-k1M", "-c",
-                "--file-allocation=none",
-                "--console-log-level=warn", "--summary-interval=0",
-                "--allow-overwrite=true", "--auto-file-renaming=false",
-                "-d", os.path.dirname(outfile) or ".",
-                "-o", os.path.basename(outfile), url]
-    return ["curl", "-fL", "--progress-bar", "-C", "-", "-o", outfile, url]
+        cmd = ["aria2c", "-x8", "-s8", "-k1M", "-c",
+               "--file-allocation=none",
+               "--console-log-level=warn", "--summary-interval=0",
+               "--allow-overwrite=true", "--auto-file-renaming=false",
+               "-d", os.path.dirname(outfile) or ".",
+               "-o", os.path.basename(outfile), url]
+        if quiet:
+            cmd.insert(1, "--quiet=true")
+        return cmd
+    cmd = ["curl", "-fL", "-C", "-", "-o", outfile, url]
+    if quiet:
+        cmd.insert(1, "-sS")           # silent, but still report real errors
+    else:
+        cmd.insert(1, "--progress-bar")
+    return cmd
 
 
 def make_disk(name: str, rel: str, disk_gb: int,
@@ -1741,6 +1866,13 @@ def cmd_install(rest: list[str]) -> int:
     if me != dst:
         shutil.copyfile(me, dst)
         os.chmod(dst, 0o755)
+    # the animations live in a second file; without it they are simply off
+    ui = os.path.join(os.path.dirname(me), "ckvm_ui.py")
+    if os.path.isfile(ui):
+        shutil.copyfile(ui, os.path.join(BINDIR, "ckvm_ui.py"))
+        ok("动画模块已安装")
+    else:
+        warn("没找到 ckvm_ui.py，动画会关闭（功能不受影响）")
     wrapper = os.path.join(BINDIR, "ckvm")
     with open(wrapper, "w", encoding="utf-8") as fh:
         fh.write("#!/bin/sh\nexec python3 " + dst + ' "$@"\n')
