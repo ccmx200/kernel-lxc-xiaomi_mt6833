@@ -757,7 +757,8 @@ def main(argv: list[str]) -> int:
         "cache": cmd_cache, "versions": cmd_versions,
         "show": cmd_show, "config": cmd_show,
         "install": cmd_install, "mirror": cmd_mirror,
-        "tune": cmd_tune,
+        "tune": cmd_tune, "selftest": cmd_selftest,
+        "console": cmd_console, "net": cmd_net,
     }
     fn = table.get(cmd)
     if fn is None:
@@ -778,6 +779,9 @@ def usage() -> None:
     out(f"  ckvm rm <名字> [-f]       删除")
     out(f"  ckvm show <名字>          看配置")
     out(f"  ckvm tune <名字>          优化 guest 内部 apt（--status/--revert）")
+    out(f"  ckvm console <名字> [-a]  看串口（默认实时，-a 全部，-n N 最后 N 行）")
+    out(f"  ckvm net [名字]           网络情况")
+    out(f"  ckvm selftest             只检查配置，不启动虚拟机")
     out(f"  ckvm mirror               换 apt 源（测速后你选）")
     out(f"  ckvm cache [--clear]      镜像缓存")
     out(f"  ckvm versions             可选 Ubuntu 版本")
@@ -1692,6 +1696,203 @@ def tail_serial(name: str, n: int = 8) -> None:
     lines = open(p, encoding="utf-8", errors="replace").read().splitlines()
     for l in lines[-n:]:
         out(f"  {S.dim}{l[:100]}{S.rst}")
+
+
+
+# --------------------------------------------------------------------------
+# selftest - inspect only, never boots anything
+# --------------------------------------------------------------------------
+def cmd_selftest(rest: list[str]) -> int:
+    banner()
+    header("自检", "只检查配置，不启动虚拟机")
+
+    checks: list[tuple[str, bool, str]] = []
+
+    def add(label: str, good: bool, detail: str = ""):
+        checks.append((label, good, detail))
+
+    # ---- privileges and virtualisation --------------------------------
+    add("root 权限", os.geteuid() == 0,
+        "" if os.geteuid() == 0 else "需要 sudo")
+    add("/dev/kvm", os.path.exists("/dev/kvm"),
+        "" if os.path.exists("/dev/kvm") else "内核没启用 KVM，或没释放 EL2")
+
+    # ---- tools ---------------------------------------------------------
+    for b in BIN_DEPS:
+        add(b, have(b), "" if have(b) else "缺少；跑 ckvm install")
+
+    # ---- firmware ------------------------------------------------------
+    code = os.path.join(FW_DIR, FW_CODE)
+    varsf = os.path.join(FW_DIR, FW_VARS)
+    add("UEFI 固件", os.path.isfile(code) and os.path.isfile(varsf),
+        "" if os.path.isfile(code) else f"缺少 {FW_DIR}/edk2_*.fd")
+    if os.path.isfile(code):
+        sz = os.path.getsize(code)
+        add("固件大小", sz > 1024 * 1024, human(sz))
+
+    # ---- CPU topology --------------------------------------------------
+    try:
+        caps = []
+        for i in range(8):
+            p = f"/sys/devices/system/cpu/cpu{i}/cpu_capacity"
+            if os.path.isfile(p):
+                caps.append(int(open(p).read().strip()))
+        if caps:
+            add("CPU 拓扑", True,
+                f"8 核，小核 {min(caps)} / 大核 {max(caps)}")
+        else:
+            add("CPU 拓扑", True, "读不到 cpu_capacity（非致命）")
+    except Exception as e:
+        add("CPU 拓扑", True, f"跳过: {e}")
+
+    # ---- memory and disk ----------------------------------------------
+    try:
+        info_mem = {}
+        for line in open("/proc/meminfo"):
+            k, _, v = line.partition(":")
+            info_mem[k.strip()] = v.strip()
+        total = int(info_mem.get("MemTotal", "0 kB").split()[0]) * 1024
+        avail = int(info_mem.get("MemAvailable", "0 kB").split()[0]) * 1024
+        add("内存", avail > 512 * 1024 * 1024,
+            f"总 {human(total)}，可用 {human(avail)}")
+    except Exception:
+        add("内存", True, "读不到 /proc/meminfo")
+
+    try:
+        st = os.statvfs(CKVM_ROOT if os.path.isdir(CKVM_ROOT) else "/")
+        free = st.f_bavail * st.f_frsize
+        add("磁盘", free > 5 * 1024 ** 3, f"{CKVM_ROOT} 可用 {human(free)}")
+    except Exception:
+        add("磁盘", True, "读不到 statvfs")
+
+    # ---- state ---------------------------------------------------------
+    n = len(list_guests())
+    add("虚拟机", True, f"{n} 台" if n else "还没有")
+    cached = [f for f in os.listdir(CACHE_DIR)] if os.path.isdir(CACHE_DIR) else []
+    imgs = [f for f in cached if f.endswith("-arm64.img")]
+    total_cache = sum(os.path.getsize(os.path.join(CACHE_DIR, f)) for f in imgs)
+    add("镜像缓存", True, f"{len(imgs)} 个，{human(total_cache)}" if imgs else "空")
+
+    cur = apt_current_mirror()
+    slow = "deb.debian.org" in cur or "archive.ubuntu.com" in cur
+    add("apt 源", not slow, cur or "未知" + ("（官方源，国内很慢）" if slow else ""))
+
+    # ---- print ---------------------------------------------------------
+    w = max(width(c[0]) for c in checks)
+    bad = 0
+    for label, good, detail in checks:
+        mark = f"{S.g}{S.ok}{S.rst}" if good else f"{S.r}{S.no}{S.rst}"
+        if not good:
+            bad += 1
+        out(f"  {mark} {pad(label, w)}  {S.dim}{detail}{S.rst}")
+    out()
+
+    if bad:
+        warn(f"{bad} 项不满足；跑 ckvm install 一般能补齐")
+        return 1
+    ok("全部通过")
+    out()
+    info("下一步： ckvm create")
+    out()
+    return 0
+
+
+# --------------------------------------------------------------------------
+# console
+# --------------------------------------------------------------------------
+def cmd_console(rest: list[str]) -> int:
+    if not rest:
+        die("用法: ckvm console <名字> [-n N|-a]")
+    name = rest[0]
+    load_vm(name)
+    log = os.path.join(vm_dir(name), "serial.log")
+    if not os.path.isfile(log):
+        die(f"还没有串口日志（{name} 从未启动过？）")
+
+    lines: list[str] = []
+    if "-a" in rest:
+        lines = open(log, encoding="utf-8", errors="replace").read().splitlines()
+    else:
+        n = 30
+        if "-n" in rest:
+            try:
+                n = int(rest[rest.index("-n") + 1])
+            except (IndexError, ValueError):
+                pass
+        lines = open(log, encoding="utf-8", errors="replace").read().splitlines()[-n:]
+
+    for l in lines:
+        print(strip_ansi(l))
+    if "-a" in rest or "-n" in rest:
+        return 0
+
+    info("（后面是实时输出，Ctrl-C 退出）")
+    try:
+        with open(log, encoding="utf-8", errors="replace") as fh:
+            fh.seek(0, os.SEEK_END)
+            while True:
+                chunk = fh.readline()
+                if chunk:
+                    print(strip_ansi(chunk), end="")
+                else:
+                    time.sleep(0.5)
+    except KeyboardInterrupt:
+        print()
+    return 0
+
+
+ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]|\x1b\][^\x07]*\x07|\x1b[()][AB0]")
+
+
+def strip_ansi(s: str) -> str:
+    """Drop terminal control sequences; the serial log is full of them."""
+    return ANSI_RE.sub("", s).replace("\r", "")
+
+
+# --------------------------------------------------------------------------
+# net
+# --------------------------------------------------------------------------
+def cmd_net(rest: list[str]) -> int:
+    banner()
+    if rest:
+        name = rest[0]
+        cfg = load_vm(name)
+        header(f"🌐 {name} 的网络")
+        mode = cfg.get("NET_MODE", DEF_NET)
+        port = cfg.get("PORT", "?")
+        if mode == "user":
+            out(f"  模式     QEMU user NAT（容器外要经宿主转发）")
+            out(f"  SSH      ssh {cfg.get('VM_USER','ubuntu')}@127.0.0.1 -p {port}")
+            out()
+            out(f"  {S.b}端口映射{S.rst}")
+            for f in [x for x in cfg.get("FORWARDS", "").split(",") if x]:
+                h, g = parse_forward(f)
+                h = int(port) if g == 22 else h
+                out(f"    宿主机 {pad(str(h), 6)} {S.arrow} guest {g}")
+        else:
+            out(f"  模式     tap，guest 有自己的 IP")
+            out(f"  guest    {TAP_GUEST}")
+        out()
+        return 0
+
+    header("🌐 容器网络")
+    rc, out_ = capture(["ip", "-brief", "addr"])
+    for l in out_.splitlines():
+        out(f"  {S.dim}{l.strip()}{S.rst}")
+    out()
+    guests = list_guests()
+    if guests:
+        out(f"  {S.b}虚拟机{S.rst}")
+        for n in guests:
+            cfg = load_vm(n)
+            state = "running" if running(n) else "stopped"
+            out(f"    {pad(n, 14)} {pad(state, 9)} "
+                f"{cfg.get('NET_MODE','user')}  端口 {cfg.get('PORT','?')}")
+        out()
+    return 0
+
+
+TAP_GUEST = "172.28.100.2/24"
 
 
 if __name__ == "__main__":
