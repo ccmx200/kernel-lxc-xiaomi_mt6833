@@ -757,6 +757,7 @@ def main(argv: list[str]) -> int:
         "cache": cmd_cache, "versions": cmd_versions,
         "show": cmd_show, "config": cmd_show,
         "install": cmd_install, "mirror": cmd_mirror,
+        "tune": cmd_tune,
     }
     fn = table.get(cmd)
     if fn is None:
@@ -776,6 +777,8 @@ def usage() -> None:
     out(f"  ckvm stop <名字>          停止")
     out(f"  ckvm rm <名字> [-f]       删除")
     out(f"  ckvm show <名字>          看配置")
+    out(f"  ckvm tune <名字>          优化 guest 内部 apt（--status/--revert）")
+    out(f"  ckvm mirror               换 apt 源（测速后你选）")
     out(f"  ckvm cache [--clear]      镜像缓存")
     out(f"  ckvm versions             可选 Ubuntu 版本")
     out()
@@ -893,6 +896,7 @@ def cmd_show(rest: list[str]) -> int:
         ("磁盘", "DISK_GB"), ("端口", "PORT"), ("物理核", "CPUSET"),
         ("网络", "NET_MODE"), ("端口映射", "FORWARDS"),
         ("磁盘缓存", "CACHE_MODE"), ("用户", "VM_USER"),
+        ("内部优化", "TUNE"),
     ]
     w = max(width(k) for k, _ in keys)
     for label, key in keys:
@@ -958,6 +962,12 @@ def cmd_create(rest: list[str]) -> int:
     out()
     cache = ask_cache()
     out()
+    idx = menu("guest 内部优化", [
+        ("启用", "关掉拖慢 apt 的几个钩子（每次装包省几秒）"),
+        ("不启用", "保持 Ubuntu 默认行为"),
+    ], default=1, extra="可以随时用 ckvm tune <名字> 补上或撤销")
+    do_tune = "yes" if idx == 0 else "no"
+    out()
     forwards = edit_forwards([DEF_FORWARDS], next_free_port())
     out()
     user, pw = ask_account()
@@ -970,7 +980,8 @@ def cmd_create(rest: list[str]) -> int:
                  ("物理核", mask_label(cores)), ("内存", f"{mem} MiB"),
                  ("磁盘", f"{disk} GiB"), ("缓存", cache),
                  ("端口映射", ", ".join(forwards)),
-                 ("登录", f"{user} / {'*' * len(pw)}")):
+                 ("登录", f"{user} / {'*' * len(pw)}"),
+                 ("内部优化", "创建后启用" if do_tune == "yes" else "不启用")):
         out(f"  {pad(k, 8)} {v}")
     out(f"  {S.dim}{rule(40)}{S.rst}")
     out()
@@ -988,6 +999,7 @@ def cmd_create(rest: list[str]) -> int:
         "DISK_GB": disk, "PORT": port, "CPUSET": cores,
         "NET_MODE": DEF_NET, "FORWARDS": ",".join(forwards),
         "CACHE_MODE": cache, "VM_USER": user, "VM_PASS": pw,
+        "TUNE": do_tune,
         "VM_HOSTNAME": name,
     }
     with open(vm_conf(name), "w", encoding="utf-8") as fh:
@@ -1026,6 +1038,24 @@ def cmd_create(rest: list[str]) -> int:
     return 0
 
 
+def key_paths(name: str) -> tuple[str, str]:
+    d = vm_dir(name)
+    return os.path.join(d, "id_ed25519"), os.path.join(d, "id_ed25519.pub")
+
+
+def ensure_key(name: str) -> str:
+    """Create a per-guest key pair if there is not one.  Returns the pubkey."""
+    priv, pub = key_paths(name)
+    if not os.path.isfile(pub):
+        run(["ssh-keygen", "-t", "ed25519", "-N", "", "-C", f"ckvm@{name}",
+             "-f", priv])
+        os.chmod(priv, 0o600)
+    try:
+        return open(pub, encoding="utf-8").read().strip()
+    except OSError:
+        return ""
+
+
 def write_seed(name: str, user: str, pw: str) -> None:
     """Build user-data / meta-data, then let cloud-localds package them."""
     d = vm_dir(name)
@@ -1049,6 +1079,11 @@ def write_seed(name: str, user: str, pw: str) -> None:
             f'    hashed_passwd: "{hashed}"\n'
         )
 
+    pub = ensure_key(name)
+    # ssh_authorized_keys is a per-user field.  At the top level it only
+    # applies to the *default* user, so a named user would never receive it.
+    key_block = f"    ssh_authorized_keys:\n      - {pub}\n" if pub else ""
+
     user_data = (
         "#cloud-config\n"
         f"hostname: {name}\n"
@@ -1057,6 +1092,7 @@ def write_seed(name: str, user: str, pw: str) -> None:
         "chpasswd:\n"
         "  expire: false\n"
         + user_block
+        + key_block
     )
 
     with open(os.path.join(d, "user-data"), "w", encoding="utf-8") as fh:
@@ -1070,24 +1106,20 @@ def write_seed(name: str, user: str, pw: str) -> None:
          os.path.join(d, "meta-data")])
 
 def hash_pw(pw: str) -> str:
-    """SHA-512 crypt, the form cloud-init expects."""
-    try:
-        import crypt
-        return crypt.crypt(pw, crypt.mksalt(crypt.METHOD_SHA512))
-    except Exception:
-        pass
-    try:
-        import hashlib
-        import base64
-        import secrets
-        salt = base64.b64encode(secrets.token_bytes(12)).decode().rstrip("=")
-        # hashlib supports sha512_crypt since 3.13
-        h = hashlib.sha512(pw.encode()).hexdigest()  # weak fallback
-        return h
-    except Exception:
-        return pw
+    """
+    SHA-512 crypt, the $6$... form shadow and cloud-init expect.
 
-
+    Python 3.13 removed the crypt module, and a plain sha512 hexdigest is NOT a
+    valid crypt string - using one silently produced a guest whose password
+    never worked.  openssl is present on any Debian/Ubuntu host.
+    """
+    for argv in (["openssl", "passwd", "-6", pw],
+                 ["mkpasswd", "-m", "sha-512", pw]):
+        rc, out_ = capture(argv)
+        if rc == 0 and out_.strip().startswith("$6$"):
+            return out_.strip()
+    # last resort: let chpasswd set it in plain text
+    return pw
 def image_urls(rel: str) -> list[str]:
     f = f"ubuntu-{rel}-server-cloudimg-arm64.img"
     return [f"{m}/releases/{rel}/release/{f}" for m in MIRROR_IMAGES]
@@ -1347,6 +1379,161 @@ def cmd_install(rest: list[str]) -> int:
     return 0
 
 
+
+# --------------------------------------------------------------------------
+# tune - guest-side apt speed-ups
+# --------------------------------------------------------------------------
+TUNE_STEP_HOOK = "disable 99update-notifier hook"
+TUNE_STEP_I18N = "drop translation indexes"
+TUNE_STEP_MANDB = "disable man-db trigger"
+TUNE_STEP_NR = "purge needrestart"
+
+
+def guest_ssh(name: str, command: str, timeout: int = 600) -> tuple[int, str]:
+    """
+    Run a command inside the guest as its login user.
+
+    Uses ssh over the published port.  sshpass supplies the password because the
+    guest is a throwaway VM; a key would be nicer but the point here is to work
+    on a freshly created machine with no setup.
+    """
+    cfg = load_vm(name)
+    user = cfg.get("VM_USER", "ubuntu")
+    pw = cfg.get("VM_PASS", "")
+    port = cfg.get("PORT", str(DEF_PORT_BASE))
+    if not pw:
+        return 1, "guest 没记录密码"
+    priv, _pub = key_paths(name)
+    common = ["-o", "StrictHostKeyChecking=no",
+              "-o", "UserKnownHostsFile=/dev/null",
+              "-o", "LogLevel=ERROR",
+              "-o", "ConnectTimeout=10"]
+
+    if os.path.isfile(priv):
+        argv = (["ssh"] + common
+                + ["-i", priv, "-o", "IdentitiesOnly=yes",
+                   "-p", str(port), f"{user}@127.0.0.1", command])
+    elif have("sshpass"):
+        argv = (["sshpass", "-p", pw, "ssh"] + common
+                + ["-o", "PubkeyAuthentication=no",
+                   "-p", str(port), f"{user}@127.0.0.1", command])
+    else:
+        return 1, ("没有该 guest 的 SSH 密钥，也没装 sshpass。"
+                   "重建这台虚拟机即可获得密钥，或先 apt-get install sshpass")
+    try:
+        p = subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
+        return p.returncode, ((p.stdout or "") + (p.stderr or "")).strip()
+    except subprocess.TimeoutExpired:
+        return 1, "超时"
+
+
+def guest_root(name: str, command: str, timeout: int = 600) -> tuple[int, str]:
+    """Same, but escalated with sudo when the login user is not root."""
+    cfg = load_vm(name)
+    if cfg.get("VM_USER", "ubuntu") == "root":
+        return guest_ssh(name, command, timeout)
+    priv, _ = key_paths(name)
+    quoted = command.replace("'", "'\\''")
+    if os.path.isfile(priv):
+        # the key has no password, so a passwordless sudo is fine here
+        return guest_ssh(name, f"sudo -n bash -c '{quoted}'", timeout)
+    pw = cfg.get("VM_PASS", "")
+    return guest_ssh(name, f"echo '{pw}' | sudo -S bash -c '{quoted}'", timeout)
+
+
+def tune_status(name: str) -> None:
+    header(f"🔧 {name} 的 guest 内部优化")
+    rows = [
+        ("99update-notifier hook", "test -f /etc/apt/apt.conf.d/99update-notifier "
+                                   "&& echo 开 || echo 关"),
+        ("翻译索引", "ls /var/lib/apt/lists/*Translation* 2>/dev/null | wc -l"),
+        ("apt lists", "du -sh /var/lib/apt/lists 2>/dev/null | cut -f1"),
+        ("man-db trigger", "test -f /var/lib/dpkg/info/man-db.triggers "
+                           "&& echo 在 || echo 已移除"),
+        ("needrestart", "dpkg -s needrestart >/dev/null 2>&1 && echo 装了 || echo 没装"),
+    ]
+    w = max(width(k) for k, _ in rows)
+    for label, cmd in rows:
+        _rc, out_ = guest_root(name, cmd, timeout=120)
+        out_ = out_.strip().splitlines()[-1] if out_.strip() else "?"
+        out(f"  {pad(label, w)}  {out_}")
+    out()
+
+
+def tune_apply(name: str, quiet: bool = False) -> bool:
+    """Run every step.  Returns True when the guest is reachable."""
+    steps = [
+        (TUNE_STEP_HOOK,
+         "test -f /etc/apt/apt.conf.d/99update-notifier && "
+         "mv -f /etc/apt/apt.conf.d/99update-notifier "
+         "/etc/apt/apt.conf.d/99update-notifier.disabled; true"),
+        (TUNE_STEP_I18N,
+         "rm -f /var/lib/apt/lists/*Translation* 2>/dev/null; true"),
+        (TUNE_STEP_MANDB,
+         "test -f /var/lib/dpkg/info/man-db.triggers && "
+         "mv -f /var/lib/dpkg/info/man-db.triggers "
+         "/var/lib/dpkg/info/man-db.triggers.ckvmbak; true"),
+    ]
+    reachable = False
+    for label, cmd in steps:
+        rc, out_ = guest_root(name, cmd, timeout=180)
+        if rc == 0:
+            reachable = True
+        if not quiet:
+            ok(label) if rc == 0 else warn(f"{label}: {out_[:80]}")
+    # needrestart is only present on some images
+    rc, out_ = guest_root(name, "dpkg -s needrestart >/dev/null 2>&1 && echo yes || echo no",
+                          timeout=120)
+    if "yes" in out_:
+        rc2, _ = guest_root(
+            name,
+            "DEBIAN_FRONTEND=noninteractive apt-get purge -y needrestart "
+            ">/dev/null 2>&1; true", timeout=600)
+        if not quiet:
+            ok(TUNE_STEP_NR) if rc2 == 0 else warn(TUNE_STEP_NR)
+    elif not quiet:
+        info("needrestart 未安装，跳过")
+    return reachable
+
+
+def tune_revert(name: str) -> None:
+    guest_root(
+        name,
+        "mv -f /etc/apt/apt.conf.d/99update-notifier.disabled "
+        "/etc/apt/apt.conf.d/99update-notifier 2>/dev/null; "
+        "test -f /var/lib/dpkg/info/man-db.triggers.ckvmbak && "
+        "mv -f /var/lib/dpkg/info/man-db.triggers.ckvmbak "
+        "/var/lib/dpkg/info/man-db.triggers; true", timeout=180)
+    ok("已恢复 hook 与 man-db trigger")
+    info("needrestart 没有被装回来（它本来就是个可选的通知工具）")
+
+
+def cmd_tune(rest: list[str]) -> int:
+    if not rest:
+        die("用法: ckvm tune <名字> [--status|--revert]")
+    name, mode = rest[0], (rest[1] if len(rest) > 1 else "")
+    load_vm(name)
+    if not running(name):
+        die(f"{name} 没在运行；tune 需要在 guest 内部执行")
+    if mode == "--status":
+        tune_status(name)
+        return 0
+    if mode == "--revert":
+        tune_revert(name)
+        return 0
+    banner()
+    header(f"🔧 guest 内部优化  {S.dim}{name}{S.rst}")
+    if tune_apply(name):
+        out()
+        ok("完成")
+        info(f"查看: ckvm tune {name} --status   恢复: ckvm tune {name} --revert")
+    else:
+        warn("guest 不可达；确认它已经启动到 SSH 就绪")
+        return 1
+    out()
+    return 0
+
+
 # --------------------------------------------------------------------------
 # start
 # --------------------------------------------------------------------------
@@ -1437,25 +1624,64 @@ def cmd_start(rest: list[str]) -> int:
 
     if net == "user":
         info("等 guest 启动到 SSH 就绪（最多 300 秒）...")
-        if wait_ssh(int(port)):
+        if wait_ssh(name, int(port)):
             ok(f"SSH 已就绪  {S.b}ssh {cfg.get('VM_USER','ubuntu')}@127.0.0.1 -p {port}{S.rst}")
+            if cfg.get("TUNE", "no") == "yes":
+                out()
+                info("应用 guest 内部优化（TUNE=yes）...")
+                done = tune_apply(name, quiet=True)
+                if not done:
+                    time.sleep(10)
+                    done = tune_apply(name, quiet=True)
+                if done:
+                    ok("内部优化已应用")
+                else:
+                    warn("优化没应用上；可稍后跑 ckvm tune " + name)
         else:
             warn("等 SSH 超时；串口日志最后几行：")
             tail_serial(name, 8)
     return 0
 
 
-def wait_ssh(port: int, timeout: int = 300) -> bool:
-    import socket
+def ssh_probe(name: str, port: int, timeout: int = 15) -> bool:
+    """True when a real SSH command completes, not merely when the port is up."""
+    cfg = load_vm(name)
+    user = cfg.get("VM_USER", "ubuntu")
+    priv, _ = key_paths(name)
+    common = ["-o", "StrictHostKeyChecking=no",
+              "-o", "UserKnownHostsFile=/dev/null",
+              "-o", "LogLevel=ERROR",
+              "-o", "ConnectTimeout=5",
+              "-o", "BatchMode=yes"]
+    if os.path.isfile(priv):
+        argv = (["ssh"] + common
+                + ["-i", priv, "-o", "IdentitiesOnly=yes",
+                   "-p", str(port), f"{user}@127.0.0.1", "true"])
+    elif have("sshpass"):
+        argv = (["sshpass", "-p", cfg.get("VM_PASS", ""), "ssh"] + common
+                + ["-o", "PubkeyAuthentication=no",
+                   "-p", str(port), f"{user}@127.0.0.1", "true"])
+    else:
+        return False
+    try:
+        return subprocess.run(argv, capture_output=True, timeout=timeout).returncode == 0
+    except (subprocess.TimeoutExpired, OSError):
+        return False
+
+
+def wait_ssh(name: str, port: int, timeout: int = 420) -> bool:
+    """
+    Wait until SSH accepts a command.
+
+    Testing the socket is not enough: the port is forwarded while sshd is still
+    starting, so the first real connection can be reset.
+    """
     import time as _t
     end = _t.time() + timeout
     while _t.time() < end:
-        try:
-            with socket.create_connection(("127.0.0.1", port), timeout=2):
-                time.sleep(2)   # let sshd finish coming up
-                return True
-        except OSError:
-            _t.sleep(3)
+        if ssh_probe(name, port):
+            return True
+        _t.sleep(4)
     return False
 
 
