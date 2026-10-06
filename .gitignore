@@ -136,3 +136,5 @@ susfs4ksu-toco
 /build-resukisu.log
 /AnyKernel3/
 /bgtest.log
+__pycache__/
+*.pyc
