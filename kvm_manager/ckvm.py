@@ -656,25 +656,22 @@ def pick_apt_mirror(current: str = "") -> str | None:
     """
     out()
     out(f"{S.b}apt 软件源{S.rst}")
-    out(f"{S.dim}先测速再选。按延迟排序曾经选中过最慢的那个，所以这里测的是吞吐。{S.rst}")
+    out(f"{S.dim}正在测速，稍等一下…{S.rst}")
     out()
 
+    # print each result as it arrives; trying to rewind the line left stray
+    # escape fragments in piped output, and the columns never lined up anyway
     results = []
     for host, name in APT_MIRRORS:
         url = f"https://{host}/debian"
-        out(f"  {S.dim}测速 {name} ...{S.rst}", )
         speed = measure_url(f"{url}/dists/trixie/main/binary-arm64/Packages.gz")
         results.append((speed, url, name, host))
-        print("\r\033[K", end="")
+        shown = f"{speed:.2f} MB/s" if speed > 0 else "不可达"
+        mark = f"{S.g}★{S.rst}" if speed > 0 else f"{S.r}×{S.rst}"
+        out(f"  {mark} {pad(name, 12)} {pad(host, 30)} {pad(shown, 10, 'right')}")
+    out()
 
     results.sort(key=lambda r: -r[0])
-    out(f"  {S.dim}{pad('源', 26)} {pad('吞吐', 10, 'right')}{S.rst}")
-    out(f"  {S.dim}{rule(40)}{S.rst}")
-    for speed, _url, name, host in results:
-        bar = "" if speed <= 0 else f"{speed:5.2f} MB/s"
-        mark = f"{S.g}★{S.rst}" if speed > 0 else f"{S.r}×{S.rst}"
-        out(f"  {pad(name + '  (' + host + ')', 40)} {pad(bar, 10, 'right')} {mark}")
-    out()
 
     items = [(name, f"{speed:.2f} MB/s" if speed > 0 else "不可达") 
              for speed, _u, name, _h in results]
