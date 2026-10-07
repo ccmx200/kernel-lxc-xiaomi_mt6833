@@ -145,6 +145,7 @@ class Distro:
 
     def __init__(self, key, name, default_user, releases, url_tmpls,
                  cache_name, note=""):
+        self.build = False        # True when ckvm must assemble the disk
         self.key = key
         self.name = name
         self.default_user = default_user
@@ -215,7 +216,22 @@ FEDORA = Distro(
     note="官方 Cloud Base Generic",
 )
 
-DISTROS = [UBUNTU, DEBIAN, FEDORA]
+# Arch is a different animal: no cloud image, so `build` says ckvm must
+# assemble the disk from the Arch Linux ARM rootfs tarball.
+ARCH = Distro(
+    "arch", "Arch Linux ARM", "alarm",
+    [("latest", "aarch64", "rolling", "831M")],
+    ["https://mirrors.ustc.edu.cn/archlinuxarm/os/"
+     "ArchLinuxARM-aarch64-latest.tar.gz",
+     "https://mirrors.tuna.tsinghua.edu.cn/archlinuxarm/os/"
+     "ArchLinuxARM-aarch64-latest.tar.gz",
+     "http://os.archlinuxarm.org/os/ArchLinuxARM-aarch64-latest.tar.gz"],
+    "arch-latest-arm64-rootfs.tar.gz",
+    note="从 rootfs tarball 建盘（约 3GB 可用内存）",
+)
+ARCH.build = True
+
+DISTROS = [UBUNTU, DEBIAN, FEDORA, ARCH]
 DISTRO_BY_KEY = {d.key: d for d in DISTROS}
 
 # kept for the code that still refers to it; the Ubuntu list
@@ -1406,7 +1422,11 @@ def cmd_create(rest: list[str]) -> int:
             ("镜像状态", f"已缓存 {human(os.path.getsize(cached))}" if cached
                         else "需要下载"),
             ("磁盘", os.path.join(d, "disk.qcow2") + f"  {disk} GiB"),
-            ("固件", os.path.join(FW_DIR, FW_CODE)),
+            ("启动方式", "直接内核启动（-kernel）" if getattr(distro, "build", False)
+                        else "UEFI 固件"),
+            ("固件" if not getattr(distro, "build", False) else "内核",
+             os.path.join(FW_DIR, FW_CODE) if not getattr(distro, "build", False)
+             else "从 disk.qcow2 的 /boot/Image 取出"),
             ("cloud-init", os.path.join(d, "seed.img")),
             ("宿主机端口", f"{port} → guest 22"),
         ]
@@ -1421,9 +1441,11 @@ def cmd_create(rest: list[str]) -> int:
             out(f"    {mark}  {S.dim}{u[:88]}{S.rst}")
         out()
         out(f"  {S.dim}QEMU 会以这些参数启动:{S.rst}")
-        for line in group_args(build_qemu_args(name, load_vm_like(
-                name, rel, cpus, mem, disk, port, cores, cache, forwards,
-                o.get("net", DEF_NET)))):
+        for line in group_args(prepare_qemu_args(
+                name, load_vm_like(name, rel, cpus, mem, disk, port, cores,
+                                   cache, forwards, o.get("net", DEF_NET),
+                                   distro.key),
+                materialize=False)):
             out(f"    {S.dim}{line}{S.rst}")
         out()
         ok("试运行结束，什么都没改")
@@ -1592,6 +1614,8 @@ def base_image(rel: str, distro: "Distro" = None) -> bool:
     if found:
         ok(f"使用缓存 {d.name} {rel}（{human(os.path.getsize(found))}，跳过下载）")
         return True
+    if getattr(d, "build", False):
+        return base_image_arch(rel, d)
     dst = cache_img(rel, d)
     if os.path.isfile(dst):
         warn("缓存里那份不完整，重新下载")
@@ -1609,6 +1633,130 @@ def base_image(rel: str, distro: "Distro" = None) -> bool:
             return True
         warn("这个源不行，换下一个")
     return False
+
+
+# --------------------------------------------------------------------------
+# Arch: build a disk from the rootfs tarball
+# --------------------------------------------------------------------------
+BUILD_MIN_FREE = 3 * 1024 ** 3      # tarball + tree + image, with headroom
+
+
+def free_mem() -> int:
+    """MemAvailable in bytes, or 0 when it cannot be read."""
+    try:
+        for line in open("/proc/meminfo"):
+            if line.startswith("MemAvailable:"):
+                return int(line.split()[1]) * 1024
+    except Exception:
+        pass
+    return 0
+
+
+def build_rootfs_image(tar_path: str, out_path: str, size_gb: int = 5) -> bool:
+    """
+    Turn the Arch Linux ARM rootfs tarball into a bootable ext4 image.
+
+    Two routes, tried in order:
+
+      mke2fs -d <tarball>        needs e2fsprogs built with libarchive.  The
+                                 device's is not, WSL's is.
+      extract, then -d <dir>     works anywhere, but needs the tree on disk.
+
+    Refuses when there is not enough free memory, because running out mid-build
+    does not fail cleanly - it makes the machine unresponsive.
+    """
+    avail = free_mem()
+    if avail and avail < BUILD_MIN_FREE:
+        die(f"可用内存只有 {human(avail)}，建 Arch 镜像需要约 "
+            f"{human(BUILD_MIN_FREE)}。\n"
+            f"     先停掉运行中的虚拟机腾出内存，再试：\n"
+            f"       ckvm list && ckvm stop <名字>\n"
+            f"     或者在内存更大的机器上建好，把镜像拷到 {CACHE_DIR}")
+
+    if os.path.isfile(out_path):
+        os.remove(out_path)
+
+    with Spinner("建 ext4 镜像"):
+        rc, out_ = capture(["mke2fs", "-t", "ext4", "-d", tar_path,
+                            "-F", out_path, f"{size_gb}G"])
+    if rc == 0 and cache_ready_path(out_path):
+        return True
+
+    if "libarchive" in out_:
+        info("本机 mke2fs 不支持 tarball，改为解包后建盘")
+    else:
+        warn(f"直接从 tarball 建盘失败：{out_[-160:]}")
+
+    root = tempfile.mkdtemp(prefix="ckvm-arch-")
+    try:
+        with Spinner("解包 rootfs"):
+            rc = run(["tar", "xzf", tar_path, "-C", root])
+        if rc != 0:
+            return False
+        with Spinner("建 ext4 镜像"):
+            rc, out_ = capture(["mke2fs", "-t", "ext4", "-d", root,
+                                "-F", out_path, f"{size_gb}G"])
+        if rc != 0:
+            warn(f"建盘失败：{out_[-200:]}")
+            return False
+        return cache_ready_path(out_path)
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def arch_kernel_from_image(img: str, dest_dir: str) -> str:
+    """
+    Copy the kernel out of the rootfs image so QEMU can boot it directly.
+
+    Arch on this device uses -kernel/-append instead of UEFI, because building
+    an EFI system partition would need mkfs.vfat or mtools, which are not
+    present.  debugfs reads the image without mounting it.
+    """
+    os.makedirs(dest_dir, exist_ok=True)
+    dest = os.path.join(dest_dir, "Image")
+    rc, _ = capture(["debugfs", "-R", f"dump /boot/Image {dest}", img])
+    if rc == 0 and os.path.isfile(dest) and os.path.getsize(dest) > 1024 * 1024:
+        return dest
+    return ""
+
+
+def base_image_arch(rel: str, distro: "Distro") -> bool:
+    """Fetch the tarball and build the disk image from it."""
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    img = cache_img(rel, distro)
+    if cache_ready_path(img):
+        ok(f"使用缓存 {distro.name}（{human(os.path.getsize(img))}，跳过构建）")
+        return True
+
+    tar = img + ".tar.gz"
+    # the tarball is a different size class from a finished image, so test it
+    # directly rather than with cache_ready_path, which expects a >100MB image
+    tar_ok = os.path.isfile(tar) and os.path.getsize(tar) > 600 * 1024 * 1024
+    if not tar_ok:
+        got = False
+        for url in distro.urls(rel):
+            info(f"下载 {distro.name} rootfs")
+            rc = watch_download(url, tar, f"{distro.name} rootfs")
+            if rc == 0 and os.path.isfile(tar) \
+                    and os.path.getsize(tar) > 600 * 1024 * 1024:
+                ok(f"已下载 {human(os.path.getsize(tar))}")
+                got = True
+                break
+            warn("这个源不行，换下一个")
+        if not got:
+            return False
+
+    info("从 rootfs 建盘（这一步吃内存和磁盘，几分钟）")
+    if not build_rootfs_image(tar, img):
+        return False
+    ok(f"已建成 {human(os.path.getsize(img))}")
+
+    # the tarball is no longer needed once the image exists
+    try:
+        os.remove(tar)
+    except OSError:
+        pass
+    return True
 
 
 def remote_size(url: str, timeout: int = 15) -> int:
@@ -1743,12 +1891,17 @@ def make_disk(name: str, rel: str, disk_gb: int,
 
 def load_vm_like(name: str, rel: str, cpus: str, mem: str, disk: str,
                  port: str, cores: str, cache: str, forwards: list,
-                 net: str) -> dict:
-    """A cfg dict shaped like vm.conf, for planning without writing one."""
+                 net: str, distro: str = "ubuntu") -> dict:
+    """
+    A cfg dict shaped like vm.conf, for planning without writing one.
+
+    DISTRO must be present: distro_of() keys off it, and without it a dry run
+    for Arch reported the Ubuntu boot path.
+    """
     return {
-        "NAME": name, "UBUNTU_REL": rel, "CPUS": cpus, "MEM": mem,
-        "DISK_GB": disk, "PORT": port, "CPUSET": cores, "CACHE_MODE": cache,
-        "FORWARDS": ",".join(forwards), "NET_MODE": net,
+        "NAME": name, "DISTRO": distro, "UBUNTU_REL": rel, "CPUS": cpus,
+        "MEM": mem, "DISK_GB": disk, "PORT": port, "CPUSET": cores,
+        "CACHE_MODE": cache, "FORWARDS": ",".join(forwards), "NET_MODE": net,
     }
 
 
@@ -1818,6 +1971,37 @@ def group_args(argv: list[str], per_line: int = 2,
     if cur:
         lines.append(cur)
     return lines
+
+
+def prepare_qemu_args(name: str, cfg: dict, materialize: bool = True) -> list[str]:
+    """
+    The final QEMU command line, including the Arch special case.
+
+    Arch guests boot by direct kernel boot: -kernel plus -append, with the
+    pflash drives removed, because the disk is a bare ext4 rootfs with no ESP
+    and no bootloader.  Verified under QEMU -M virt: the Arch kernel reaches
+    systemd.
+
+    materialize=False is for --dry-run: it reports that the kernel would be
+    extracted from the image rather than extracting it, so a preview stays
+    free of side effects.
+    """
+    args = build_qemu_args(name, cfg)
+    if not getattr(distro_of(cfg), "build", False):
+        return args
+
+    d = vm_dir(name)
+    args = [a for a in args
+            if not (isinstance(a, str) and "if=pflash" in a)]
+    if materialize:
+        kern = arch_kernel_from_image(os.path.join(d, "disk.qcow2"), d)
+        if not kern:
+            die(f"从 {d}/disk.qcow2 里取不到 /boot/Image；"
+                f"重建一次： ckvm rm {name} -f && ckvm create {name}")
+    else:
+        kern = os.path.join(d, "boot/Image") + "  (启动时从镜像里取)"
+    return args + ["-kernel", kern, "-append",
+                   "console=ttyAMA0 root=/dev/vda rw"]
 
 
 def port_busy(port: int) -> bool:
@@ -2227,7 +2411,7 @@ def cmd_start(rest: list[str]) -> int:
     net = cfg.get("NET_MODE", DEF_NET)
 
     # build_qemu_args already wraps the command in taskset when a mask is set
-    args = build_qemu_args(name, cfg)
+    args = prepare_qemu_args(name, cfg)
 
     out(f"  {S.b}{name}{S.rst}  {S.dim}{cpus} vCPU · {mem} MiB · {mask_label(cpuset)}"
         f" · 缓存 {cache}{S.rst}")
