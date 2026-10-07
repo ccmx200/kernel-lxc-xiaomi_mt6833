@@ -3241,9 +3241,14 @@ def cmd_selftest(rest: list[str]) -> int:
     total_cache = sum(os.path.getsize(os.path.join(CACHE_DIR, f)) for f in imgs)
     add("镜像缓存", True, f"{len(imgs)} 个，{human(total_cache)}" if imgs else "空")
 
+    # A stock mirror is slow, not broken: apt still works, so this is a warning
+    # rather than a failure.  Counting it as a failure meant a just-installed
+    # ckvm exited non-zero on its own selftest, and something the user can fix
+    # with one command should not look like a broken install.
     cur = apt_current_mirror()
     slow = "deb.debian.org" in cur or "archive.ubuntu.com" in cur
-    add("apt 源", not slow, cur or "未知" + ("（官方源，国内很慢）" if slow else ""))
+    add("apt 源", True,
+        (cur or "未知") + ("    慢，跑 ckvm mirror 换一个" if slow else ""))
 
     # ---- print ---------------------------------------------------------
     w = max(width(c[0]) for c in checks)
