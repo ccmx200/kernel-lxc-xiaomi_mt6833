@@ -856,6 +856,50 @@ def apt_current_mirror() -> str:
     return ""
 
 
+def apt_mirror_speed(base: str, timeout: int = 25) -> float:
+    """
+    Measure a Debian mirror in MB/s by downloading part of a real index.
+
+    Deliberately a bandwidth test, not a latency test: ranking mirrors by ping
+    picked the slowest one once already, because a nearby host with a saturated
+    uplink answers quickly and then crawls.
+    """
+    import time as _t
+    import urllib.request
+    url = f"{base.rstrip('/')}/dists/trixie/main/binary-arm64/Packages.gz"
+    t0 = _t.time()
+    got = 0
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "ckvm"})
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            while got < 6_000_000:
+                chunk = r.read(65536)
+                if not chunk:
+                    break
+                got += len(chunk)
+    except Exception:
+        return 0.0
+    if got < 200_000:
+        return 0.0
+    return got / 1048576.0 / max(_t.time() - t0, 0.001)
+
+
+def apt_pick_fastest_mirror() -> str:
+    """
+    The apt mirror with the best measured throughput, or "" if none answered.
+
+    Was lost in the multi-distro rewrite while cmd_install kept calling it, so
+    installing on a container with a stock mirror crashed with a NameError
+    before it could switch the source.
+    """
+    best, best_speed = "", 0.0
+    for host, _name in APT_MIRRORS:
+        speed = apt_mirror_speed(f"https://{host}/debian")
+        if speed > best_speed:
+            best, best_speed = f"https://{host}/debian", speed
+    return best
+
+
 def apply_apt_mirror(base: str) -> bool:
     """Rewrite sources to use base, keeping a backup."""
     import glob

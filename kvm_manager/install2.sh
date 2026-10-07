@@ -170,4 +170,12 @@ fi
 cp "$TMP" "$WORK/ckvm.py"
 say "下载完成，开始安装..."
 printf '\n'
-exec python3 "$WORK/ckvm.py" install
+
+# Do NOT exec here.  exec replaces this shell, so the EXIT trap never runs and
+# every install left /tmp/ckvm.XXXXXX and /tmp/ckvm-src.XXXXXX behind - about
+# 110KB plus a directory each time.  Run it, then remove both.
+python3 "$WORK/ckvm.py" install
+rc=$?
+rm -f "$TMP"
+rm -rf "$WORK"
+exit $rc
