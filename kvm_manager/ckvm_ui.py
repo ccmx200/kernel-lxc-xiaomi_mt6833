@@ -417,16 +417,18 @@ def pick(title, items, default: int = 0, cancel: str = "\u53d6\u6d88",
             # climb back over the block and redraw it
             sys.stdout.write(f"\033[{block}A")
             draw()
-        # leave the chosen entry visible as the answer
-        sys.stdout.write(f"\033[{block}A")
+        # Clean the whole block away and leave the cursor at the start of the
+        # line the answer will be written on.  Earlier attempts moved up by the
+        # block height and wrote that many short lines, which lands in the
+        # wrong place and either left menu fragments on screen or added blank
+        # lines; the answer is printed by the caller, so no newline here.
         for _ in range(block):
-            sys.stdout.write("\r\033[K\n")
-        sys.stdout.write(f"\033[{block}A")
-        if idx is None:
-            sys.stdout.write(f"  {D}{cancel}{R}\n")
-        else:
-            label = items[idx][0]
-            sys.stdout.write(f"  {C.green}{MARK_OK}{R} {C.bold}{label}{R}\n")
+            sys.stdout.write("\033[A")
+        for i in range(block):
+            sys.stdout.write("\r\033[K")
+            if i < block - 1:
+                sys.stdout.write("\033[B")
+        sys.stdout.write(f"\033[{block - 1}A\r")
         sys.stdout.flush()
     finally:
         termios.tcsetattr(fd, termios.TCSADRAIN, old)

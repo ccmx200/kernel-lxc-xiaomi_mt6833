@@ -995,7 +995,7 @@ def usage() -> None:
     out(f"  ckvm uninstall            卸载（保留虚拟机数据）")
     out(f"  ckvm mirror               换 apt 源（测速后你选）")
     out(f"  ckvm cache [--clear]      镜像缓存")
-    out(f"  ckvm versions             可选 Ubuntu 版本")
+    out(f"  ckvm versions [发行版]     可选版本（ubuntu/debian/fedora/arch）")
     out()
     out(f"{S.dim}数据: {CKVM_ROOT}    固件: {FW_DIR}{S.rst}")
     out()
@@ -1245,10 +1245,17 @@ def cmd_create(rest: list[str]) -> int:
     if o.get("distro") and o["distro"] not in DISTRO_BY_KEY:
         bad(f"不支持的发行版: {o['distro']}；可选: {', '.join(DISTRO_BY_KEY)}")
     if o.get("rel"):
-        pre = DISTRO_BY_KEY.get(o.get("distro", DEF_DISTRO), UBUNTU)
-        if o["rel"] not in [r[0] for r in pre.releases]:
-            bad(f"{pre.name} 没有 {o['rel']}；"
-                f"可选: {', '.join(r[0] for r in pre.releases)}")
+        # without --distro the release could belong to any family, so only
+        # complain when we know which one was meant
+        if o.get("distro"):
+            pre = DISTRO_BY_KEY[o["distro"]]
+            if o["rel"] not in [r[0] for r in pre.releases]:
+                bad(f"{pre.name} 没有 {o['rel']}；"
+                    f"可选: {', '.join(r[0] for r in pre.releases)}")
+        elif not any(o["rel"] in [r[0] for r in d.releases] for d in DISTROS):
+            allr = ", ".join(f"{d.key}:{r[0]}"
+                             for d in DISTROS for r in d.releases)
+            bad(f"没有版本 {o['rel']}；可选: {allr}")
     if name and not valid_name(name):
         bad(f"名字只能用字母数字和 _ . - ：{name}")
     if name and os.path.isdir(vm_dir(name)):
@@ -1294,7 +1301,23 @@ def cmd_create(rest: list[str]) -> int:
     header("创建虚拟机")
 
     # ---- distro ---------------------------------------------------------
-    dkey = o.get("distro", DEF_DISTRO)
+    # No default: an interactive create must offer the choice.  Passing a
+    # default into o.get() made the key always truthy, so the menu below was
+    # dead code and every interactive create silently picked Ubuntu.  QUIET
+    # (--yes / --dry-run) is the only case that takes a default.
+    dkey = o.get("distro", "")
+    if not dkey and o.get("rel"):
+        # A release given without a family: 13 means Debian, 42 Fedora, latest
+        # Arch.  Falling back to Ubuntu here meant `--rel 13` created an Ubuntu
+        # guest.  Only Ubuntu's own numbers are ambiguous with nothing else, so
+        # match across families first.
+        for d in DISTROS:
+            if o["rel"] in [r[0] for r in d.releases]:
+                dkey = d.key
+                break
+    if not dkey and QUIET:
+        dkey = DEF_DISTRO
+    picked = False
     if dkey:
         if dkey not in DISTRO_BY_KEY:
             die(f"不支持的发行版: {dkey}；可选: {', '.join(DISTRO_BY_KEY)}")
@@ -1306,8 +1329,11 @@ def cmd_create(rest: list[str]) -> int:
             info("已取消")
             return 1
         distro = DISTROS[idx]
+        picked = True
     rels = [r[0] for r in distro.releases]
-    ok(f"{distro.name}")
+    if not picked:
+        # say which one, but not twice: the arrow-key menu already echoed it
+        ok(f"{distro.name}")
 
     # ---- release --------------------------------------------------------
     rel = o.get("rel", "")
