@@ -1097,6 +1097,8 @@ def cmd_show(rest: list[str]) -> int:
             v = cfg.get(key, "")
         if key == "CPUSET" and v:
             v = mask_label(v)
+        if key == "TUNE":
+            v = "启用" if v == "yes" else "不启用"
         out(f"  {pad(label, w)}  {v}")
     out()
     return 0
