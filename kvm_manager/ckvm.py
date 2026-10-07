@@ -1124,7 +1124,8 @@ def cmd_create(rest: list[str]) -> int:
 
     # ---- parse options -------------------------------------------------
     # switches take no value; everything else does
-    SWITCHES = {"yes", "y", "interactive", "i", "on", "off"}
+    SWITCHES = {"yes", "y", "interactive", "i", "on", "off",
+                "dry-run", "dry", "help", "h"}
     o: dict[str, str] = {}
     name = ""
     i = 0
@@ -1151,11 +1152,19 @@ def cmd_create(rest: list[str]) -> int:
 
     unknown = sorted(set(o) - {"distro", "rel", "cpus", "cores", "mem", "disk",
                                "port", "net", "fwd", "user", "pass", "cache",
-                               "tune", "hostname", "yes", "interactive"})
+                               "tune", "hostname", "yes", "interactive",
+                               "dry-run", "dry"})
     if unknown:
         die(f"不认识的选项: {' '.join('--' + u for u in unknown)}\n"
             f"     可用: --distro --rel --cpus --cores --mem --disk --port "
-            f"--net --fwd --user --pass --cache --tune --yes")
+            f"--net --fwd --user --pass --cache --tune --yes --dry-run")
+
+    # --dry-run and --yes both mean "do not ask me anything": use defaults for
+    # whatever the command line did not specify.
+    DRY = bool(o.get("dry-run") or o.get("dry"))
+    QUIET = bool(o.get("yes")) or DRY
+    if DRY:
+        o.setdefault("yes", "1")
 
     # ---- validate everything given on the command line, before asking ----
     # otherwise a bad value is only reported after the interactive questions
@@ -1234,6 +1243,8 @@ def cmd_create(rest: list[str]) -> int:
     if rel:
         if rel not in rels:
             die(f"{distro.name} 没有 {rel}；可选: {', '.join(rels)}")
+    elif QUIET:
+        rel = DEF_REL if DEF_REL in rels else rels[-1]
     else:
         items = []
         for ver, code, tag, size in distro.releases:
@@ -1280,6 +1291,8 @@ def cmd_create(rest: list[str]) -> int:
         if bad:
             die(f"这台机器只有核 0-7，越界: {bad}")
         ok(f"{mask_label(cores)}")
+    elif QUIET:
+        cores = DEF_CORES
     else:
         cores = ask_cores()
     out()
@@ -1297,6 +1310,8 @@ def cmd_create(rest: list[str]) -> int:
     if cache:
         if cache not in CACHE_MODES:
             die(f"--cache 只能是: {', '.join(CACHE_MODES)}")
+    elif QUIET:
+        cache = DEF_CACHE
     else:
         cache = ask_cache()
         out()
@@ -1305,6 +1320,8 @@ def cmd_create(rest: list[str]) -> int:
     tune = o.get("tune", "")
     if tune:
         do_tune = "yes" if tune.lower() in ("yes", "y", "1", "on", "true") else "no"
+    elif QUIET:
+        do_tune = "yes"
     else:
         idx = menu("安装后自动优化", [
             ("启用", "装软件包会快一些"),
@@ -1327,6 +1344,8 @@ def cmd_create(rest: list[str]) -> int:
                 die(f"--fwd {part}: {e}")
         if not forwards:
             die("--fwd 是空的")
+    elif QUIET:
+        forwards = [DEF_FORWARDS]
     else:
         forwards = edit_forwards([DEF_FORWARDS], next_free_port())
     out()
@@ -1335,6 +1354,12 @@ def cmd_create(rest: list[str]) -> int:
     user = o.get("user", "")
     pw = o.get("pass", "") or os.environ.get("CKVM_PW", "")
     if user and pw:
+        if not re.fullmatch(r"[a-z_][a-z0-9_-]{0,31}", user):
+            die(f"用户名不合法: {user}")
+        ok(f"登录 {user}")
+    elif QUIET and not pw:
+        if not user:
+            user = distro.default_user
         if not re.fullmatch(r"[a-z_][a-z0-9_-]{0,31}", user):
             die(f"用户名不合法: {user}")
         ok(f"登录 {user}")
@@ -1361,10 +1386,48 @@ def cmd_create(rest: list[str]) -> int:
         out(f"  {pad(k, 8)} {v}")
     out(f"  {S.dim}{rule(40)}{S.rst}")
     out()
-    if not o.get("yes") and not confirm("开始创建"):
+    if not DRY and not o.get("yes") and not confirm("开始创建"):
         info("已取消")
         return 1
     out()
+
+    # ---- dry run: describe everything, touch nothing --------------------
+    if DRY:
+        port = o.get("port", "") or str(next_free_port())
+        planned_urls = distro.urls(rel)
+        cached = find_cached(rel, distro)
+        d = vm_dir(name)
+        out(f"{S.b}试运行{S.rst}  {S.dim}不会下载、不会写入{S.rst}")
+        out(f"  {S.dim}{rule(52)}{S.rst}")
+        plan = [
+            ("配置目录", d),
+            ("vm.conf", vm_conf(name)),
+            ("基础镜像", cached or planned_urls[0] if planned_urls else "?"),
+            ("镜像状态", f"已缓存 {human(os.path.getsize(cached))}" if cached
+                        else "需要下载"),
+            ("磁盘", os.path.join(d, "disk.qcow2") + f"  {disk} GiB"),
+            ("固件", os.path.join(FW_DIR, FW_CODE)),
+            ("cloud-init", os.path.join(d, "seed.img")),
+            ("宿主机端口", f"{port} → guest 22"),
+        ]
+        w = max(width(k) for k, _ in plan)
+        for k, v in plan:
+            out(f"  {pad(k, w)}  {S.dim}{v}{S.rst}")
+        out(f"  {S.dim}{rule(52)}{S.rst}")
+        out()
+        out(f"  {S.dim}备用镜像源:{S.rst}")
+        for u in planned_urls:
+            mark = f"{S.g}首选{S.rst}" if u == planned_urls[0] else f"{S.dim}备用{S.rst}"
+            out(f"    {mark}  {S.dim}{u[:88]}{S.rst}")
+        out()
+        out(f"  {S.dim}QEMU 会以这些参数启动:{S.rst}")
+        for line in group_args(build_qemu_args(name, load_vm_like(
+                name, rel, cpus, mem, disk, port, cores, cache, forwards,
+                o.get("net", DEF_NET)))):
+            out(f"    {S.dim}{line}{S.rst}")
+        out()
+        ok("试运行结束，什么都没改")
+        return 0
 
     # ---- write config ---------------------------------------------------
     port = o.get("port", "") or str(next_free_port())
@@ -1678,6 +1741,85 @@ def make_disk(name: str, rel: str, disk_gb: int,
     run(["qemu-img", "resize", img, f"{disk_gb}G"])
 
 
+def load_vm_like(name: str, rel: str, cpus: str, mem: str, disk: str,
+                 port: str, cores: str, cache: str, forwards: list,
+                 net: str) -> dict:
+    """A cfg dict shaped like vm.conf, for planning without writing one."""
+    return {
+        "NAME": name, "UBUNTU_REL": rel, "CPUS": cpus, "MEM": mem,
+        "DISK_GB": disk, "PORT": port, "CPUSET": cores, "CACHE_MODE": cache,
+        "FORWARDS": ",".join(forwards), "NET_MODE": net,
+    }
+
+
+def build_qemu_args(name: str, cfg: dict) -> list[str]:
+    """
+    The QEMU command line for a guest.
+
+    Shared by `start` and by `--dry-run`, so the plan a dry run prints is the
+    command that would actually run - they cannot drift apart.
+    """
+    d = vm_dir(name)
+    port = cfg.get("PORT", str(DEF_PORT_BASE))
+    cpus = cfg.get("CPUS", str(DEF_CPUS))
+    mem = cfg.get("MEM", str(DEF_MEM))
+    cpuset = cfg.get("CPUSET", DEF_CORES)
+    cache = cfg.get("CACHE_MODE", DEF_CACHE)
+    forwards = [f for f in cfg.get("FORWARDS", DEF_FORWARDS).split(",") if f]
+    net = cfg.get("NET_MODE", DEF_NET)
+
+    args = [
+        "qemu-system-aarch64", "-name", name,
+        "-M", "virt,gic-version=3", "-cpu", "max", "-accel", "kvm",
+        "-smp", cpus, "-m", mem,
+        "-drive", f"if=pflash,format=raw,unit=0,file={d}/uefi-code.fd,readonly=on",
+        "-drive", f"if=pflash,format=raw,unit=1,file={d}/uefi-vars.fd",
+        "-drive", f"if=virtio,format=qcow2,cache={cache},file={d}/disk.qcow2",
+        "-drive", f"if=virtio,format=raw,readonly=on,file={d}/seed.img",
+    ]
+    if net == "user":
+        hf = []
+        for f in forwards:
+            h, g = parse_forward(f)
+            if g == 22:
+                h = int(port)
+            hf.append(f"hostfwd=tcp:0.0.0.0:{h}-:{g}")
+        args += ["-netdev", "user,id=n0," + ",".join(hf),
+                 "-device", "virtio-net-pci,netdev=n0"]
+    args += ["-device", "virtio-rng-pci", "-display", "none",
+             "-serial", "file:" + os.path.join(d, "serial.log")]
+
+    if have("taskset") and cpuset:
+        args = ["taskset", "-c", cpuset] + args
+    return args
+
+
+def group_args(argv: list[str], per_line: int = 2,
+               width: int = 96) -> list[str]:
+    """
+    Group a QEMU argv into readable lines.
+
+    Printing one element per line is unreadable; printing it all on one line
+    wraps badly.  Options come in flag/value pairs, so group in pairs and split
+    when a line would get too long.
+    """
+    lines: list[str] = []
+    cur = ""
+    i = 0
+    while i < len(argv):
+        n = per_line
+        piece = " ".join(argv[i:i + n])
+        i += n
+        if cur and len(cur) + 1 + len(piece) > width:
+            lines.append(cur)
+            cur = piece
+        else:
+            cur = f"{cur} {piece}".strip()
+    if cur:
+        lines.append(cur)
+    return lines
+
+
 def port_busy(port: int) -> bool:
     """True when something already listens on this host port."""
     import socket
@@ -1710,20 +1852,6 @@ def next_free_port() -> int:
     while p in used or port_busy(p):
         p += 1
     return p
-
-
-def cmd_start(rest: list[str]) -> int:
-    if not rest:
-        die("用法: ckvm start <名字>")
-    name = rest[0]
-    load_vm(name)
-    if running(name):
-        info(f"{name} 已经在运行")
-        return 0
-    pid = guest_pid(name)
-    info(f"启动 {name} ...")
-    die("启动流程尚未接上，下一步实现")
-    return 0
 
 
 def cmd_stop(rest: list[str]) -> int:
@@ -2098,27 +2226,8 @@ def cmd_start(rest: list[str]) -> int:
     forwards = [f for f in cfg.get("FORWARDS", DEF_FORWARDS).split(",") if f]
     net = cfg.get("NET_MODE", DEF_NET)
 
-    args = [
-        "qemu-system-aarch64", "-name", name,
-        "-M", "virt,gic-version=3", "-cpu", "max", "-accel", "kvm",
-        "-smp", cpus, "-m", mem,
-        "-drive", f"if=pflash,format=raw,unit=0,file={d}/uefi-code.fd,readonly=on",
-        "-drive", f"if=pflash,format=raw,unit=1,file={d}/uefi-vars.fd",
-        "-drive", f"if=virtio,format=qcow2,cache={cache},file={d}/disk.qcow2",
-        "-drive", f"if=virtio,format=raw,readonly=on,file={d}/seed.img",
-    ]
-    if net == "user":
-        hf = []
-        for f in forwards:
-            h, g = parse_forward(f)
-            if g == 22:
-                h = int(port)
-            hf.append(f"hostfwd=tcp:0.0.0.0:{h}-:{g}")
-        args += ["-netdev", "user,id=n0," + ",".join(hf),
-                 "-device", "virtio-net-pci,netdev=n0"]
-    args += ["-device", "virtio-rng-pci",
-             "-display", "none",
-             "-serial", "file:" + os.path.join(d, "serial.log")]
+    # build_qemu_args already wraps the command in taskset when a mask is set
+    args = build_qemu_args(name, cfg)
 
     out(f"  {S.b}{name}{S.rst}  {S.dim}{cpus} vCPU · {mem} MiB · {mask_label(cpuset)}"
         f" · 缓存 {cache}{S.rst}")
@@ -2130,9 +2239,6 @@ def cmd_start(rest: list[str]) -> int:
     out()
 
     env = dict(os.environ)
-    taskset = have("taskset")
-    if taskset and cpuset:
-        args = ["taskset", "-c", cpuset] + args
 
     if fg:
         return run(args, env=env)
