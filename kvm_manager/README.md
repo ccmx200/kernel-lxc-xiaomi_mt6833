@@ -3,6 +3,8 @@
 在 **MT6833 / evergo**（红米 Note 11T 5G，天玑 810）上跑**硬件加速**的 KVM 虚拟机。
 装在 droidspaces 容器里，systemd 管理，**支持多开**，CPU / 内存 / 磁盘随便配。
 
+支持 **Ubuntu · Debian · Fedora** 三个发行版，装之前可以 `--dry-run` 先看计划。
+
 ```
   🚀 ckvm · KVM 虚拟机管理器 · 2.0
      作者  璀璨梦星 · cuicanmx   github.com/ccmx200
@@ -39,6 +41,48 @@ curl -fsSL <上面的地址> | sh -s -- --from https://ghproxy.net/
 ```bash
 ckvm create
 ```
+
+---
+
+## 可选的发行版
+
+```bash
+ckvm versions                 # 三个发行版一起列
+ckvm versions debian          # 只看一个
+```
+
+| 发行版 | 版本 | 大小 | 说明 |
+|---|---|---|---|
+| **Ubuntu** | 22.04 – 26.04（9 个） | 584M – 902M | 官方 cloud image |
+| **Debian** | 13 trixie / 12 bookworm | 322M / 326M | genericcloud，带 cloud-init |
+| **Fedora** | 42 | 600M | Cloud Base Generic |
+
+```bash
+ckvm create web --distro debian --rel 13
+ckvm create web --distro fedora --rel 42
+ckvm create web --rel 24.04                 # 不给发行版就是 Ubuntu
+```
+
+镜像分开缓存，互不影响：
+
+```
+$ ckvm cache
+
+  💾 镜像缓存  /var/lib/ckvm/.cache
+  ────────────────────────────────────────────────
+
+    发行版       版本       大小  状态
+    ────────────────────────────────────────────────
+    Ubuntu      26.04    901.7M  ✓
+    Debian      13       321.9M  ✓
+    ────────────────────────────────────────────────
+    合计                 1.2G
+```
+
+> **Arch Linux 暂不支持。** 官方 Arch 镜像树**只有 x86_64**；Arch Linux ARM 提供的是
+> 790 MB 的 rootfs tarball，不是可启动镜像，需要自己建盘 —— 而建盘要么需要
+> `mkfs.vfat`/`mtools`（做 EFI 分区）要么需要 `libarchive`（本机 e2fsprogs 没编译进去），
+> 在这台设备上都不可用。详见 TECHNICAL.md 第 15 章。
 
 ---
 
@@ -116,7 +160,8 @@ ckvm create cmd1 \
 
 | 选项 | 含义 | 默认 |
 |---|---|---|
-| `--rel V` | Ubuntu 版本 | 问，默认 26.04 |
+| `--distro D` | `ubuntu` / `debian` / `fedora` | 问，默认 ubuntu |
+| `--rel V` | 版本号 | 问，默认发行版的最新 |
 | `--cpus N` | vCPU 数量 | 问，默认 8 |
 | `--cores C` | `all` / `big` / 掩码如 `0-2,6-7` | 问，默认全核 |
 | `--mem MB` | 内存，最小 256 | 问，默认 2048 |
@@ -129,6 +174,7 @@ ckvm create cmd1 \
 | `--port N` | 宿主机端口 | 自动从 8023 找空闲 |
 | `--net M` | `user` / `host` | `user` |
 | `--yes` | 跳过确认 | — |
+| `--dry-run` | 只打印计划，不问、不下载、不写入 | — |
 
 选项写错会立刻报错并列出可用的：
 
@@ -136,6 +182,43 @@ ckvm create cmd1 \
   ❌ 不认识的选项: --bogus
      可用: --rel --cpus --cores --mem --disk --port --net --fwd --user --pass --cache --tune --yes
 ```
+
+## 先看计划再动手：`--dry-run`
+
+```bash
+ckvm create web --distro debian --rel 13 --cpus 2 --mem 1024 --dry-run
+```
+
+```
+  试运行  不会下载、不会写入
+    ────────────────────────────────────────────────────
+    配置目录    /var/lib/ckvm/web
+    vm.conf     /var/lib/ckvm/web/vm.conf
+    基础镜像    https://mirror.nju.edu.cn/debian-cdimage/cloud/trixie/latest/debian-13-genericcloud-arm64.qcow2
+    镜像状态    需要下载
+    磁盘        /var/lib/ckvm/web/disk.qcow2  10 GiB
+    固件        /usr/local/share/ckvm/firmware/edk2_qemu_aarch64_nonvram.fd
+    cloud-init  /var/lib/ckvm/web/seed.img
+    宿主机端口  8023 → guest 22
+    ────────────────────────────────────────────────────
+
+    备用镜像源:
+      首选  https://mirror.nju.edu.cn/debian-cdimage/cloud/trixie/latest/debian-13-genericcloud-arm6
+      备用  https://cloud.debian.org/images/cloud/trixie/latest/debian-13-genericcloud-arm64.qcow2
+
+    QEMU 会以这些参数启动:
+      taskset -c 0-7 qemu-system-aarch64 -name web -M virt,gic-version=3 -cpu max -accel kvm -smp 2
+      -m 1024 -drive if=pflash,format=raw,unit=0,file=/var/lib/ckvm/web/uefi-code.fd,readonly=on
+      -netdev user,id=n0,hostfwd=tcp:0.0.0.0:8023-:22
+      -device virtio-net-pci,netdev=n0 -device virtio-rng-pci -display none
+      -serial file:/var/lib/ckvm/web/serial.log
+
+  ✅ 试运行结束，什么都没改
+```
+
+`--dry-run` 也意味着**不再问你任何问题**：命令行没给的选项一律用默认值。
+
+---
 
 ### 登录账号
 
@@ -291,7 +374,8 @@ ckvm tune cmd1 --revert     # 还原
 # 创建与管理
 ckvm create                     # 交互式
 ckvm create <名字> [选项]        # 命令式
-ckvm versions                   # 可选版本
+ckvm create ... --dry-run       # 只打印计划，不下载不写入
+ckvm versions [发行版]           # 可选版本（ubuntu/debian/fedora）
 ckvm image [版本]                # 只下载/缓存基础镜像
 ckvm cache [--clear|--path]     # 镜像缓存
 
