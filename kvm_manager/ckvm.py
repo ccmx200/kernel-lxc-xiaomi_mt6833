@@ -35,7 +35,8 @@ try:
         if _p and _p not in sys.path:
             sys.path.insert(0, _p)
     from ckvm_ui import (Spinner, Progress, sweep, bar_reveal, steps,  # noqa
-                         human_bytes, human_time, TTY as UI_TTY)
+                         human_bytes, human_time, TTY as UI_TTY,
+                         pick, can_pick)
     HAVE_UI = True
 except Exception:                                    # pragma: no cover
     HAVE_UI = False
@@ -433,12 +434,20 @@ def ask_secret(prompt: str) -> str:
 
 
 def menu(title: str, items: list[tuple[str, str]], default: int = 1,
-         cancel: str = "取消", extra: str = "") -> int | None:
+         cancel: str = "取消", extra: str = "") -> "int | None":
     """
-    Numbered menu.  Returns the 0-based index, or None when cancelled.
+    Let the user choose.  Returns the 0-based index, or None when cancelled.
+
+    On a terminal this is an arrow-key menu; otherwise it stays the numbered
+    prompt, so piping still works and scripts do not change behaviour.
 
     items: list of (label, description)
     """
+    if HAVE_UI and can_pick():
+        # pick() takes a 0-based default; callers here pass 1-based
+        return pick(title, items, default=default - 1, cancel=cancel,
+                    extra=extra)
+
     out(f"{S.b}{title}{S.rst}")
     if extra:
         out(f"{S.dim}{extra}{S.rst}")
@@ -1277,8 +1286,8 @@ def cmd_create(rest: list[str]) -> int:
 
     # ---- name -----------------------------------------------------------
     if not name:
-        name = ask("虚拟机名字",
-                   f"{distro.key}{rel.replace('.', '')}")
+        default_name = f"{distro.key}{rel.replace('.', '')}"
+        name = default_name if QUIET else ask("虚拟机名字", default_name)
     if not valid_name(name):
         die(f"名字只能用字母数字和 _ . - ：{name}")
     if os.path.isdir(vm_dir(name)):
@@ -1287,7 +1296,7 @@ def cmd_create(rest: list[str]) -> int:
     # ---- cpu ------------------------------------------------------------
     cpus = o.get("cpus", "")
     if not cpus:
-        cpus = ask("vCPU 数量", str(DEF_CPUS))
+        cpus = str(DEF_CPUS) if QUIET else ask("vCPU 数量", str(DEF_CPUS))
     if not cpus.isdigit() or int(cpus) < 1:
         die("vCPU 必须是正整数")
     out()
@@ -1314,8 +1323,10 @@ def cmd_create(rest: list[str]) -> int:
     out()
 
     # ---- memory / disk --------------------------------------------------
-    mem = o.get("mem", "") or ask("内存 (MiB)", str(DEF_MEM))
-    disk = o.get("disk", "") or ask("磁盘 (GiB)", str(DEF_DISK))
+    mem = o.get("mem", "") or (str(DEF_MEM) if QUIET
+                               else ask("内存 (MiB)", str(DEF_MEM)))
+    disk = o.get("disk", "") or (str(DEF_DISK) if QUIET
+                                 else ask("磁盘 (GiB)", str(DEF_DISK)))
     for label, v, lo in (("内存", mem, 256), ("磁盘", disk, 2)):
         if not v.isdigit() or int(v) < lo:
             die(f"{label} 至少 {lo}，收到: {v}")

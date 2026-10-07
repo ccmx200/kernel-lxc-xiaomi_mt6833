@@ -1,17 +1,17 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Terminal feedback for ckvm: spinners, progress bars, transitions.
+Terminal feedback for ckvm: spinners, progress bars, transitions, and menus.
 
-Kept in its own module because ckvm.py was already 2600 lines and mixing
-animation code into the command logic makes both harder to follow.
+Kept in its own module because ckvm.py was already 2600 lines and animation
+code mixed into command logic makes both harder to follow.
 
 Rules this module follows:
 
-  * nothing animates unless stdout is a real terminal - a pipe gets plain lines,
-    because escape codes in a log are worse than no animation
-  * every glyph has an ASCII fallback chosen from the output encoding, so a GBK
-    console does not raise UnicodeEncodeError mid-download
+  * nothing animates unless stdout is a real terminal, and no glyph is emitted
+    that the output encoding cannot represent - a GBK console used to raise
+    UnicodeEncodeError mid-download
+  * every effect has a plain-text fallback, so piping and logging stay readable
   * a context manager always clears its line, including when the body raises,
     so a failure never leaves half a progress bar on screen
   * elapsed time is shown for anything slow, since a still spinner with no
@@ -25,6 +25,25 @@ import shutil
 import sys
 import threading
 import time
+
+
+def w(s: str) -> int:
+    """
+    Display width, counting East Asian wide characters as two.
+
+    Local copy so this module does not have to import ckvm (which imports it).
+    """
+    import unicodedata
+    n = 0
+    for ch in s:
+        if unicodedata.combining(ch):
+            continue
+        if unicodedata.east_asian_width(ch) in ("W", "F") or ord(ch) >= 0x1F300:
+            n += 2
+        else:
+            n += 1
+    return n
+
 
 # --------------------------------------------------------------------------
 # capability detection
@@ -48,9 +67,11 @@ _UTF_FRAMES = ("\u280b", "\u2819", "\u2839", "\u2838", "\u283c",
                "\u2834", "\u2826", "\u2827", "\u2807", "\u280f")
 SPIN_FRAMES = _UTF_FRAMES if UNI else ("|", "/", "-", "\\")
 
-# never emit a glyph the output encoding cannot represent
 MARK_OK = "\u2713" if UNI else "OK"
 MARK_DOT = "\u00b7" if UNI else "-"
+CURSOR = "\u276f" if UNI else ">"
+ARROWS = "\u2191\u2193" if UNI else "up/down"
+RETURN = "\u21b5" if UNI else "Enter"
 
 _CODES = {
     "reset": "0", "bold": "1", "dim": "2", "italic": "3", "under": "4",
@@ -192,7 +213,7 @@ class Progress:
         self.done = 0
 
     def __enter__(self):
-        self.update(0)
+        self.update(1)
         return self
 
     def update(self, done: int) -> None:
@@ -200,7 +221,7 @@ class Progress:
         if not self.enabled:
             return
         now = time.time()
-        # redraw at most ~12x a second; faster only burns cpu
+        # redraw at most about 12x a second; faster only burns cpu
         if now - self.last < 0.08 and done < self.total:
             return
         self.last = now
@@ -286,6 +307,130 @@ def steps(items, delay: float = 0.12) -> None:
         else:
             sys.stdout.write(f"  {MARK_OK} {it}\n")
         sys.stdout.flush()
+
+
+# --------------------------------------------------------------------------
+# arrow-key menu
+# --------------------------------------------------------------------------
+def _read_key(fd: int) -> str:
+    """
+    One keypress, decoded.
+
+    Arrow keys arrive as ESC [ A/B/C/D.  A bare ESC cannot be told apart from
+    the start of a sequence without waiting, so a short poll decides.
+    """
+    import select
+
+    ch = os.read(fd, 1)
+    if ch == b"\x1b":
+        r, _w, _x = select.select([fd], [], [], 0.05)
+        if not r:
+            return "esc"
+        rest = os.read(fd, 2)
+        return {b"[A": "up", b"[B": "down", b"[C": "right", b"[D": "left",
+                b"[H": "home", b"[F": "end", b"OA": "up", b"OB": "down",
+                b"OC": "right", b"OD": "left"}.get(rest, "other")
+    if ch in (b"\r", b"\n"):
+        return "enter"
+    if ch in (b"\x03", b"\x04"):
+        raise KeyboardInterrupt
+    return ch.decode("utf-8", "replace")
+
+
+def can_pick() -> bool:
+    """True when an arrow-key menu is possible."""
+    try:
+        return TTY and sys.stdin.isatty()
+    except Exception:
+        return False
+
+
+def pick(title, items, default: int = 0, cancel: str = "\u53d6\u6d88",
+         extra: str = ""):
+    """
+    Arrow-key menu.  items: list of (label, description).
+
+    Returns the 0-based index or None when cancelled.  Callers keep their
+    numbered prompt for when can_pick() is False, so piping still works.
+    """
+    import termios
+    import tty
+
+    fd = sys.stdin.fileno()
+    n = len(items)
+    if n == 0:
+        return None
+    idx = max(0, min(default, n - 1))
+    label_w = max(w(l) for l, _d in items)
+
+    def wline(s: str) -> None:
+        sys.stdout.write("\r\033[K" + s + "\n")
+
+    def draw() -> None:
+        for i, (label, desc) in enumerate(items):
+            if i == idx:
+                line = f"  {C.cyan}{CURSOR}{R} {C.bold}{label}{R}"
+            else:
+                line = f"  {' '} {label}"
+            if desc:
+                line += " " * max(1, label_w - w(label) + 2) + f"{D}{desc}{R}"
+            wline(line)
+        wline(f"  {C.cyan}0{R} {D}{cancel}{R}")
+        wline(f"  {D}{ARROWS} \u9009\u62e9   {RETURN} \u786e\u5b9a   "
+              f"q \u53d6\u6d88{R}")
+
+    if title:
+        sys.stdout.write(f"\n  {C.bold}{title}{R}\n")
+    if extra:
+        sys.stdout.write(f"  {D}{extra}{R}\n")
+    sys.stdout.write("\n")
+
+    # remember the block height so each redraw can climb back over it
+    block = n + 2
+
+    old = termios.tcgetattr(fd)
+    try:
+        tty.setraw(fd)
+        draw()
+        while True:
+            k = _read_key(fd)
+            if k in ("up", "left", "k"):
+                idx = (idx - 1) % n
+            elif k in ("down", "right", "j"):
+                idx = (idx + 1) % n
+            elif k == "home":
+                idx = 0
+            elif k == "end":
+                idx = n - 1
+            elif k == "enter":
+                break
+            elif k in ("q", "esc"):
+                idx = None
+                break
+            elif k.isdigit():
+                v = int(k)
+                if v == 0:
+                    idx = None
+                    break
+                if 1 <= v <= n:
+                    idx = v - 1
+            # climb back over the block and redraw it
+            sys.stdout.write(f"\033[{block}A")
+            draw()
+        # leave the chosen entry visible as the answer
+        sys.stdout.write(f"\033[{block}A")
+        for _ in range(block):
+            sys.stdout.write("\r\033[K\n")
+        sys.stdout.write(f"\033[{block}A")
+        if idx is None:
+            sys.stdout.write(f"  {D}{cancel}{R}\n")
+        else:
+            label = items[idx][0]
+            sys.stdout.write(f"  {C.green}{MARK_OK}{R} {C.bold}{label}{R}\n")
+        sys.stdout.flush()
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+    return idx
 
 
 def hint(text: str) -> str:
