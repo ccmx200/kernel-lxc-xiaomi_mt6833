@@ -1491,6 +1491,14 @@ def cmd_create(rest: list[str]) -> int:
     else:
         make_disk(name, rel, int(disk), distro)
         ok(f"磁盘已就绪（{disk} GiB）")
+        # Arch has no cloud-init, so the seed is ignored and the login has to be
+        # written into the image itself
+        if getattr(distro, "build", False):
+            img = os.path.join(d, "disk.qcow2")
+            if inject_arch_credentials(img, user, pw):
+                ok("账号已写入镜像（Arch 没有 cloud-init）")
+            else:
+                warn("账号注入失败；guest 起来后只能用镜像自带的密码登录")
 
     out()
     out(f"  {S.g}🎉{S.rst} {S.b}{name}{S.rst} 创建完成")
@@ -1704,6 +1712,110 @@ def build_rootfs_image(tar_path: str, out_path: str, size_gb: int = 5) -> bool:
         shutil.rmtree(root, ignore_errors=True)
 
 
+def inject_arch_credentials(img: str, user: str, pw: str) -> bool:
+    """
+    Set the login for an Arch guest by editing the image directly.
+
+    Arch Linux ARM has no cloud-init, so the seed.img ckvm builds for Ubuntu and
+    Debian is simply ignored - the guest boots to a login prompt that only the
+    image's default password would satisfy.  This was found by booting one and
+    watching it reach "alarm login:" while SSH kept timing out.
+
+    debugfs edits /etc/shadow and /etc/group inside the image, which needs no
+    mounting and no loop device.
+    """
+    if not have("debugfs"):
+        return False
+
+    hashed = hash_pw(pw)
+    if not hashed.startswith("$"):
+        return False
+
+    tmpd = tempfile.mkdtemp(prefix="ckvm-arch-cred-")
+    try:
+        # ---- shadow: give the user and root a known password ----------
+        sh = os.path.join(tmpd, "shadow")
+        rc, _ = capture(["debugfs", "-R", f"dump /etc/shadow {sh}", img])
+        if rc != 0 or not os.path.isfile(sh):
+            return False
+        lines = open(sh, encoding="utf-8").read().splitlines()
+        found = False
+        new = []
+        for l in lines:
+            f = l.split(":")
+            if len(f) > 2 and f[0] == user:
+                f[1] = hashed
+                l = ":".join(f)
+                found = True
+            elif len(f) > 2 and f[0] == "root":
+                f[1] = hashed
+                l = ":".join(f)
+            new.append(l)
+        if not found:
+            return False
+        with open(sh, "w", encoding="utf-8") as fh:
+            fh.write("\n".join(new) + "\n")
+
+        # ---- passwd: make sure the shell is usable --------------------
+        pwf = os.path.join(tmpd, "passwd")
+        capture(["debugfs", "-R", f"dump /etc/passwd {pwf}", img])
+        if os.path.isfile(pwf):
+            plines = []
+            for l in open(pwf, encoding="utf-8").read().splitlines():
+                f = l.split(":")
+                if len(f) > 6 and f[0] == user and ("nologin" in f[6] or not f[6]):
+                    f[6] = "/bin/bash"
+                    l = ":".join(f)
+                plines.append(l)
+            with open(pwf, "w", encoding="utf-8") as fh:
+                fh.write("\n".join(plines) + "\n")
+
+        # ---- group: wheel for sudo ------------------------------------
+        grp = os.path.join(tmpd, "group")
+        capture(["debugfs", "-R", f"dump /etc/group {grp}", img])
+        if os.path.isfile(grp):
+            glines = []
+            for l in open(grp, encoding="utf-8").read().splitlines():
+                f = l.split(":")
+                if len(f) > 3 and f[0] == "wheel" and user not in f[3].split(","):
+                    f[3] = (f[3] + "," + user).lstrip(",")
+                    l = ":".join(f)
+                glines.append(l)
+            with open(grp, "w", encoding="utf-8") as fh:
+                fh.write("\n".join(glines) + "\n")
+
+        # ---- write them back ------------------------------------------
+        # Three things had to be established by testing, all of which broke
+        # this the first time:
+        #   * `debugfs write` refuses an existing path with "Ext2 file already
+        #     exists" and changes nothing, so the file must be removed first.
+        #   * after rm+write the mode becomes 0644, and sshd will not use a
+        #     world-readable /etc/shadow.
+        #   * `set_inode_field mode 600` is read as OCTAL-ish and produced
+        #     mode 01200 with a "bad type" inode, which then broke D-Bus and
+        #     the SSH handshake.  The mode must be given as an octal string.
+        modes = {"shadow": "0100600", "passwd": "0100644", "group": "0100644"}
+        ok_all = True
+        for name, dest in (("shadow", "/etc/shadow"),
+                           ("passwd", "/etc/passwd"),
+                           ("group", "/etc/group")):
+            src = os.path.join(tmpd, name)
+            if not os.path.isfile(src):
+                continue
+            capture(["debugfs", "-w", "-R", f"rm {dest}", img])
+            rc, wout = capture(["debugfs", "-w", "-R",
+                                f"write {src} {dest}", img])
+            if "Allocated inode" not in wout and rc != 0:
+                warn(f"写 {dest} 失败：{wout.strip()[-80:]}")
+                ok_all = False
+                continue
+            capture(["debugfs", "-w", "-R",
+                     f"set_inode_field {dest} mode {modes[name]}", img])
+        return ok_all
+    finally:
+        shutil.rmtree(tmpd, ignore_errors=True)
+
+
 def arch_kernel_from_image(img: str, dest_dir: str) -> str:
     """
     Copy the kernel out of the rootfs image so QEMU can boot it directly.
@@ -1877,16 +1989,47 @@ def copy_with_progress(src: str, dst: str, label: str = "复制镜像") -> None:
 
 def make_disk(name: str, rel: str, disk_gb: int,
               distro: "Distro" = None) -> None:
+    """
+    Give the guest its own copy of the base image, resized.
+
+    Arch keeps a raw disk.  Its boot needs the kernel extracted from the image
+    with debugfs, which reads filesystems, not qcow2 containers - converting
+    made the kernel unreachable.  The format is recorded in DISK_FMT so start
+    passes the right -drive format.
+    """
     d = vm_dir(name)
     img = os.path.join(d, "disk.qcow2")
+    fmt = "qcow2"
     if os.path.isfile(img) and os.path.getsize(img) > 1024 * 1024:
         info("磁盘已存在")
     else:
         src = find_cached(rel, distro)
         if not src:
             raise RuntimeError(f"缓存里没有 {rel} 的镜像")
-        copy_with_progress(src, img, f"复制 {distro.name if distro else ''} 镜像".strip())
+        copy_with_progress(src, img,
+                           f"复制 {distro.name if distro else ''} 镜像".strip())
+        _rc, info_txt = capture(["qemu-img", "info", img])
+        if re.search(r"^file format:\s*raw\b", info_txt, re.M):
+            fmt = "raw"
+            if getattr(distro, "build", False):
+                # leave it raw: debugfs has to read the kernel back out later
+                info("基础镜像是 raw，Arch 直接使用 raw 磁盘")
+            else:
+                info("基础镜像是 raw，转成 qcow2")
+                tmp = img + ".qc"
+                if run(["qemu-img", "convert", "-f", "raw", "-O", "qcow2",
+                        img, tmp]) == 0 and os.path.getsize(tmp) > 1024 * 1024:
+                    os.replace(tmp, img)
+                    fmt = "qcow2"
+                    ok("已转为 qcow2")
+                else:
+                    warn("转换失败，继续用 raw（磁盘仍可用）")
+                    try:
+                        os.remove(tmp)
+                    except OSError:
+                        pass
     run(["qemu-img", "resize", img, f"{disk_gb}G"])
+    set_conf(name, "DISK_FMT", fmt)
 
 
 def load_vm_like(name: str, rel: str, cpus: str, mem: str, disk: str,
@@ -1918,6 +2061,8 @@ def build_qemu_args(name: str, cfg: dict) -> list[str]:
     mem = cfg.get("MEM", str(DEF_MEM))
     cpuset = cfg.get("CPUSET", DEF_CORES)
     cache = cfg.get("CACHE_MODE", DEF_CACHE)
+    # Arch keeps a raw disk so debugfs can read the kernel back out of it
+    disk_fmt = cfg.get("DISK_FMT", "qcow2")
     forwards = [f for f in cfg.get("FORWARDS", DEF_FORWARDS).split(",") if f]
     net = cfg.get("NET_MODE", DEF_NET)
 
@@ -1927,7 +2072,7 @@ def build_qemu_args(name: str, cfg: dict) -> list[str]:
         "-smp", cpus, "-m", mem,
         "-drive", f"if=pflash,format=raw,unit=0,file={d}/uefi-code.fd,readonly=on",
         "-drive", f"if=pflash,format=raw,unit=1,file={d}/uefi-vars.fd",
-        "-drive", f"if=virtio,format=qcow2,cache={cache},file={d}/disk.qcow2",
+        "-drive", f"if=virtio,format={disk_fmt},cache={cache},file={d}/disk.qcow2",
         "-drive", f"if=virtio,format=raw,readonly=on,file={d}/seed.img",
     ]
     if net == "user":
@@ -1991,8 +2136,10 @@ def prepare_qemu_args(name: str, cfg: dict, materialize: bool = True) -> list[st
         return args
 
     d = vm_dir(name)
-    args = [a for a in args
-            if not (isinstance(a, str) and "if=pflash" in a)]
+    # Drop the two pflash drives as flag/value pairs.  Filtering element by
+    # element removed only the value - "if=pflash..." matched but "-drive" did
+    # not - which left a stray -drive and made QEMU exit immediately.
+    args = drop_drive(args, "if=pflash")
     if materialize:
         kern = arch_kernel_from_image(os.path.join(d, "disk.qcow2"), d)
         if not kern:
@@ -2002,6 +2149,48 @@ def prepare_qemu_args(name: str, cfg: dict, materialize: bool = True) -> list[st
         kern = os.path.join(d, "boot/Image") + "  (启动时从镜像里取)"
     return args + ["-kernel", kern, "-append",
                    "console=ttyAMA0 root=/dev/vda rw"]
+
+
+def set_conf(name: str, key: str, value: str) -> None:
+    """Set one key in vm.conf, adding it if absent."""
+    path = vm_conf(name)
+    try:
+        lines = open(path, encoding="utf-8").read().splitlines()
+    except OSError:
+        return
+    out_lines, seen = [], False
+    for l in lines:
+        if l.startswith(key + "="):
+            out_lines.append(f"{key}={value}")
+            seen = True
+        else:
+            out_lines.append(l)
+    if not seen:
+        out_lines.append(f"{key}={value}")
+    try:
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write("\n".join(out_lines) + "\n")
+    except OSError:
+        pass
+
+
+def drop_drive(argv: list[str], match: str) -> list[str]:
+    """
+    Remove every `-drive <value>` pair whose value contains match.
+
+    Written after a plain element filter broke the argv: it removed the value
+    ("if=pflash,...") but kept the preceding "-drive", so QEMU saw two -drive
+    flags in a row and refused to start.
+    """
+    out: list[str] = []
+    i = 0
+    while i < len(argv):
+        if argv[i] == "-drive" and i + 1 < len(argv) and match in argv[i + 1]:
+            i += 2
+            continue
+        out.append(argv[i])
+        i += 1
+    return out
 
 
 def port_busy(port: int) -> bool:
