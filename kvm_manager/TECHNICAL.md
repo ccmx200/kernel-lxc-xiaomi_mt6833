@@ -2072,20 +2072,3 @@ ping              2 transmitted, 2 received, 0% loss
 ssh               172.28.100.2:22 -> SSH-2.0-OpenSSH_10.2p1 Ubuntu-2ubuntu3.6
 ```
 
-下载速率（NJU，aria2 16 连接）：
-
-```text
-约 10 MB/s
-```
-
-网络可达性（容器内）：
-
-```text
-raw.githubusercontent.com   Connection reset by peer
-github.com                  Connection reset by peer
-git.yylx.win                404（只代理 git clone，不代理 raw）
-ghproxy.net                 200
-gh-proxy.com                200
-mirror.nju.edu.cn           200
-mirrors.ustc.edu.cn         200
-```
