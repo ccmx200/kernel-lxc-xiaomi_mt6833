@@ -51,12 +51,24 @@ ckvm versions                 # 三个发行版一起列
 ckvm versions debian          # 只看一个
 ```
 
-| 发行版 | 版本 | 大小 | 说明 |
-|---|---|---|---|
-| **Ubuntu** | 22.04 – 26.04（9 个） | 584M – 902M | 官方 cloud image |
-| **Debian** | 13 trixie / 12 bookworm | 322M / 326M | genericcloud，带 cloud-init |
-| **Fedora** | 42 | 600M | Cloud Base Generic |
-| **Arch Linux ARM** | latest | 831M | 从 rootfs tarball 建盘，直接内核启动 |
+四个发行版都**在本机实测过**：创建 → 启动 → SSH 登录。
+
+| 发行版 | 版本 | 大小 | 说明 | 实测 |
+|---|---|---|---|---|
+| **Ubuntu** | 22.04 – 26.04（9 个） | 584M – 902M | 官方 cloud image | ✅ 26.04 |
+| **Debian** | 13 trixie / 12 bookworm | 322M / 326M | genericcloud，带 cloud-init | ✅ 13 |
+| **Fedora** | 42 | 508M | Cloud Base Generic | ✅ 42 |
+| **Arch Linux ARM** | latest | 831M | 从 rootfs tarball 建盘，直接内核启动 | ✅ latest |
+
+实测到的差别：
+
+| | Ubuntu / Debian / Fedora | Arch Linux ARM |
+|---|---|---|
+| 启动 | UEFI 固件 + 引导器 | **直接内核启动**（`-kernel`）|
+| 账号 | cloud-init 处理 | **ckvm 直接写进镜像**（Arch 没有 cloud-init）|
+| 磁盘 | qcow2 | **raw**（要能用 debugfs 取回内核）|
+| 默认用户 | ubuntu / debian / fedora | alarm |
+| sudo | 可用 | **未装 sudo**，装了才能用 |
 
 ```bash
 ckvm create web --distro debian --rel 13
