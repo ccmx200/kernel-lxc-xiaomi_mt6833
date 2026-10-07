@@ -2206,18 +2206,50 @@ def cmd_install(rest: list[str]) -> int:
     if me != dst:
         shutil.copyfile(me, dst)
         os.chmod(dst, 0o755)
-    # the animations live in a second file; without it they are simply off
+    # The animations live in a second file.  Look for it beside this script; if
+    # it is not there (a piped install that only fetched ckvm.py, say) fetch it,
+    # because installing without it silently loses every spinner and bar.
+    ui_dst = os.path.join(BINDIR, "ckvm_ui.py")
     ui = os.path.join(os.path.dirname(me), "ckvm_ui.py")
     if os.path.isfile(ui):
-        shutil.copyfile(ui, os.path.join(BINDIR, "ckvm_ui.py"))
+        shutil.copyfile(ui, ui_dst)
         ok("动画模块已安装")
     else:
-        warn("没找到 ckvm_ui.py，动画会关闭（功能不受影响）")
+        info("动画模块不在手边，取一份")
+        got = False
+        for pref in [accel] + [a for a, _ in GITHUB_ACCEL if a != accel]:
+            url = f"{pref}{REPO_RAW}/kvm_manager/ckvm_ui.py"
+            tmp = ui_dst + ".part"
+            if run(download_cmd(url, tmp, quiet=True)) == 0 \
+                    and os.path.isfile(tmp) \
+                    and os.path.getsize(tmp) > 1024:
+                os.replace(tmp, ui_dst)
+                got = True
+                break
+        if got:
+            ok("动画模块已安装")
+        else:
+            warn("动画模块没取到；ckvm 可用，只是没有动画")
     wrapper = os.path.join(BINDIR, "ckvm")
     with open(wrapper, "w", encoding="utf-8") as fh:
         fh.write("#!/bin/sh\nexec python3 " + dst + ' "$@"\n')
     os.chmod(wrapper, 0o755)
     ok(f"已安装: {wrapper}")
+
+    # Leave the apt source pointing at something usable.  A fresh Debian
+    # container comes with deb.debian.org, which is slow from China, and the
+    # selftest reports it as a failure - so a just-installed ckvm would greet
+    # the user with a red line.  Pick the fastest measured mirror when the
+    # current one is a stock host.
+    cur = apt_current_mirror()
+    if "deb.debian.org" in cur or "archive.ubuntu.com" in cur or not cur:
+        out()
+        info(f"当前 apt 源 {cur or '未知'} 在国内很慢，测速换一个")
+        fast = apt_pick_fastest_mirror()
+        if fast and apply_apt_mirror(fast):
+            ok(f"已换用 {fast}")
+            info("更新索引...")
+            run(["apt-get", "update", "-qq"])
 
     out()
     out(f"  {S.g}🎉{S.rst} {S.b}安装完成{S.rst}")
