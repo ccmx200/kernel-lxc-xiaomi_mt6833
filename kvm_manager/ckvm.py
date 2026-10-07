@@ -102,8 +102,7 @@ FW_VARS = "edk2_vars.fd"
 DEF_CPUS = 8
 DEF_MEM = 2048
 DEF_DISK = 50
-DEF_REL = "26.04"   # Ubuntu default
-DEF_DISTRO = "ubuntu"
+DEF_REL = "26.04"   # only a menu default now; never used to fill a missing value
 DEF_PORT_BASE = 8023
 DEF_CORES = "0-7"
 DEF_CACHE = "writeback"
@@ -1301,34 +1300,41 @@ def cmd_create(rest: list[str]) -> int:
     header("创建虚拟机")
 
     # ---- distro ---------------------------------------------------------
-    # No default: an interactive create must offer the choice.  Passing a
-    # default into o.get() made the key always truthy, so the menu below was
-    # dead code and every interactive create silently picked Ubuntu.  QUIET
-    # (--yes / --dry-run) is the only case that takes a default.
+    # Never assumed.  Two earlier versions of this got it wrong: passing a
+    # default into o.get() made the key always truthy so the menu was dead code
+    # and every create was Ubuntu; then --rel alone still fell through to
+    # Ubuntu, so --rel 13 made an Ubuntu guest.  Now the family is chosen
+    # explicitly, or inferred from a release that only one family has.
     dkey = o.get("distro", "")
+    candidates = DISTROS
     if not dkey and o.get("rel"):
-        # A release given without a family: 13 means Debian, 42 Fedora, latest
-        # Arch.  Falling back to Ubuntu here meant `--rel 13` created an Ubuntu
-        # guest.  Only Ubuntu's own numbers are ambiguous with nothing else, so
-        # match across families first.
-        for d in DISTROS:
-            if o["rel"] in [r[0] for r in d.releases]:
-                dkey = d.key
-                break
-    if not dkey and QUIET:
-        dkey = DEF_DISTRO
+        matches = [d for d in DISTROS if o["rel"] in [r[0] for r in d.releases]]
+        if len(matches) == 1:
+            # unambiguous: only one family publishes that release number
+            dkey = matches[0].key
+        elif len(matches) > 1:
+            candidates = matches
+            if QUIET:
+                die(f"{o['rel']} 在多个发行版里都有: "
+                    f"{', '.join(d.key for d in matches)}；请加 --distro")
+    elif not dkey and QUIET:
+        # no menu is possible, and guessing is what caused the bug
+        die("需要指定发行版。\n"
+            f"     --distro {' | '.join(DISTRO_BY_KEY)}\n"
+            f"     例如： ckvm create web --distro debian --rel 13 --yes")
+
     picked = False
     if dkey:
         if dkey not in DISTRO_BY_KEY:
             die(f"不支持的发行版: {dkey}；可选: {', '.join(DISTRO_BY_KEY)}")
         distro = DISTRO_BY_KEY[dkey]
     else:
-        items = [(d.name, d.note or "") for d in DISTROS]
+        items = [(d.name, d.note or "") for d in candidates]
         idx = menu("发行版", items, default=1)
         if idx is None:
             info("已取消")
             return 1
-        distro = DISTROS[idx]
+        distro = candidates[idx]
         picked = True
     rels = [r[0] for r in distro.releases]
     if not picked:
@@ -1336,12 +1342,17 @@ def cmd_create(rest: list[str]) -> int:
         ok(f"{distro.name}")
 
     # ---- release --------------------------------------------------------
+    # Same rule as the family: never assumed.  With no menu available, an
+    # implicit "latest" is a silent decision, so ask for --rel instead.
     rel = o.get("rel", "")
     if rel:
         if rel not in rels:
             die(f"{distro.name} 没有 {rel}；可选: {', '.join(rels)}")
     elif QUIET:
-        rel = DEF_REL if DEF_REL in rels else rels[-1]
+        die(f"需要指定版本。\n"
+            f"     --rel {' | '.join(rels)}\n"
+            f"     例如： ckvm create web --distro {distro.key} "
+            f"--rel {rels[-1]} --yes")
     else:
         items = []
         for ver, code, tag, size in distro.releases:

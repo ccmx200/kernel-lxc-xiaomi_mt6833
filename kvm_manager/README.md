@@ -132,10 +132,42 @@ ckvm ssh web
 **两种用法都行**：不带给名字和选项就是一步一步问；给了就跳过对应的提问。
 
 ```bash
-ckvm create web --rel 24.04 --cpus 4 --mem 1536 --disk 30 --pass 你的密码
+ckvm create web --distro ubuntu --rel 24.04 --cpus 4 --mem 1536 \
+  --disk 30 --pass 你的密码
 ```
 
 ---
+
+### 发行版必须显式指定
+
+**没有默认发行版。** 交互式会先问，非交互式（`--yes` / `--dry-run`）必须给 `--distro`：
+
+```bash
+ckvm create web --distro debian --rel 13 --yes
+```
+
+不给就报错并给出候选，**不会替你选**：
+
+```text
+  ❌ 需要指定发行版。
+     --distro ubuntu | debian | fedora | arch
+     例如： ckvm create web --distro debian --rel 13 --yes
+```
+
+`--rel` 同理，在非交互式下也必须给。
+
+**唯一例外**：如果版本号只有一个发行版有，可以省略 `--distro` ——
+因为这时没有歧义：
+
+```bash
+ckvm create web --rel 13        # 只有 Debian 有 13，推断为 Debian
+ckvm create web --rel 42        # 只有 Fedora 有 42
+ckvm create web --rel latest    # 只有 Arch 有 latest
+```
+
+> 这个规则的由来：早期版本会把 `ubuntu` 当作默认值，导致**发行版菜单根本不会出现**，
+> 每次 `ckvm create` 都静默创建 Ubuntu 虚拟机，用户无法选择。改成强制显式，
+> 就不会再有"替我决定"的情况。
 
 ## 创建虚拟机
 
