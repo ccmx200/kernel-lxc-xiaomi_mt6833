@@ -3,7 +3,7 @@
 在 **MT6833 / evergo**（红米 Note 11T 5G，天玑 810）上跑**硬件加速**的 KVM 虚拟机。
 装在 droidspaces 容器里，systemd 管理，**支持多开**，CPU / 内存 / 磁盘随便配。
 
-支持 **Ubuntu · Debian · Fedora** 三个发行版，装之前可以 `--dry-run` 先看计划。
+支持 **Ubuntu · Debian · Fedora · Arch Linux ARM**，装之前可以 `--dry-run` 先看计划。
 
 ```
   🚀 ckvm · KVM 虚拟机管理器 · 2.0
@@ -56,6 +56,7 @@ ckvm versions debian          # 只看一个
 | **Ubuntu** | 22.04 – 26.04（9 个） | 584M – 902M | 官方 cloud image |
 | **Debian** | 13 trixie / 12 bookworm | 322M / 326M | genericcloud，带 cloud-init |
 | **Fedora** | 42 | 600M | Cloud Base Generic |
+| **Arch Linux ARM** | latest | 831M | 从 rootfs tarball 建盘，直接内核启动 |
 
 ```bash
 ckvm create web --distro debian --rel 13
@@ -79,10 +80,32 @@ $ ckvm cache
     合计                 1.2G
 ```
 
-> **Arch Linux 暂不支持。** 官方 Arch 镜像树**只有 x86_64**；Arch Linux ARM 提供的是
-> 790 MB 的 rootfs tarball，不是可启动镜像，需要自己建盘 —— 而建盘要么需要
-> `mkfs.vfat`/`mtools`（做 EFI 分区）要么需要 `libarchive`（本机 e2fsprogs 没编译进去），
-> 在这台设备上都不可用。详见 TECHNICAL.md 第 15 章。
+### Arch Linux ARM
+
+官方 Arch 镜像树**只有 x86_64**，没有可用的 arm64 云端镜像。Arch Linux ARM 提供的是
+**831 MB 的 rootfs tarball**，所以 ckvm 会**自己建盘**：
+
+```bash
+ckvm image arch              # 下载 rootfs + 建盘（约 3GB 可用内存）
+ckvm create atest --distro arch --rel latest
+```
+
+建盘两步（按顺序尝试）：
+
+| 方法 | 条件 |
+|---|---|
+| `mke2fs -d <tarball>` | 需要 e2fsprogs 编译了 libarchive |
+| 解包后 `mke2fs -d <目录>` | 通用回退，任何环境都能用 |
+
+然后**直接内核启动**：QEMU 用 `-kernel` + `-append`，不需要 UEFI 固件，
+也不需要 ESP 分区或引导器 —— 因为 Arch 的盘就是一整个 ext4 rootfs。
+
+> **内存要求（重要）**：建盘需要约 **3GB 可用内存**（831MB tarball +
+> 约 2GB 解包树 + 5GB 镜像）。ckvm 会先检查 `MemAvailable`，
+> **不够就拒绝并给出提示**，不会硬上。
+>
+> 这不是保守估计 —— 我在只有 803MB 可用时试过一次，
+> **整台设备失去响应，只能手动重启**。所以这个检查是必须的。
 
 ---
 
